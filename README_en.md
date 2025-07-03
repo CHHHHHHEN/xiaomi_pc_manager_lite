@@ -5,6 +5,8 @@ Xiaomi PC Manager Lite is a lightweight Windows tool designed for Xiaomi laptops
 
 ![Main GUI](gui_shot.png)
 
+pixiv ID: 127323669
+
 ## Main Features
 - Battery care charging switch and charge limit setting (supports hotkeys)
 - Performance mode switching (supports hotkeys and custom mode switching)
