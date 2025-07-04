@@ -20,13 +20,13 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <Image Include="resources\background.png">
-      <Filter>资源文件</Filter>
-    </Image>
     <Image Include="resources\main_icon.ico">
       <Filter>资源文件</Filter>
     </Image>
     <Image Include="resources\tray_icon.ico">
+      <Filter>资源文件</Filter>
+    </Image>
+    <Image Include="resources\background.png">
       <Filter>资源文件</Filter>
     </Image>
   </ItemGroup>

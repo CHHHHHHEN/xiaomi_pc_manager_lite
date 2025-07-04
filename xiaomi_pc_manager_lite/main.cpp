@@ -32,6 +32,10 @@ const wchar_t* WINDOW_TITLE = L"小米电脑管家精简版";
 #define ID_BATTERY_LEVEL_SPIN       1011
 #define ID_AUTO_START_CHECK         1012
 #define ID_REFRESH_BUTTON           1013
+#define ID_KB_BACKLIGHT_OFF         1014
+#define ID_KB_BACKLIGHT_LOW         1015
+#define ID_KB_BACKLIGHT_HIGH        1016
+#define ID_KB_BACKLIGHT_SMART       1017
 
 // 托盘相关
 #define WM_TRAYICON                 (WM_USER + 1)
@@ -49,6 +53,7 @@ const wchar_t* WINDOW_TITLE = L"小米电脑管家精简版";
 #define EC_BATTERY_CARE_ADDR       0xA4
 #define EC_BATTERY_LEVEL_ADDR      0xA7
 #define EC_PERFORMANCE_MODE_ADDR   0x68
+#define EC_KEYBOARD_BACKLIGHT_ADDR 0xB2
 
 // 性能模式值
 #define PERF_ECO_MODE              0x0A
@@ -57,9 +62,15 @@ const wchar_t* WINDOW_TITLE = L"小米电脑管家精简版";
 #define PERF_FAST_MODE             0x03
 #define PERF_EXTREME_MODE          0x04
 
+// 键盘背光模式值
+#define KB_BACKLIGHT_OFF           0x01
+#define KB_BACKLIGHT_LOW           0x02
+#define KB_BACKLIGHT_HIGH          0x04
+#define KB_BACKLIGHT_SMART         0x08
+
 // 热键ID
 #define HOTKEY_ID_BATTERY  1
-#define HOTKEY_ID_PERF     2
+#define HOTKEY_ID_PERF      2
 
 // 注册表自启动项名
 const wchar_t* AUTOSTART_REG_PATH = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -84,6 +95,10 @@ HWND g_hBatteryLevelLabel = nullptr;
 HWND g_hPerformanceCombo = nullptr;
 HWND g_hTitleLabel = nullptr; 
 HWND g_hPerfLabel = nullptr; 
+HWND g_hKbBacklightOff = nullptr;
+HWND g_hKbBacklightLow = nullptr;
+HWND g_hKbBacklightHigh = nullptr;
+HWND g_hKbBacklightSmart = nullptr;
 NOTIFYICONDATA g_nid = {};
 bool g_isMinimized = false;
 bool g_isDragging = false;
@@ -115,8 +130,10 @@ BYTE ReadEC(WORD address);
 void WriteEC(WORD address, BYTE value);
 void UpdateBatteryCareStatus();
 void UpdatePerformanceMode();
+void UpdateKeyboardBacklightMode();
 void SetBatteryCare(bool enable, int level = 80);
 void SetPerformanceMode(int mode);
+void SetKeyboardBacklightMode(BYTE mode);
 void CreateTrayIcon();
 void RemoveTrayIcon();
 void ShowTrayMenu();
@@ -491,6 +508,17 @@ void UpdatePerformanceMode() {
     SendMessage(g_hPerformanceCombo, CB_SETCURSEL, index, 0);
 }
 
+// 更新键盘背光模式
+void UpdateKeyboardBacklightMode() {
+    BYTE ecValue = ReadEC(EC_KEYBOARD_BACKLIGHT_ADDR);
+    BYTE mode = ecValue & 0x0F; // 只关心低4位
+
+    SendMessage(g_hKbBacklightOff, BM_SETCHECK, (mode == KB_BACKLIGHT_OFF) ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessage(g_hKbBacklightLow, BM_SETCHECK, (mode == KB_BACKLIGHT_LOW) ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessage(g_hKbBacklightHigh, BM_SETCHECK, (mode == KB_BACKLIGHT_HIGH) ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessage(g_hKbBacklightSmart, BM_SETCHECK, (mode == KB_BACKLIGHT_SMART) ? BST_CHECKED : BST_UNCHECKED, 0);
+}
+
 // 设置养护充电
 void SetBatteryCare(bool enable, int level) {
     // 确保范围在0-100之间
@@ -521,10 +549,19 @@ void SetPerformanceMode(int mode) {
     WriteEC(EC_PERFORMANCE_MODE_ADDR, modeValue);
 }
 
+// 设置键盘背光模式
+void SetKeyboardBacklightMode(BYTE mode) {
+    BYTE currentValue = ReadEC(EC_KEYBOARD_BACKLIGHT_ADDR);
+    // 保留高4位，设置低4位
+    BYTE newValue = (currentValue & 0xF0) | (mode & 0x0F);
+    WriteEC(EC_KEYBOARD_BACKLIGHT_ADDR, newValue);
+    UpdateKeyboardBacklightMode();
+}
+
 // 保存配置到文件
 void SaveConfig() {
     // 检查控件句柄有效性
-    if (!g_hBatteryCareCheck || !g_hBatteryLevelEdit || !g_hPerformanceCombo)
+    if (!g_hBatteryCareCheck || !g_hBatteryLevelEdit || !g_hPerformanceCombo || !g_hKbBacklightOff || !g_hKbBacklightLow || !g_hKbBacklightHigh || !g_hKbBacklightSmart)
         return;
     std::wofstream ofs(CONFIG_FILE);
     if (!ofs.is_open() || !ofs.good()) return;
@@ -533,9 +570,17 @@ void SaveConfig() {
     if (GetWindowText(g_hBatteryLevelEdit, levelText, 16) == 0) wcscpy_s(levelText, L"80");
     int batteryLevel = _wtoi(levelText);
     int perfMode = (int)SendMessage(g_hPerformanceCombo, CB_GETCURSEL, 0, 0);
+    
+    int kbBacklightMode = 0;
+    if (SendMessage(g_hKbBacklightOff, BM_GETCHECK, 0, 0) == BST_CHECKED) kbBacklightMode = KB_BACKLIGHT_OFF;
+    else if (SendMessage(g_hKbBacklightLow, BM_GETCHECK, 0, 0) == BST_CHECKED) kbBacklightMode = KB_BACKLIGHT_LOW;
+    else if (SendMessage(g_hKbBacklightHigh, BM_GETCHECK, 0, 0) == BST_CHECKED) kbBacklightMode = KB_BACKLIGHT_HIGH;
+    else if (SendMessage(g_hKbBacklightSmart, BM_GETCHECK, 0, 0) == BST_CHECKED) kbBacklightMode = KB_BACKLIGHT_SMART;
+
     ofs << L"battery_care=" << batteryCare << std::endl;
     ofs << L"battery_level=" << batteryLevel << std::endl;
     ofs << L"perf_mode=" << perfMode << std::endl;
+    ofs << L"kb_backlight_mode=" << kbBacklightMode << std::endl;
     ofs.close();
 }
 
@@ -544,11 +589,12 @@ void LoadConfig() {
     std::wifstream ifs(CONFIG_FILE);
     if (!ifs) return;
     std::wstring line;
-    int batteryCare = -1, batteryLevel = -1, perfMode = -1;
+    int batteryCare = -1, batteryLevel = -1, perfMode = -1, kbBacklightMode = -1;
     while (std::getline(ifs, line)) {
         if (line.find(L"battery_care=") == 0) batteryCare = std::stoi(line.substr(13));
         else if (line.find(L"battery_level=") == 0) batteryLevel = std::stoi(line.substr(14));
         else if (line.find(L"perf_mode=") == 0) perfMode = std::stoi(line.substr(10));
+        else if (line.find(L"kb_backlight_mode=") == 0) kbBacklightMode = std::stoi(line.substr(18));
     }
     if (batteryCare != -1)
         SendMessage(g_hBatteryCareCheck, BM_SETCHECK, batteryCare ? BST_CHECKED : BST_UNCHECKED, 0);
@@ -560,11 +606,31 @@ void LoadConfig() {
     }
     if (perfMode != -1)
         SendMessage(g_hPerformanceCombo, CB_SETCURSEL, perfMode, 0);
+    if (kbBacklightMode != -1) {
+        switch (kbBacklightMode) {
+            case KB_BACKLIGHT_OFF:
+                SendMessage(g_hKbBacklightOff, BM_SETCHECK, BST_CHECKED, 0);
+                break;
+            case KB_BACKLIGHT_LOW:
+                SendMessage(g_hKbBacklightLow, BM_SETCHECK, BST_CHECKED, 0);
+                break;
+            case KB_BACKLIGHT_HIGH:
+                SendMessage(g_hKbBacklightHigh, BM_SETCHECK, BST_CHECKED, 0);
+                break;
+            case KB_BACKLIGHT_SMART:
+                SendMessage(g_hKbBacklightSmart, BM_SETCHECK, BST_CHECKED, 0);
+                break;
+        }
+    }
     // 应用配置到硬件
-    if (batteryCare != -1 && batteryLevel != -1)
-        SetBatteryCare(batteryCare != 0, batteryLevel);
-    if (perfMode != -1)
-        SetPerformanceMode(perfMode);
+    if (g_winRing0Initialized) {
+        if (batteryCare != -1 && batteryLevel != -1)
+            SetBatteryCare(batteryCare != 0, batteryLevel);
+        if (perfMode != -1)
+            SetPerformanceMode(perfMode);
+        if (kbBacklightMode != -1)
+            SetKeyboardBacklightMode(kbBacklightMode);
+    }
 }
 
 // 创建托盘图标
@@ -650,81 +716,103 @@ void ToggleMainWindow() {
 void CreateControls(HWND hwnd) {
     // 创建透明画刷
     g_hTransparentBrush = (HBRUSH)GetStockObject(NULL_BRUSH);
-    
-    // 标题 - 使用透明背景
+
+    int left = 24; // 控件区左边距
+    int width = 320; // 控件区宽度
+    int y = 24; // 顶部起始
+    int spacing = 12; // 控件间距
+
+    // 标题 - 靠左
     g_hTitleLabel = CreateWindow(L"STATIC", L"小米电脑管家精简版",
-        WS_VISIBLE | WS_CHILD | SS_CENTER,
-        50, 40, 300, 25, hwnd, nullptr, GetModuleHandle(nullptr), nullptr);
-    
-    // 养护充电复选框 - 设置透明背景
+        WS_VISIBLE | WS_CHILD | SS_LEFT,
+        left, y, width, 36, hwnd, nullptr, GetModuleHandle(nullptr), nullptr);
+    y += 36 + spacing;
+
+    // 养护充电复选框
     g_hBatteryCareCheck = CreateWindow(L"BUTTON", L"开启养护充电",
         WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX,
-        30, 80, 150, 25, hwnd, (HMENU)ID_BATTERY_CARE_ENABLE, GetModuleHandle(nullptr), nullptr);
-    
-    // 充电上限标签 - 使用透明背景
+        left, y, width, 28, hwnd, (HMENU)ID_BATTERY_CARE_ENABLE, GetModuleHandle(nullptr), nullptr);
+    y += 28 + spacing;
+
+    // 充电上限标签
     g_hBatteryLevelLabel = CreateWindow(L"STATIC", L"充电上限 (0-100%):",
-        WS_VISIBLE | WS_CHILD,
-        30, 115, 150, 20, hwnd, nullptr, GetModuleHandle(nullptr), nullptr);
-    
-    // 充电上限数值输入框
+        WS_VISIBLE | WS_CHILD | SS_LEFT,
+        left, y, width, 22, hwnd, nullptr, GetModuleHandle(nullptr), nullptr);
+    y += 22 + spacing;
+
+    // 充电上限输入框和调节器
     g_hBatteryLevelEdit = CreateWindow(L"EDIT", L"80",
         WS_VISIBLE | WS_CHILD | WS_BORDER | ES_NUMBER | ES_RIGHT,
-        30, 140, 60, 25, hwnd, (HMENU)ID_BATTERY_LEVEL_EDIT, GetModuleHandle(nullptr), nullptr);
-    
-    // 数值调节器（上下调节按钮）
+        left, y, 60, 28, hwnd, (HMENU)ID_BATTERY_LEVEL_EDIT, GetModuleHandle(nullptr), nullptr);
     g_hBatteryLevelSpin = CreateWindow(UPDOWN_CLASS, L"",
         WS_VISIBLE | WS_CHILD | UDS_SETBUDDYINT | UDS_ALIGNRIGHT | UDS_ARROWKEYS | UDS_NOTHOUSANDS,
-        90, 140, 20, 25, hwnd, (HMENU)ID_BATTERY_LEVEL_SPIN, GetModuleHandle(nullptr), nullptr);
-    
-    // 设置数值调节器的关联控件和范围
+        left + 60, y, 20, 28, hwnd, (HMENU)ID_BATTERY_LEVEL_SPIN, GetModuleHandle(nullptr), nullptr);
     SendMessage(g_hBatteryLevelSpin, UDM_SETBUDDY, (WPARAM)g_hBatteryLevelEdit, 0);
     SendMessage(g_hBatteryLevelSpin, UDM_SETRANGE32, 0, 100);
     SendMessage(g_hBatteryLevelSpin, UDM_SETPOS32, 0, 80);
-    
-    // 百分号标签
     CreateWindow(L"STATIC", L"%",
         WS_VISIBLE | WS_CHILD,
-        115, 145, 15, 20, hwnd, nullptr, GetModuleHandle(nullptr), nullptr);
-    
-    // 性能模式标签 - 使用透明背景
+        left + 85, y + 4, 20, 20, hwnd, nullptr, GetModuleHandle(nullptr), nullptr);
+    y += 28 + spacing;
+
+    // 性能模式标签
     g_hPerfLabel = CreateWindow(L"STATIC", L"性能模式:",
-        WS_VISIBLE | WS_CHILD,
-        30, 200, 80, 20, hwnd, nullptr, GetModuleHandle(nullptr), nullptr);
-    
+        WS_VISIBLE | WS_CHILD | SS_LEFT,
+        left, y, width, 22, hwnd, nullptr, GetModuleHandle(nullptr), nullptr);
+    y += 22 + spacing;
+
     // 性能模式下拉框
     g_hPerformanceCombo = CreateWindow(WC_COMBOBOX, L"",
         WS_VISIBLE | WS_CHILD | CBS_DROPDOWNLIST | CBS_HASSTRINGS,
-        120, 195, 150, 200, hwnd, (HMENU)ID_PERFORMANCE_MODE, GetModuleHandle(nullptr), nullptr);
-    
-    // 添加性能模式选项
+        left, y, width, 120, hwnd, (HMENU)ID_PERFORMANCE_MODE, GetModuleHandle(nullptr), nullptr);
     SendMessage(g_hPerformanceCombo, CB_ADDSTRING, 0, (LPARAM)L"省电模式");
     SendMessage(g_hPerformanceCombo, CB_ADDSTRING, 0, (LPARAM)L"静谧模式");
     SendMessage(g_hPerformanceCombo, CB_ADDSTRING, 0, (LPARAM)L"智能模式");
     SendMessage(g_hPerformanceCombo, CB_ADDSTRING, 0, (LPARAM)L"极速模式");
     SendMessage(g_hPerformanceCombo, CB_ADDSTRING, 0, (LPARAM)L"狂暴模式");
-    SendMessage(g_hPerformanceCombo, CB_SETCURSEL, 2, 0); // 默认智能模式
-    
-    // 最小化按钮 - 使用自定义样式
-    CreateWindow(L"BUTTON", L"—",
-        WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON | BS_FLAT,
-        320, 10, 30, 25, hwnd, (HMENU)ID_MIN_BUTTON, GetModuleHandle(nullptr), nullptr);
-    
-    // 关闭按钮 - 使用自定义样式
-    CreateWindow(L"BUTTON", L"×",
-        WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON | BS_FLAT,
-        355, 10, 30, 25, hwnd, (HMENU)ID_CLOSE_BUTTON, GetModuleHandle(nullptr), nullptr);
-    
+    SendMessage(g_hPerformanceCombo, CB_SETCURSEL, 2, 0);
+    y += 32 + spacing;
+
+    // 键盘背光模式分组
+    HWND hKbGroup = CreateWindow(L"BUTTON", L"键盘背光模式",
+        WS_VISIBLE | WS_CHILD | BS_GROUPBOX,
+        left, y, width, 60, hwnd, nullptr, GetModuleHandle(nullptr), nullptr);
+    int kbY = y + 20;
+    int kbW = 70;
+    int kbSpacing = 10;
+    g_hKbBacklightOff = CreateWindow(L"BUTTON", L"关闭",
+        WS_VISIBLE | WS_CHILD | BS_AUTORADIOBUTTON | WS_GROUP,
+        left + 10, kbY, kbW, 24, hwnd, (HMENU)ID_KB_BACKLIGHT_OFF, GetModuleHandle(nullptr), nullptr);
+    g_hKbBacklightLow = CreateWindow(L"BUTTON", L"低亮度",
+        WS_VISIBLE | WS_CHILD | BS_AUTORADIOBUTTON,
+        left + 10 + (kbW + kbSpacing) * 1, kbY, kbW, 24, hwnd, (HMENU)ID_KB_BACKLIGHT_LOW, GetModuleHandle(nullptr), nullptr);
+    g_hKbBacklightHigh = CreateWindow(L"BUTTON", L"高亮度",
+        WS_VISIBLE | WS_CHILD | BS_AUTORADIOBUTTON,
+        left + 10 + (kbW + kbSpacing) * 2, kbY, kbW, 24, hwnd, (HMENU)ID_KB_BACKLIGHT_HIGH, GetModuleHandle(nullptr), nullptr);
+    g_hKbBacklightSmart = CreateWindow(L"BUTTON", L"智能模式",
+        WS_VISIBLE | WS_CHILD | BS_AUTORADIOBUTTON,
+        left + 10 + (kbW + kbSpacing) * 3, kbY, kbW + 20, 24, hwnd, (HMENU)ID_KB_BACKLIGHT_SMART, GetModuleHandle(nullptr), nullptr);
+    y += 60 + spacing;
+
     // 刷新按钮
     HWND hRefreshBtn = CreateWindow(L"BUTTON", L"刷新状态",
         WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
-        30, 240, 100, 30, hwnd, (HMENU)ID_REFRESH_BUTTON, GetModuleHandle(nullptr), nullptr);
+        left, y, 110, 32, hwnd, (HMENU)ID_REFRESH_BUTTON, GetModuleHandle(nullptr), nullptr);
 
     // 开机自启动复选框
     HWND hAutoStartCheck = CreateWindow(L"BUTTON", L"开机自启动",
         WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX,
-        140, 245, 120, 22, hwnd, (HMENU)ID_AUTO_START_CHECK, GetModuleHandle(nullptr), nullptr);
-    // 设置初始状态
+        left + 130, y + 4, 120, 24, hwnd, (HMENU)ID_AUTO_START_CHECK, GetModuleHandle(nullptr), nullptr);
     SendMessage(hAutoStartCheck, BM_SETCHECK, IsAutoStartEnabled() ? BST_CHECKED : BST_UNCHECKED, 0);
+
+    // 最小化按钮
+    CreateWindow(L"BUTTON", L"—",
+        WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON | BS_FLAT,
+        400 - 80, 8, 32, 28, hwnd, (HMENU)ID_MIN_BUTTON, GetModuleHandle(nullptr), nullptr);
+    // 关闭按钮
+    CreateWindow(L"BUTTON", L"×",
+        WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON | BS_FLAT,
+        400 - 40, 8, 32, 28, hwnd, (HMENU)ID_CLOSE_BUTTON, GetModuleHandle(nullptr), nullptr);
 }
 
 // 检查图像是否有透明度
@@ -744,34 +832,34 @@ bool HasImageTransparency(Gdiplus::Image* image) {
 void DrawBackground(HDC hdc, RECT* rect) {
     if (g_backgroundImage && g_backgroundImage->GetLastStatus() == Gdiplus::Ok) {
         Gdiplus::Graphics graphics(hdc);
-        
-        // 设置高质量渲染
         graphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
         graphics.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
         graphics.SetCompositingMode(Gdiplus::CompositingModeSourceOver);
         graphics.SetCompositingQuality(Gdiplus::CompositingQualityHighQuality);
-        
-        // 先清除背景为白色
         graphics.Clear(Gdiplus::Color(255, 255, 255, 255));
-        
-        // 绘制背景图像
-        graphics.DrawImage(g_backgroundImage, 0, 0, rect->right, rect->bottom);
+        // 右侧200像素绘制完整背景图（人物），左侧控件区为半透明白色
+        int personWidth = 250;
+        int winW = rect->right;
+        int winH = rect->bottom;
+        // 绘制背景图像（右侧对齐）
+        graphics.DrawImage(g_backgroundImage, winW - personWidth, 0, personWidth, winH);
+        // 左侧控件区填充半透明白色
+        Gdiplus::SolidBrush brush(Gdiplus::Color(220, 255, 255, 255));
+        graphics.FillRectangle(&brush, 0, 0, winW - personWidth, winH);
+        // 可选：控件区右侧加一条淡蓝色分割线
+        Gdiplus::Pen pen(Gdiplus::Color(180, 200, 255), 2);
+        graphics.DrawLine(&pen, winW - personWidth, 0, winW - personWidth, winH);
     } else {
-        // 如果没有背景图，使用渐变色背景
         HBRUSH hBrush = CreateSolidBrush(RGB(245, 250, 255));
         FillRect(hdc, rect, hBrush);
         DeleteObject(hBrush);
-        
-        // 添加边框
         HPEN hPen = CreatePen(PS_SOLID, 2, RGB(100, 149, 237));
         HPEN hOldPen = (HPEN)SelectObject(hdc, hPen);
-        
         MoveToEx(hdc, 0, 0, nullptr);
         LineTo(hdc, rect->right - 1, 0);
         LineTo(hdc, rect->right - 1, rect->bottom - 1);
         LineTo(hdc, 0, rect->bottom - 1);
         LineTo(hdc, 0, 0);
-        
         SelectObject(hdc, hOldPen);
         DeleteObject(hPen);
     }
@@ -779,8 +867,8 @@ void DrawBackground(HDC hdc, RECT* rect) {
 
 // 创建程序化渐变背景
 void CreateProgrammaticBackground() {
-    const int width = 400;
-    const int height = 280;
+    const int width = 800;
+    const int height = 550;
     
     Gdiplus::Bitmap* bitmap = new Gdiplus::Bitmap(width, height, PixelFormat24bppRGB);
     Gdiplus::Graphics graphics(bitmap);
@@ -849,6 +937,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             }
             UpdateBatteryCareStatus(); // 更新UI状态
             UpdatePerformanceMode();   // 更新UI状态
+            UpdateKeyboardBacklightMode(); // 更新UI状态
             
             SetTimer(hwnd, 1, 1000, nullptr); // 1秒后创建托盘图标
 
@@ -883,6 +972,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 // 恢复性能模式
                 int sel = (int)SendMessage(g_hPerformanceCombo, CB_GETCURSEL, 0, 0);
                 SetPerformanceMode(sel);
+                // 恢复键盘背光
+                UpdateKeyboardBacklightMode();
             }
             break;
             
@@ -978,6 +1069,18 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                         }
                     }
                     break;
+                case ID_KB_BACKLIGHT_OFF:
+                    SetKeyboardBacklightMode(KB_BACKLIGHT_OFF);
+                    break;
+                case ID_KB_BACKLIGHT_LOW:
+                    SetKeyboardBacklightMode(KB_BACKLIGHT_LOW);
+                    break;
+                case ID_KB_BACKLIGHT_HIGH:
+                    SetKeyboardBacklightMode(KB_BACKLIGHT_HIGH);
+                    break;
+                case ID_KB_BACKLIGHT_SMART:
+                    SetKeyboardBacklightMode(KB_BACKLIGHT_SMART);
+                    break;
                 case ID_MIN_BUTTON:
                     ShowWindow(hwnd, SW_HIDE);
                     g_isMinimized = true;
@@ -1027,6 +1130,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 case ID_REFRESH_BUTTON:
                     UpdateBatteryCareStatus();
                     UpdatePerformanceMode();
+                    UpdateKeyboardBacklightMode();
                     break;
             }
             break;
@@ -1146,14 +1250,16 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
 
     // 创建窗口
     DWORD exStyle = 0;
+    const int windowWidth = 650;
+    const int windowHeight = 420;
     g_hWnd = CreateWindowEx(
         exStyle,
         CLASS_NAME,
         WINDOW_TITLE,
         WS_POPUP | WS_VISIBLE,
-        (GetSystemMetrics(SM_CXSCREEN) - 400) / 2, // 居中显示
-        (GetSystemMetrics(SM_CYSCREEN) - 280) / 2,
-        400, 280,
+        (GetSystemMetrics(SM_CXSCREEN) - windowWidth) / 2, // 居中显示
+        (GetSystemMetrics(SM_CYSCREEN) - windowHeight) / 2,
+        windowWidth, windowHeight,
         nullptr, nullptr, hInstance, nullptr
     );
 
