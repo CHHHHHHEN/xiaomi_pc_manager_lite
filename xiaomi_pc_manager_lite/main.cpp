@@ -3,14 +3,20 @@
 #include <shellapi.h>
 #include <gdiplus.h>
 #include <shlwapi.h>
+#include <strsafe.h>
 #include <string>
 #include <memory>
+#include <fstream>
+#include <taskschd.h>
+#include <comdef.h>
 #include "resource.h"
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "shlwapi.lib")
+#pragma comment(lib, "taskschd.lib")
+#pragma comment(lib, "comsupp.lib")
 
 // 窗口类名和标题
 const wchar_t* CLASS_NAME = L"XiaomiPCManagerLite";
@@ -25,6 +31,7 @@ const wchar_t* WINDOW_TITLE = L"小米电脑管家精简版";
 #define ID_BATTERY_LEVEL_EDIT       1010
 #define ID_BATTERY_LEVEL_SPIN       1011
 #define ID_AUTO_START_CHECK         1012
+#define ID_REFRESH_BUTTON           1013
 
 // 托盘相关
 #define WM_TRAYICON                 (WM_USER + 1)
@@ -57,6 +64,10 @@ const wchar_t* WINDOW_TITLE = L"小米电脑管家精简版";
 // 注册表自启动项名
 const wchar_t* AUTOSTART_REG_PATH = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 const wchar_t* AUTOSTART_REG_NAME = L"XiaomiPCManagerLite";
+
+// 配置文件路径
+const wchar_t* CONFIG_FILE = L"xiaomi_pc_manager_lite_config.ini";
+const wchar_t* TASK_NAME = L"XiaomiPCManagerLite_AutoStart";
 
 // WinRing0函数指针类型定义
 typedef BOOL (WINAPI *InitializeOls_t)();
@@ -117,32 +128,164 @@ void RegisterDefaultHotKeys(HWND hwnd);
 void UnregisterCustomHotKeys(HWND hwnd);
 bool IsAutoStartEnabled();
 void SetAutoStart(bool enable);
+void SaveConfig();
+void LoadConfig();
 
 // 判断是否已设置自启动
 bool IsAutoStartEnabled() {
-    HKEY hKey;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, AUTOSTART_REG_PATH, 0, KEY_READ, &hKey) != ERROR_SUCCESS)
+    HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    if (FAILED(hr)) return false;
+
+    ITaskService* pService = NULL;
+    hr = CoCreateInstance(CLSID_TaskScheduler, NULL, CLSCTX_INPROC_SERVER, IID_ITaskService, (void**)&pService);
+    if (FAILED(hr)) {
+        CoUninitialize();
         return false;
-    wchar_t value[MAX_PATH];
-    DWORD size = sizeof(value);
-    bool enabled = (RegQueryValueExW(hKey, AUTOSTART_REG_NAME, nullptr, nullptr, (LPBYTE)value, &size) == ERROR_SUCCESS);
-    RegCloseKey(hKey);
-    return enabled;
+    }
+
+    hr = pService->Connect(_variant_t(), _variant_t(), _variant_t(), _variant_t());
+    if (FAILED(hr)) {
+        pService->Release();
+        CoUninitialize();
+        return false;
+    }
+
+    ITaskFolder* pRootFolder = NULL;
+    hr = pService->GetFolder(_bstr_t(L""), &pRootFolder);
+    if (FAILED(hr)) {
+        pService->Release();
+        CoUninitialize();
+        return false;
+    }
+
+    IRegisteredTask* pRegisteredTask = NULL;
+    hr = pRootFolder->GetTask(_bstr_t(TASK_NAME), &pRegisteredTask);
+    
+    pRootFolder->Release();
+    pService->Release();
+    CoUninitialize();
+
+    if (SUCCEEDED(hr) && pRegisteredTask) {
+        pRegisteredTask->Release();
+        return true;
+    }
+
+    return false;
 }
 
-// 设置/取消自启动
+// 设置/取消自启动（使用Task Scheduler COM API）
 void SetAutoStart(bool enable) {
-    HKEY hKey;
-    if (RegCreateKeyExW(HKEY_CURRENT_USER, AUTOSTART_REG_PATH, 0, nullptr, 0, KEY_WRITE, nullptr, &hKey, nullptr) != ERROR_SUCCESS)
+    HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    if (FAILED(hr)) return;
+
+    ITaskService* pService = NULL;
+    hr = CoCreateInstance(CLSID_TaskScheduler, NULL, CLSCTX_INPROC_SERVER, IID_ITaskService, (void**)&pService);
+    if (FAILED(hr)) {
+        CoUninitialize();
         return;
-    if (enable) {
-        wchar_t exePath[MAX_PATH];
-        GetModuleFileNameW(nullptr, exePath, MAX_PATH);
-        RegSetValueExW(hKey, AUTOSTART_REG_NAME, 0, REG_SZ, (BYTE*)exePath, (DWORD)((wcslen(exePath) + 1) * sizeof(wchar_t)));
-    } else {
-        RegDeleteValueW(hKey, AUTOSTART_REG_NAME);
     }
-    RegCloseKey(hKey);
+
+    hr = pService->Connect(_variant_t(), _variant_t(), _variant_t(), _variant_t());
+    if (FAILED(hr)) {
+        pService->Release();
+        CoUninitialize();
+        return;
+    }
+
+    ITaskFolder* pRootFolder = NULL;
+    hr = pService->GetFolder(_bstr_t(L""), &pRootFolder);
+    if (FAILED(hr)) {
+        pService->Release();
+        CoUninitialize();
+        return;
+    }
+
+    if (enable) {
+        // 如果任务已存在，先删除
+        pRootFolder->DeleteTask(_bstr_t(TASK_NAME), 0);
+
+        ITaskDefinition* pTask = NULL;
+        hr = pService->NewTask(0, &pTask);
+        if (FAILED(hr)) {
+            pRootFolder->Release();
+            pService->Release();
+            CoUninitialize();
+            return;
+        }
+
+        // 设置主体
+        IPrincipal* pPrincipal = NULL;
+        hr = pTask->get_Principal(&pPrincipal);
+        if (SUCCEEDED(hr)) {
+            pPrincipal->put_RunLevel(TASK_RUNLEVEL_HIGHEST);
+            pPrincipal->Release();
+        }
+
+        // 设置触发器
+        ITriggerCollection* pTriggerCollection = NULL;
+        hr = pTask->get_Triggers(&pTriggerCollection);
+        if (SUCCEEDED(hr)) {
+            ITrigger* pTrigger = NULL;
+            hr = pTriggerCollection->Create(TASK_TRIGGER_LOGON, &pTrigger);
+            if (SUCCEEDED(hr)) {
+                pTrigger->put_Id(_bstr_t(L"Trigger1"));
+                pTrigger->Release();
+            }
+            pTriggerCollection->Release();
+        }
+
+        // 设置动作
+        IActionCollection* pActionCollection = NULL;
+        hr = pTask->get_Actions(&pActionCollection);
+        if (SUCCEEDED(hr)) {
+            IAction* pAction = NULL;
+            hr = pActionCollection->Create(TASK_ACTION_EXEC, &pAction);
+            if (SUCCEEDED(hr)) {
+                IExecAction* pExecAction = NULL;
+                hr = pAction->QueryInterface(IID_IExecAction, (void**)&pExecAction);
+                if (SUCCEEDED(hr)) {
+                    wchar_t exePath[MAX_PATH];
+                    GetModuleFileNameW(NULL, exePath, MAX_PATH);
+                    pExecAction->put_Path(_bstr_t(exePath));
+                    pExecAction->Release();
+                }
+                pAction->Release();
+            }
+            pActionCollection->Release();
+        }
+
+        // 设置
+        ITaskSettings* pSettings = NULL;
+        hr = pTask->get_Settings(&pSettings);
+        if (SUCCEEDED(hr)) {
+            pSettings->put_DisallowStartIfOnBatteries(VARIANT_FALSE);
+            pSettings->put_StopIfGoingOnBatteries(VARIANT_FALSE);
+            pSettings->put_ExecutionTimeLimit(_bstr_t(L"PT0S")); // 无时间限制
+            pSettings->put_StartWhenAvailable(VARIANT_TRUE);
+            pSettings->Release();
+        }
+
+        // 注册任务
+        IRegisteredTask* pRegisteredTask = NULL;
+        pRootFolder->RegisterTaskDefinition(
+            _bstr_t(TASK_NAME),
+            pTask,
+            TASK_CREATE_OR_UPDATE,
+            _variant_t(L""), // User
+            _variant_t(L""), // Password
+            TASK_LOGON_INTERACTIVE_TOKEN,
+            _variant_t(L""),
+            &pRegisteredTask);
+
+        if (pRegisteredTask) pRegisteredTask->Release();
+        pTask->Release();
+    } else {
+        pRootFolder->DeleteTask(_bstr_t(TASK_NAME), 0);
+    }
+
+    pRootFolder->Release();
+    pService->Release();
+    CoUninitialize();
 }
 
 // 从资源加载图片
@@ -378,6 +521,52 @@ void SetPerformanceMode(int mode) {
     WriteEC(EC_PERFORMANCE_MODE_ADDR, modeValue);
 }
 
+// 保存配置到文件
+void SaveConfig() {
+    // 检查控件句柄有效性
+    if (!g_hBatteryCareCheck || !g_hBatteryLevelEdit || !g_hPerformanceCombo)
+        return;
+    std::wofstream ofs(CONFIG_FILE);
+    if (!ofs.is_open() || !ofs.good()) return;
+    int batteryCare = SendMessage(g_hBatteryCareCheck, BM_GETCHECK, 0, 0) == BST_CHECKED ? 1 : 0;
+    wchar_t levelText[16] = {0};
+    if (GetWindowText(g_hBatteryLevelEdit, levelText, 16) == 0) wcscpy_s(levelText, L"80");
+    int batteryLevel = _wtoi(levelText);
+    int perfMode = (int)SendMessage(g_hPerformanceCombo, CB_GETCURSEL, 0, 0);
+    ofs << L"battery_care=" << batteryCare << std::endl;
+    ofs << L"battery_level=" << batteryLevel << std::endl;
+    ofs << L"perf_mode=" << perfMode << std::endl;
+    ofs.close();
+}
+
+// 从文件读取配置
+void LoadConfig() {
+    std::wifstream ifs(CONFIG_FILE);
+    if (!ifs) return;
+    std::wstring line;
+    int batteryCare = -1, batteryLevel = -1, perfMode = -1;
+    while (std::getline(ifs, line)) {
+        if (line.find(L"battery_care=") == 0) batteryCare = std::stoi(line.substr(13));
+        else if (line.find(L"battery_level=") == 0) batteryLevel = std::stoi(line.substr(14));
+        else if (line.find(L"perf_mode=") == 0) perfMode = std::stoi(line.substr(10));
+    }
+    if (batteryCare != -1)
+        SendMessage(g_hBatteryCareCheck, BM_SETCHECK, batteryCare ? BST_CHECKED : BST_UNCHECKED, 0);
+    if (batteryLevel != -1) {
+        wchar_t buf[16];
+        swprintf_s(buf, L"%d", batteryLevel);
+        SetWindowText(g_hBatteryLevelEdit, buf);
+        SendMessage(g_hBatteryLevelSpin, UDM_SETPOS32, 0, batteryLevel);
+    }
+    if (perfMode != -1)
+        SendMessage(g_hPerformanceCombo, CB_SETCURSEL, perfMode, 0);
+    // 应用配置到硬件
+    if (batteryCare != -1 && batteryLevel != -1)
+        SetBatteryCare(batteryCare != 0, batteryLevel);
+    if (perfMode != -1)
+        SetPerformanceMode(perfMode);
+}
+
 // 创建托盘图标
 void CreateTrayIcon() {
     ZeroMemory(&g_nid, sizeof(NOTIFYICONDATA));
@@ -525,10 +714,15 @@ void CreateControls(HWND hwnd) {
         WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON | BS_FLAT,
         355, 10, 30, 25, hwnd, (HMENU)ID_CLOSE_BUTTON, GetModuleHandle(nullptr), nullptr);
     
+    // 刷新按钮
+    HWND hRefreshBtn = CreateWindow(L"BUTTON", L"刷新状态",
+        WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
+        30, 240, 100, 30, hwnd, (HMENU)ID_REFRESH_BUTTON, GetModuleHandle(nullptr), nullptr);
+
     // 开机自启动复选框
     HWND hAutoStartCheck = CreateWindow(L"BUTTON", L"开机自启动",
         WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX,
-        250, 240, 120, 22, hwnd, (HMENU)ID_AUTO_START_CHECK, GetModuleHandle(nullptr), nullptr);
+        140, 245, 120, 22, hwnd, (HMENU)ID_AUTO_START_CHECK, GetModuleHandle(nullptr), nullptr);
     // 设置初始状态
     SendMessage(hAutoStartCheck, BM_SETCHECK, IsAutoStartEnabled() ? BST_CHECKED : BST_UNCHECKED, 0);
 }
@@ -646,15 +840,28 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
     switch (uMsg) {
         case WM_CREATE:
             CreateControls(hwnd);
-            SetTimer(hwnd, 1, 1000, nullptr); // 1秒后创建托盘图标
             RegisterDefaultHotKeys(hwnd); // 注册默认热键
             if (InitializeWinRing0()) {
-                UpdateBatteryCareStatus();
-                UpdatePerformanceMode();
+                LoadConfig(); // 初始化成功后加载配置并应用
+            } else {
+                // 初始化失败，仅加载配置到UI，不应用到硬件
+                LoadConfig(); 
             }
+            UpdateBatteryCareStatus(); // 更新UI状态
+            UpdatePerformanceMode();   // 更新UI状态
+            
+            SetTimer(hwnd, 1, 1000, nullptr); // 1秒后创建托盘图标
+
             if (IsAutoStartEnabled()) {
                 ShowWindow(hwnd, SW_HIDE);
                 g_isMinimized = true;
+            }
+            break;
+            
+        case WM_POWERBROADCAST:
+            if (wParam == PBT_APMPOWERSTATUSCHANGE) {
+                // 电源状态改变，3秒后恢复性能模式
+                SetTimer(hwnd, 100, 3000, NULL);
             }
             break;
             
@@ -662,6 +869,20 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             if (wParam == 1) {
                 KillTimer(hwnd, 1);
                 CreateTrayIcon();
+            } else if (wParam == 100) {
+                KillTimer(hwnd, 100);
+                // 3秒后恢复所有设置
+                // 恢复养护充电
+                bool careChecked = SendMessage(g_hBatteryCareCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;
+                wchar_t levelText[16];
+                GetWindowText(g_hBatteryLevelEdit, levelText, 16);
+                int careLevel = _wtoi(levelText);
+                if (careLevel < 0) careLevel = 0;
+                if (careLevel > 100) careLevel = 100;
+                SetBatteryCare(careChecked, careLevel);
+                // 恢复性能模式
+                int sel = (int)SendMessage(g_hPerformanceCombo, CB_GETCURSEL, 0, 0);
+                SetPerformanceMode(sel);
             }
             break;
             
@@ -714,43 +935,49 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         
         case WM_COMMAND:
             switch (LOWORD(wParam)) {
-                case ID_BATTERY_CARE_ENABLE: {
-                    bool isChecked = SendMessage(g_hBatteryCareCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;
-                    
-                    // 获取当前输入框的数值
-                    wchar_t text[16];
-                    GetWindowText(g_hBatteryLevelEdit, text, 16);
-                    int level = _wtoi(text);
-                    if (level < 0) level = 0;
-                    if (level > 100) level = 100;
-                    
-                    SetBatteryCare(isChecked, level);
-                    
-                    // 强制重绘复选框区域以更新透明背景
-                    InvalidateRect(g_hBatteryCareCheck, nullptr, TRUE);
-                    break;
-                }
-                case ID_BATTERY_LEVEL_EDIT: {
-                    if (HIWORD(wParam) == EN_CHANGE) {
-                        // 当输入框内容改变时，更新EC数据（如果养护充电已开启）
-                        if (SendMessage(g_hBatteryCareCheck, BM_GETCHECK, 0, 0) == BST_CHECKED) {
+                case ID_BATTERY_CARE_ENABLE:
+                case ID_BATTERY_LEVEL_EDIT:
+                case ID_PERFORMANCE_MODE:
+                    switch (LOWORD(wParam)) {
+                        case ID_BATTERY_CARE_ENABLE: {
+                            bool isChecked = SendMessage(g_hBatteryCareCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;
+                            
+                            // 获取当前输入框的数值
                             wchar_t text[16];
                             GetWindowText(g_hBatteryLevelEdit, text, 16);
                             int level = _wtoi(text);
-                            if (level >= 0 && level <= 100) {
-                                WriteEC(EC_BATTERY_LEVEL_ADDR, (BYTE)level);
+                            if (level < 0) level = 0;
+                            if (level > 100) level = 100;
+                            
+                            SetBatteryCare(isChecked, level);
+                            
+                            // 强制重绘复选框区域以更新透明背景
+                            InvalidateRect(g_hBatteryCareCheck, nullptr, TRUE);
+                            break;
+                        }
+                        case ID_BATTERY_LEVEL_EDIT: {
+                            if (HIWORD(wParam) == EN_CHANGE) {
+                                // 当输入框内容改变时，更新EC数据（如果养护充电已开启）
+                                if (SendMessage(g_hBatteryCareCheck, BM_GETCHECK, 0, 0) == BST_CHECKED) {
+                                    wchar_t text[16];
+                                    GetWindowText(g_hBatteryLevelEdit, text, 16);
+                                    int level = _wtoi(text);
+                                    if (level >= 0 && level <= 100) {
+                                        WriteEC(EC_BATTERY_LEVEL_ADDR, (BYTE)level);
+                                    }
+                                }
                             }
+                            break;
+                        }
+                        case ID_PERFORMANCE_MODE: {
+                            if (HIWORD(wParam) == CBN_SELCHANGE) {
+                                int sel = (int)SendMessage(g_hPerformanceCombo, CB_GETCURSEL, 0, 0);
+                                SetPerformanceMode(sel);
+                            }
+                            break;
                         }
                     }
                     break;
-                }
-                case ID_PERFORMANCE_MODE: {
-                    if (HIWORD(wParam) == CBN_SELCHANGE) {
-                        int sel = (int)SendMessage(g_hPerformanceCombo, CB_GETCURSEL, 0, 0);
-                        SetPerformanceMode(sel);
-                    }
-                    break;
-                }
                 case ID_MIN_BUTTON:
                     ShowWindow(hwnd, SW_HIDE);
                     g_isMinimized = true;
@@ -763,13 +990,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                     }
                     break;
                 case ID_CLOSE_BUTTON:
-                    PostQuitMessage(0);
+                    DestroyWindow(hwnd);
                     break;
                 case ID_TRAY_SHOW:
                     ToggleMainWindow();
                     break;
                 case ID_TRAY_EXIT:
-                    PostQuitMessage(0);
+                    DestroyWindow(hwnd);
                     break;
                 case ID_TRAY_BATTERY_ENABLE:
                     SetBatteryCare(true, 80);
@@ -797,6 +1024,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                     SetAutoStart(checked);
                     break;
                 }
+                case ID_REFRESH_BUTTON:
+                    UpdateBatteryCareStatus();
+                    UpdatePerformanceMode();
+                    break;
             }
             break;
             
@@ -838,7 +1069,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             break;
             
         case WM_DESTROY:
+            SaveConfig(); // 退出时保存
+            RemoveTrayIcon();
             UnregisterCustomHotKeys(hwnd);
+            DeinitializeWinRing0();
+            if (g_backgroundImage) {
+                delete g_backgroundImage;
+                g_backgroundImage = nullptr;
+            }
             PostQuitMessage(0);
             break;
             
@@ -859,6 +1097,18 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 // 主函数
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLine, int nCmdShow) {
     g_hInstance = hInstance; // 保存实例句柄
+
+    // 初始化COM
+    CoInitializeEx(NULL, COINIT_MULTITHREADED);
+
+    // 设置当前目录为程序所在目录，保证配置文件读写正确
+    wchar_t exePath[MAX_PATH];
+    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+    wchar_t* lastSlash = wcsrchr(exePath, L'\\');
+    if (lastSlash) {
+        *lastSlash = L'\0';
+        SetCurrentDirectoryW(exePath);
+    }
 
     // 初始化GDI+
     Gdiplus::GdiplusStartupInput gdiplusStartupInput;
@@ -914,7 +1164,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
 
     // 设置窗口半透明
     SetWindowLongPtr(g_hWnd, GWL_EXSTYLE, GetWindowLongPtr(g_hWnd, GWL_EXSTYLE) | WS_EX_LAYERED);
-    SetLayeredWindowAttributes(g_hWnd, 0, 150, LWA_ALPHA);
+    SetLayeredWindowAttributes(g_hWnd, 0, 180, LWA_ALPHA);
 
     // 检查是否自启动，若是则最小化
     if (IsAutoStartEnabled() && wcslen(lpCmdLine) == 0) {
@@ -939,6 +1189,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
 
     // 清理GDI+
     Gdiplus::GdiplusShutdown(gdiplusToken);
+
+    // 反初始化COM
+    CoUninitialize();
 
     return (int)msg.wParam;
 }
