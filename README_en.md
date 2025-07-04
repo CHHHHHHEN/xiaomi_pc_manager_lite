@@ -1,5 +1,8 @@
 # Xiaomi PC Manager Lite
 
+**ONLY Tested on Redmibook Pro 14 2025 Ultra 7 255H 32+1T Version，for other redmibook please refer to the link following and get exact ec values yourself**
+[Bilibili article](https://www.bilibili.com/opus/1085397596488335361)
+
 ## Introduction
 Xiaomi PC Manager Lite is a lightweight Windows tool designed for Xiaomi laptops, supporting battery care charging, performance mode switching, global hotkeys, tray operations, and auto-start features.
 

@@ -1,6 +1,9 @@
 # Xiaomi PC Manager Lite (小米电脑管家精简版)
 [English Version readme](README_en.md)
 
+**仅在Redmibook Pro 14 2025 Ultra 7 255H 32+1T版本上进行测试，其他版本使用前请自行验证**
+[B站专栏介绍](https://www.bilibili.com/opus/1085397596488335361)
+
 ## 简介
 Xiaomi PC Manager Lite 是一个为小米笔记本电脑设计的轻量级 Windows 工具，支持电池养护充电、性能模式切换、全局快捷键、托盘操作及自启动等功能。
 
