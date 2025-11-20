@@ -32,14 +32,5 @@ BEGIN
 END
 
 // 图标资源 - IDI_MAIN_ICON 作为程序的主图标
-IDI_MAIN_ICON           ICON    "resources/main_icon.ico"
+IDI_MAIN_ICON           ICON "resources/main_icon.ico"
 IDI_TRAY_ICON           ICON    "resources/tray_icon.ico"
-
-// 背景图像资源 (PNG格式)
-IDB_BACKGROUND          RCDATA  "resources/background.png"
-
-// 字符串资源
-STRINGTABLE
-BEGIN
-    IDS_APP_TITLE   "MI_PC_Manager_Lite"
-END

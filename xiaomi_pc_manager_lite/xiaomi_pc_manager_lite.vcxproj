@@ -130,7 +130,7 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="main.cpp" />
+    <ClCompile Include="main_clean.cpp" />
   </ItemGroup>
   <ItemGroup>
     <Image Include="resources\background.png" />
