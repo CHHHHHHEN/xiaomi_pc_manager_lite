@@ -29,7 +29,8 @@ const wchar_t* WINDOW_TITLE = L"小米电脑管家精简版";
 #define ID_EC_STATUS_BATTERY        1019
 #define ID_EC_STATUS_PERF           1020
 
-// 托盘相关
+#define ID_TRAY_RETRY_TIMER         2
+
 #define WM_TRAYICON   (WM_USER + 1)
 #define ID_TRAY_EXIT        2001
 #define ID_TRAY_SHOW   2002
@@ -80,6 +81,8 @@ bool g_isDragging = false;
 POINT g_dragOffset = {};
 HINSTANCE g_hInstance = nullptr;
 HBRUSH g_hBackgroundBrush = nullptr;
+UINT g_uTaskbarRestart = 0;
+
 
 // WinRing0相关
 HMODULE g_hWinRing0 = nullptr;
@@ -372,8 +375,13 @@ void CreateTrayIcon() {
 
 	wcscpy_s(g_nid.szTip, sizeof(g_nid.szTip) / sizeof(wchar_t), L"小米电脑管家精简版");
 
+	// 尝试添加图标，如果失败则设置定时器重试，而不是显示消息框
 	if (!Shell_NotifyIcon(NIM_ADD, &g_nid)) {
-		MessageBox(g_hWnd, L"创建托盘图标失败。", L"警告", MB_OK | MB_ICONWARNING);
+		// 失败后，每5秒重试一次
+		SetTimer(g_hWnd, ID_TRAY_RETRY_TIMER, 5000, nullptr);
+	} else {
+		// 成功后，确保重试定时器被清除
+		KillTimer(g_hWnd, ID_TRAY_RETRY_TIMER);
 	}
 }
 
@@ -539,6 +547,7 @@ void DrawBackground(HDC hdc, RECT* rect) {
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
 	switch (uMsg) {
 	case WM_CREATE:
+		g_uTaskbarRestart = RegisterWindowMessage(L"TaskbarCreated");
 		CreateControls(hwnd);
 		if (InitializeWinRing0()) {
 			LoadConfig();
@@ -561,6 +570,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 		if (wParam == 1) {
 			KillTimer(hwnd, 1);
 			CreateTrayIcon();
+		}
+		else if (wParam == ID_TRAY_RETRY_TIMER) {
+			// 托盘图标创建失败后的重试逻辑
+			CreateTrayIcon(); // CreateTrayIcon内部会在成功后KillTimer
 		}
 		else if (wParam == 100) {
 			KillTimer(hwnd, 100);
@@ -767,6 +780,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 		return DefWindowProc(hwnd, uMsg, wParam, lParam);
 
 	default:
+		// 处理任务栏重启消息
+		if (uMsg == g_uTaskbarRestart) {
+			CreateTrayIcon();
+		}
 		return DefWindowProc(hwnd, uMsg, wParam, lParam);
 	}
 	return 0;
