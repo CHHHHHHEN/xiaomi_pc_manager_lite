@@ -28,6 +28,8 @@ const wchar_t* WINDOW_TITLE = L"小米电脑管家精简版";
 #define ID_APPLY_BUTTON             1018
 #define ID_EC_STATUS_BATTERY        1019
 #define ID_EC_STATUS_PERF           1020
+#define ID_AUTO_APPLY_START         1021
+#define ID_AUTO_REAPPLY_POWER       1022
 
 #define ID_TRAY_RETRY_TIMER         2
 
@@ -75,6 +77,8 @@ HWND g_hPerfLabel = nullptr;
 HWND g_hApplyButton = nullptr;
 HWND g_hEcStatusBattery = nullptr;
 HWND g_hEcStatusPerf = nullptr;
+HWND g_hAutoApplyStartCheck = nullptr;
+HWND g_hAutoReapplyPowerCheck = nullptr;
 NOTIFYICONDATA g_nid = {};
 bool g_isMinimized = false;
 bool g_isDragging = false;
@@ -311,7 +315,7 @@ void SetPerformanceMode(int mode) {
 
 // 保存配置到文件
 void SaveConfig() {
-	if (!g_hBatteryCareCheck || !g_hBatteryLevelEdit || !g_hPerformanceCombo)
+	if (!g_hBatteryCareCheck || !g_hBatteryLevelEdit || !g_hPerformanceCombo || !g_hAutoApplyStartCheck || !g_hAutoReapplyPowerCheck)
 		return;
 
 	std::wofstream ofs(CONFIG_FILE);
@@ -325,9 +329,14 @@ void SaveConfig() {
 
 	int perfMode = (int)SendMessage(g_hPerformanceCombo, CB_GETCURSEL, 0, 0);
 
+	int autoApplyStart = SendMessage(g_hAutoApplyStartCheck, BM_GETCHECK, 0, 0) == BST_CHECKED ? 1 : 0;
+	int autoReapplyPower = SendMessage(g_hAutoReapplyPowerCheck, BM_GETCHECK, 0, 0) == BST_CHECKED ? 1 : 0;
+
 	ofs << L"battery_care=" << batteryCare << std::endl;
 	ofs << L"battery_level=" << batteryLevel << std::endl;
 	ofs << L"perf_mode=" << perfMode << std::endl;
+	ofs << L"auto_apply_start=" << autoApplyStart << std::endl;
+	ofs << L"auto_reapply_power=" << autoReapplyPower << std::endl;
 	ofs.close();
 }
 
@@ -338,11 +347,14 @@ void LoadConfig() {
 
 	std::wstring line;
 	int batteryCare = -1, batteryLevel = -1, perfMode = -1;
+	int autoApplyStart = -1, autoReapplyPower = -1;
 
 	while (std::getline(ifs, line)) {
 		if (line.find(L"battery_care=") == 0) batteryCare = std::stoi(line.substr(13));
 		else if (line.find(L"battery_level=") == 0) batteryLevel = std::stoi(line.substr(14));
 		else if (line.find(L"perf_mode=") == 0) perfMode = std::stoi(line.substr(10));
+		else if (line.find(L"auto_apply_start=") == 0) autoApplyStart = std::stoi(line.substr(17));
+		else if (line.find(L"auto_reapply_power=") == 0) autoReapplyPower = std::stoi(line.substr(19));
 	}
 
 	if (batteryCare != -1)
@@ -357,6 +369,12 @@ void LoadConfig() {
 
 	if (perfMode != -1)
 		SendMessage(g_hPerformanceCombo, CB_SETCURSEL, perfMode, 0);
+
+	if (autoApplyStart != -1)
+		SendMessage(g_hAutoApplyStartCheck, BM_SETCHECK, autoApplyStart ? BST_CHECKED : BST_UNCHECKED, 0);
+
+	if (autoReapplyPower != -1)
+		SendMessage(g_hAutoReapplyPowerCheck, BM_SETCHECK, autoReapplyPower ? BST_CHECKED : BST_UNCHECKED, 0);
 }
 
 // 创建托盘图标
@@ -487,6 +505,16 @@ void CreateControls(HWND hwnd) {
 	SendMessage(g_hPerformanceCombo, CB_SETCURSEL, 2, 0);
 	y += 32 + spacing;
 
+	g_hAutoApplyStartCheck = CreateWindow(L"BUTTON", L"启动时自动应用配置",
+		WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX,
+		left, y, width, 28, hwnd, (HMENU)ID_AUTO_APPLY_START, GetModuleHandle(nullptr), nullptr);
+	y += 28 + spacing;
+
+	g_hAutoReapplyPowerCheck = CreateWindow(L"BUTTON", L"电源变动时自动重用配置",
+		WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX,
+		left, y, width, 28, hwnd, (HMENU)ID_AUTO_REAPPLY_POWER, GetModuleHandle(nullptr), nullptr);
+	y += 28 + spacing;
+
 	CreateWindow(L"BUTTON", L"刷新状态",
 		WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
 		left, y, 110, 32, hwnd, (HMENU)ID_REFRESH_BUTTON, GetModuleHandle(nullptr), nullptr);
@@ -551,6 +579,18 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 		CreateControls(hwnd);
 		if (InitializeWinRing0()) {
 			LoadConfig();
+			if (SendMessage(g_hAutoApplyStartCheck, BM_GETCHECK, 0, 0) == BST_CHECKED) {
+				bool isChecked = SendMessage(g_hBatteryCareCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;
+				wchar_t text[16];
+				GetWindowText(g_hBatteryLevelEdit, text, 16);
+				int level = _wtoi(text);
+				if (level < 0) level = 0;
+				if (level > 100) level = 100;
+				SetBatteryCare(isChecked, level);
+
+				int sel = (int)SendMessage(g_hPerformanceCombo, CB_GETCURSEL, 0, 0);
+				SetPerformanceMode(sel);
+			}
 		}
 		else {
 			LoadConfig();
@@ -578,16 +618,18 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 		else if (wParam == 100) {
 			KillTimer(hwnd, 100);
 			// 电源状态改变时自动重新应用设置
-			bool careChecked = SendMessage(g_hBatteryCareCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;
-			wchar_t levelText[16];
-			GetWindowText(g_hBatteryLevelEdit, levelText, 16);
-			int careLevel = _wtoi(levelText);
-			if (careLevel < 0) careLevel = 0;
-			if (careLevel > 100) careLevel = 100;
-			SetBatteryCare(careChecked, careLevel);
-			
-			int sel = (int)SendMessage(g_hPerformanceCombo, CB_GETCURSEL, 0, 0);
-			SetPerformanceMode(sel);
+			if (SendMessage(g_hAutoReapplyPowerCheck, BM_GETCHECK, 0, 0) == BST_CHECKED) {
+				bool careChecked = SendMessage(g_hBatteryCareCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;
+				wchar_t levelText[16];
+				GetWindowText(g_hBatteryLevelEdit, levelText, 16);
+				int careLevel = _wtoi(levelText);
+				if (careLevel < 0) careLevel = 0;
+				if (careLevel > 100) careLevel = 100;
+				SetBatteryCare(careChecked, careLevel);
+
+				int sel = (int)SendMessage(g_hPerformanceCombo, CB_GETCURSEL, 0, 0);
+				SetPerformanceMode(sel);
+			}
 		}
 		break;
 
@@ -825,7 +867,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
 	}
 
 	const int windowWidth = 650;
-	const int windowHeight = 420;  // 减小高度，移除了键盘背光控件
+	const int windowHeight = 520;  // 增加高度以容纳新控件
 	g_hWnd = CreateWindowEx(
 		0,
 		CLASS_NAME,
