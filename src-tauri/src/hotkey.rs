@@ -1,20 +1,15 @@
 use std::sync::OnceLock;
 use tauri::{AppHandle, Emitter, Manager};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    RegisterHotKey, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT,
+    RegisterHotKey, MOD_ALT, MOD_CONTROL,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetMessageW, SetWindowLongPtrW, TranslateMessage,
-    WINDOW_EX_STYLE, WINDOW_STYLE, MSG, GWLP_WNDPROC, WM_HOTKEY,
+    DefWindowProcW, WM_HOTKEY,
 };
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::Foundation::{HWND, HINSTANCE, LPARAM, LRESULT, WPARAM};
-use windows::core::PCWSTR;
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 
 const HOTKEY_TOGGLE_BATTERY: i32 = 1;
 const HOTKEY_CYCLE_PERF: i32 = 2;
-const HWND_MESSAGE: HWND = HWND(std::ptr::with_exposed_provenance_mut(-3isize as usize));
 
 static APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
 
@@ -25,43 +20,21 @@ pub fn setup_hotkeys(app: AppHandle) {
 
 fn hotkey_message_loop() {
     unsafe {
-        let hinstance = HINSTANCE(GetModuleHandleW(None).unwrap().0);
-
-        let class_name: Vec<u16> = "STATIC\0".encode_utf16().collect();
-
-        let hwnd = CreateWindowExW(
-            WINDOW_EX_STYLE::default(),
-            PCWSTR::from_raw(class_name.as_ptr()),
-            PCWSTR::null(),
-            WINDOW_STYLE::default(),
-            0, 0, 0, 0,
-            Some(HWND_MESSAGE),
-            None,
-            Some(hinstance),
-            None,
-        );
-
-        let hwnd = match hwnd {
+        let hwnd = match crate::msg_window::create_message_window() {
             Ok(w) => w,
             Err(e) => {
-                log::error!("CreateWindowExW for hotkey window failed: {}", e);
+                log::error!("Create hotkey window failed: {}", e);
                 return;
             }
         };
 
-        SetWindowLongPtrW(hwnd, GWLP_WNDPROC, hotkey_wndproc as *const () as isize);
+        crate::msg_window::set_wndproc(hwnd, hotkey_wndproc);
 
-        let mods = MOD_CONTROL | MOD_ALT | MOD_NOREPEAT;
+        let mods = MOD_CONTROL | MOD_ALT;
         let _ = RegisterHotKey(Some(hwnd), HOTKEY_TOGGLE_BATTERY, mods, 0x42); // B
         let _ = RegisterHotKey(Some(hwnd), HOTKEY_CYCLE_PERF, mods, 0x50);     // P
 
-        let mut msg = MSG::default();
-        while GetMessageW(&mut msg, None, 0, 0).into() {
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
-
-        let _ = DestroyWindow(hwnd);
+        crate::msg_window::message_loop(hwnd);
     }
 }
 

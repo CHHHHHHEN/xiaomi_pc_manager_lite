@@ -17,6 +17,10 @@ pub fn extract_winring0() -> Result<PathBuf, String> {
         .ok_or_else(|| format!("{} not found in embedded binaries", dll_name))?;
 
     let temp_dir = std::env::temp_dir().join("XiaomiPcManagerLite").join("bin");
+    // Clean up stale files from previous runs before extracting
+    if temp_dir.exists() {
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
     std::fs::create_dir_all(&temp_dir)
         .map_err(|e| format!("create temp dir: {}", e))?;
 

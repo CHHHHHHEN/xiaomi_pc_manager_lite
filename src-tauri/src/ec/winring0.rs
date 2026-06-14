@@ -14,6 +14,7 @@ fn ec_wait_write(rp: ReadPort) {
         if unsafe { rp(EC_CMD) } & 0x02 == 0 {
             break;
         }
+        core::hint::spin_loop();
     }
 }
 
@@ -22,6 +23,7 @@ fn ec_wait_read(rp: ReadPort) {
         if unsafe { rp(EC_CMD) } & 0x01 == 0 {
             break;
         }
+        core::hint::spin_loop();
     }
 }
 

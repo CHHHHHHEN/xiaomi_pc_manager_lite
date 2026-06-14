@@ -1,18 +1,12 @@
 use std::sync::OnceLock;
 use tauri::{AppHandle, Manager};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetMessageW, SetWindowLongPtrW, TranslateMessage,
-    WINDOW_EX_STYLE, WINDOW_STYLE, MSG, GWLP_WNDPROC,
+    DefWindowProcW,
 };
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-
-const PBT_APMPOWERSTATUSCHANGE: u32 = 0x0018u32;
-use windows::Win32::Foundation::{HWND, HINSTANCE, LPARAM, LRESULT, WPARAM};
-use windows::core::PCWSTR;
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 
 const WM_POWERBROADCAST: u32 = 0x0218u32;
-const HWND_MESSAGE: HWND = HWND(std::ptr::with_exposed_provenance_mut(-3isize as usize));
+const PBT_APMPOWERSTATUSCHANGE: u32 = 0x0018u32;
 
 static POWER_APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
 
@@ -23,39 +17,16 @@ pub fn start_power_monitor(app: AppHandle) {
 
 fn power_message_loop() {
     unsafe {
-        let hinstance = HINSTANCE(GetModuleHandleW(None).unwrap().0);
-
-        let class_name: Vec<u16> = "STATIC\0".encode_utf16().collect();
-
-        let hwnd = CreateWindowExW(
-            WINDOW_EX_STYLE::default(),
-            PCWSTR::from_raw(class_name.as_ptr()),
-            PCWSTR::null(),
-            WINDOW_STYLE::default(),
-            0, 0, 0, 0,
-            Some(HWND_MESSAGE),
-            None,
-            Some(hinstance),
-            None,
-        );
-
-        let hwnd = match hwnd {
+        let hwnd = match crate::msg_window::create_message_window() {
             Ok(w) => w,
             Err(e) => {
-                log::error!("CreateWindowExW for power event window failed: {}", e);
+                log::error!("Create power event window failed: {}", e);
                 return;
             }
         };
 
-        SetWindowLongPtrW(hwnd, GWLP_WNDPROC, power_wndproc as *const () as isize);
-
-        let mut msg = MSG::default();
-        while GetMessageW(&mut msg, None, 0, 0).into() {
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
-
-        let _ = DestroyWindow(hwnd);
+        crate::msg_window::set_wndproc(hwnd, power_wndproc);
+        crate::msg_window::message_loop(hwnd);
     }
 }
 
@@ -86,20 +57,25 @@ fn reapply_config_on_power_change(app: &AppHandle) {
             if !config.auto_reapply_on_power_change {
                 return;
             }
+            let battery_care = config.battery_care_enabled;
+            let charge_limit = config.battery_charge_limit;
+            let perf_mode = config.performance_mode;
+            drop(config);
+
             if let Ok(backend) = state.backend.lock() {
-                if let Err(e) = backend.set_battery_care(config.battery_care_enabled) {
+                if let Err(e) = backend.set_battery_care(battery_care) {
                     log::warn!("re-apply battery care: {}", e);
                 }
-                if let Err(e) = backend.set_charge_limit(config.battery_charge_limit) {
+                if let Err(e) = backend.set_charge_limit(charge_limit) {
                     log::warn!("re-apply charge limit: {}", e);
                 }
-                if let Err(e) = backend.set_performance_mode(config.performance_mode) {
+                if let Err(e) = backend.set_performance_mode(perf_mode) {
                     log::warn!("re-apply perf mode: {}", e);
                 }
             }
 
             if let Some(tray) = app.try_state::<crate::tray::TrayState<tauri::Wry>>() {
-                let _ = tray.battery_care.set_checked(config.battery_care_enabled);
+                let _ = tray.battery_care.set_checked(battery_care);
             }
         }
     }

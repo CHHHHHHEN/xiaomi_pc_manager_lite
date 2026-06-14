@@ -68,10 +68,8 @@ pub fn get_config(state: tauri::State<AppState>) -> Result<ec::config::AppConfig
 
 #[tauri::command]
 pub fn save_config(state: tauri::State<AppState>, config: ec::config::AppConfig) -> Result<(), String> {
-    {
-        let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
-        *cfg = config.clone();
-    }
-    config.save().map_err(|e| e.to_string())?;
+    let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
+    *cfg = config;
+    cfg.save().map_err(|e| e.to_string())?;
     Ok(())
 }

@@ -1,12 +1,21 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { onMount } from "svelte";
+  import { listen } from "@tauri-apps/api/event";
   import TitleBar from "./lib/TitleBar.svelte";
   import EcStatus from "./lib/EcStatus.svelte";
   import BatteryCare from "./lib/BatteryCare.svelte";
   import PerformanceMode from "./lib/PerformanceMode.svelte";
   import SettingsPanel from "./lib/SettingsPanel.svelte";
   import "./styles/global.css";
+
+  interface StatusResponse {
+    backend: string;
+    available: boolean;
+    battery_care_enabled: boolean;
+    charge_limit: number;
+    performance_mode: number;
+  }
 
   let backend = $state("");
   let available = $state(false);
@@ -19,7 +28,7 @@
 
   async function loadStatus() {
     try {
-      const s: any = await invoke("get_status");
+      const s = await invoke<StatusResponse>("get_status");
       backend = s.backend;
       available = s.available;
       batteryCareEnabled = s.battery_care_enabled;
@@ -89,29 +98,27 @@
 
     const unlisteners: Array<() => void> = [];
 
-    import("@tauri-apps/api/event").then(({ listen }) => {
-      listen("tray-toggle-battery-care", () => {
-        handleBatteryToggle(!batteryCareEnabled);
-      }).then((u) => unlisteners.push(u));
+    listen("tray-toggle-battery-care", () => {
+      handleBatteryToggle(!batteryCareEnabled);
+    }).then((u) => unlisteners.push(u));
 
-      listen<string>("tray-set-perf-mode", (e) => {
-        const modeName = e.payload.toLowerCase();
-        const modeMap: Record<string, number> = {
-          eco: 0x0A, quiet: 0x02, smart: 0x09, fast: 0x03, extreme: 0x04,
-        };
-        if (modeName in modeMap) {
-          handlePerfModeChange(modeMap[modeName]);
-        }
-      }).then((u) => unlisteners.push(u));
+    listen<string>("tray-set-perf-mode", (e) => {
+      const modeName = e.payload.toLowerCase();
+      const modeMap: Record<string, number> = {
+        eco: 0x0A, quiet: 0x02, smart: 0x09, fast: 0x03, extreme: 0x04,
+      };
+      if (modeName in modeMap) {
+        handlePerfModeChange(modeMap[modeName]);
+      }
+    }).then((u) => unlisteners.push(u));
 
-      listen("hotkey-toggle-battery-care", () => {
-        handleBatteryToggle(!batteryCareEnabled);
-      }).then((u) => unlisteners.push(u));
+    listen("hotkey-toggle-battery-care", () => {
+      handleBatteryToggle(!batteryCareEnabled);
+    }).then((u) => unlisteners.push(u));
 
-      listen("hotkey-cycle-perf-mode", () => {
-        handlePerfModeChange(getNextPerfMode(perfMode));
-      }).then((u) => unlisteners.push(u));
-    });
+    listen("hotkey-cycle-perf-mode", () => {
+      handlePerfModeChange(getNextPerfMode(perfMode));
+    }).then((u) => unlisteners.push(u));
 
     return () => unlisteners.forEach((u) => u());
   });

@@ -1,5 +1,5 @@
 use tauri::{
-    AppHandle, Manager, Runtime,
+    AppHandle, Emitter, Manager, Runtime,
     menu::{CheckMenuItem, CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder, SubmenuBuilder, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     image::Image,
@@ -93,18 +93,22 @@ fn handle_tray_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
     match id.as_ref() {
         "battery_care" => {
             if let Some(state) = app.try_state::<AppState>() {
-                let new_state = {
-                    let mut config = state.config.lock().unwrap();
+                let result = (|| -> Result<(), String> {
+                    let mut config = state.config.lock().map_err(|e| e.to_string())?;
                     let new_val = !config.battery_care_enabled;
                     config.battery_care_enabled = new_val;
                     if let Ok(backend) = state.backend.lock() {
-                        let _ = backend.set_battery_care(new_val);
+                        backend.set_battery_care(new_val).ok();
                     }
-                    config.save().ok();
-                    new_val
-                };
-                if let Some(tray) = app.try_state::<TrayState<tauri::Wry>>() {
-                    let _ = tray.battery_care.set_checked(new_state);
+                    config.save()?;
+                    if let Some(tray) = app.try_state::<TrayState<tauri::Wry>>() {
+                        tray.battery_care.set_checked(new_val).ok();
+                    }
+                    let _ = app.emit("tray-toggle-battery-care", ());
+                    Ok(())
+                })();
+                if let Err(e) = result {
+                    log::error!("tray battery_care: {}", e);
                 }
             }
         }
@@ -115,14 +119,21 @@ fn handle_tray_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
                 .find(|m| m.name().to_lowercase() == mode_name)
             {
                 let mode_val = *mode as u8;
-                if let Some(state) = app.try_state::<AppState>() {
-                    if let Ok(backend) = state.backend.lock() {
-                        let _ = backend.set_performance_mode(mode_val);
+                let result = (|| -> Result<(), String> {
+                    if let Some(state) = app.try_state::<AppState>() {
+                        if let Ok(backend) = state.backend.lock() {
+                            backend.set_performance_mode(mode_val).map_err(|e| e.to_string())?;
+                        }
+                        if let Ok(mut config) = state.config.lock() {
+                            config.performance_mode = mode_val;
+                            config.save()?;
+                        }
                     }
-                    if let Ok(mut config) = state.config.lock() {
-                        config.performance_mode = mode_val;
-                        config.save().ok();
-                    }
+                    let _ = app.emit("tray-set-perf-mode", mode_name);
+                    Ok(())
+                })();
+                if let Err(e) = result {
+                    log::error!("tray perf mode: {}", e);
                 }
             }
         }

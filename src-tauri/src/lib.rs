@@ -4,6 +4,7 @@ pub mod embed;
 pub mod tray;
 pub mod hotkey;
 pub mod power_event;
+mod msg_window;
 
 use std::sync::Mutex;
 
@@ -34,7 +35,8 @@ pub fn run() {
         Ok(b) => b,
         Err(e) => {
             log::error!("Failed to create EC backend: {}", e);
-            panic!("EC backend required: {:?}", e);
+            eprintln!("Fatal: EC backend initialization failed: {}", e);
+            std::process::exit(1);
         }
     };
     log::info!("EC backend: {}", backend.name());
