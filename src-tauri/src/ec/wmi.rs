@@ -4,8 +4,8 @@ use super::backend::EcBackend;
 use super::battery;
 use super::error::EcError;
 use windows::Win32::System::Com::{
-    CoInitializeEx, CoSetProxyBlanket, CoCreateInstance, CLSCTX_ALL, COINIT_MULTITHREADED,
-    EOAC_NONE, RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE,
+    CoInitializeEx, CoSetProxyBlanket, CoCreateInstance, CLSCTX_ALL,
+    COINIT_MULTITHREADED, EOAC_NONE, RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE,
 };
 use windows::Win32::System::Ole::SafeArrayCreateVector;
 use windows::Win32::System::Ole::{SafeArrayAccessData, SafeArrayUnaccessData, SafeArrayDestroy};
@@ -31,6 +31,12 @@ const CMD_WRITE: u16 = 0xFB00;
 const FUN2_BATTERY: u16 = 0x1000;
 const FUN2_PERF: u16 = 0x0800;
 
+unsafe fn ensure_mta() -> Result<(), EcError> {
+    CoInitializeEx(None, COINIT_MULTITHREADED)
+        .ok()
+        .map_err(|e| EcError::WmiConnect(format!("COM init: {}", e)))
+}
+
 fn to_le16(buf: &mut [u8; 32], offset: usize, val: u16) {
     buf[offset] = (val & 0xFF) as u8;
     buf[offset + 1] = ((val >> 8) & 0xFF) as u8;
@@ -50,8 +56,7 @@ unsafe impl Sync for WmiBackend {}
 impl WmiBackend {
     pub fn new() -> Result<Self, EcError> {
         unsafe {
-            CoInitializeEx(None, COINIT_MULTITHREADED).ok()
-                .map_err(|e| EcError::WmiConnect(format!("COM init: {}", e)))?;
+            ensure_mta()?;
 
             let locator: IWbemLocator = CoCreateInstance(&CLSID_WbemLocator, None, CLSCTX_ALL)
                 .map_err(|e| EcError::WmiConnect(format!("CoCreateInstance: {}", e)))?;
@@ -239,6 +244,7 @@ impl EcBackend for WmiBackend {
     }
 
     fn read_byte(&self, addr: u16) -> Result<u8, EcError> {
+        unsafe { ensure_mta()?; }
         let buf = match addr {
             0x68 => self.read_perf()?,
             0xA4 | 0xA7 => self.read_battery()?,
@@ -248,6 +254,7 @@ impl EcBackend for WmiBackend {
     }
 
     fn write_byte(&self, addr: u16, value: u8) -> Result<(), EcError> {
+        unsafe { ensure_mta()?; }
         match addr {
             0x68 => self.write_perf(value),
             0xA4 | 0xA7 => self.write_battery(value),
@@ -256,6 +263,7 @@ impl EcBackend for WmiBackend {
     }
 
     fn get_battery_care_enabled(&self) -> Result<bool, EcError> {
+        unsafe { ensure_mta()?; }
         let buf = self.read_battery()?;
         let limit = from_le16(&buf, 4);
         let raw = limit as u8;
@@ -264,12 +272,14 @@ impl EcBackend for WmiBackend {
     }
 
     fn get_charge_limit(&self) -> Result<u8, EcError> {
+        unsafe { ensure_mta()?; }
         let buf = self.read_battery()?;
         let raw = buf[4];
         Ok(battery::wmi_rawcode_to_percent(raw).unwrap_or(100))
     }
 
     fn set_battery_care(&self, enabled: bool) -> Result<(), EcError> {
+        unsafe { ensure_mta()?; }
         let current = self.get_charge_limit()?;
         if enabled {
             if current == 100 {
@@ -282,6 +292,7 @@ impl EcBackend for WmiBackend {
     }
 
     fn set_charge_limit(&self, percent: u8) -> Result<(), EcError> {
+        unsafe { ensure_mta()?; }
         let percent = percent.min(100);
         let raw = battery::percent_to_wmi_rawcode(percent)
             .or_else(|| Some(battery::nearest_wmi_percent(percent)))
@@ -290,11 +301,13 @@ impl EcBackend for WmiBackend {
     }
 
     fn get_performance_mode(&self) -> Result<u8, EcError> {
+        unsafe { ensure_mta()?; }
         let buf = self.read_perf()?;
         Ok(buf[4])
     }
 
     fn set_performance_mode(&self, mode: u8) -> Result<(), EcError> {
+        unsafe { ensure_mta()?; }
         self.write_perf(mode)
     }
 }

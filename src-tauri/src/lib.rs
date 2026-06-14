@@ -30,7 +30,15 @@ fn apply_startup_config(backend: &dyn ec::backend::EcBackend, config: &ec::confi
 pub fn run() {
     env_logger::init();
 
-    let backend = ec::backend::create_backend(ec::config::BackendPreference::Auto);
+    // Spawn backend creation on a background thread so that
+    // CoInitializeEx(MTA) in the WMI backend doesn't conflict
+    // with Tauri's OleInitialize on the main thread.
+    let backend = std::thread::spawn(|| {
+        ec::backend::create_backend(ec::config::BackendPreference::Auto)
+    })
+    .join()
+    .expect("backend init thread panicked");
+
     let backend = match backend {
         Ok(b) => b,
         Err(e) => {
