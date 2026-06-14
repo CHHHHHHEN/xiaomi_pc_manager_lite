@@ -1,5 +1,9 @@
 pub mod commands;
 pub mod ec;
+pub mod embed;
+pub mod tray;
+pub mod hotkey;
+pub mod power_event;
 
 use std::sync::Mutex;
 
@@ -59,6 +63,20 @@ pub fn run() {
         .manage(AppState {
             backend: Mutex::new(backend),
             config: Mutex::new(config),
+        })
+        .setup(|app| {
+            let handle = app.handle();
+            tray::setup_tray(handle).unwrap_or_else(|e| {
+                log::error!("Failed to setup tray: {}", e);
+            });
+
+            let app_hotkey = app.handle().clone();
+            hotkey::setup_hotkeys(app_hotkey);
+
+            let app_power = app.handle().clone();
+            power_event::start_power_monitor(app_power);
+
+            Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_backend_name,

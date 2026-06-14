@@ -31,27 +31,27 @@
 
 ## ⏳ 待完成
 
-### 中优先级
+### 中优先级 ✅ 已完成
 
 #### tray.rs — 系统托盘
-- 托盘图标 + 右键菜单
-- 菜单项：电池养护开关、性能模式切换、显示/隐藏窗口、退出
-- Tauri v2 `TrayIconBuilder` API
+- [x] 托盘图标 + 右键菜单
+- [x] 菜单项：电池养护开关、性能模式切换、显示/隐藏窗口、退出
+- [x] Tauri v2 `TrayIconBuilder` API
 
 #### hotkey.rs — 全局快捷键
-- 需要添加 `global-hotkey` crate 到 Cargo.toml（计划版本 0.8）
-- `Ctrl+Alt+B` 切换电池养护
-- `Ctrl+Alt+P` 循环切换性能模式
+- [x] Windows `RegisterHotKey` API（已添加 `Win32_UI_Input_KeyboardAndMouse` feature）
+- [x] `Ctrl+Alt+B` 切换电池养护（发送 hotkey-toggle-battery-care 事件到前端）
+- [x] `Ctrl+Alt+P` 循环切换性能模式（发送 hotkey-cycle-perf-mode 事件到前端）
 
 #### power_event.rs — 电源监听
-- Windows `WM_POWERBROADCAST` / `PBT_APMPOWERSTATUSCHANGE`
-- 监听电源状态变化 → 自动重应用配置（auto_reapply_on_power_change）
-- 需要 `Win32_System_Power` feature（已添加）
+- [x] 消息窗口监听 `WM_POWERBROADCAST` / `PBT_APMPOWERSTATUSCHANGE`
+- [x] 监听电源状态变化 → 自动重应用配置（auto_reapply_on_power_change）
+- [x] 集成 `tray::sync_tray_state` 同步托盘状态
 
 #### WinRing0 DLL/SYS 嵌入 + 运行时释放
-- 使用 `rust-embed` 将 `WinRing0x64.dll` / `.sys` 嵌入 exe
-- 启动时释放到临时目录或 exe 同级
-- 进程退出时清理
+- [x] 使用 `rust-embed` 将 `WinRing0x64.dll` 嵌入 exe
+- [x] 启动时释放到临时目录（`%TEMP%\XiaomiPcManagerLite\bin\`）
+- [x] 进程退出时清理（`embed::cleanup_temp()`）
 
 ---
 

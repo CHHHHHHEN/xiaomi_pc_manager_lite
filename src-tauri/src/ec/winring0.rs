@@ -34,32 +34,51 @@ pub struct WinRing0Backend {
 unsafe impl Send for WinRing0Backend {}
 unsafe impl Sync for WinRing0Backend {}
 
+fn dll_name() -> &'static str {
+    if cfg!(target_pointer_width = "64") {
+        "WinRing0x64.dll"
+    } else {
+        "WinRing0.dll"
+    }
+}
+
+fn try_load(dll_path: &str) -> Result<(Library, ReadPort, WritePort), EcError> {
+    let lib = unsafe { Library::new(dll_path) }
+        .map_err(|e| EcError::DllLoad(e.to_string()))?;
+
+    let init: unsafe extern "system" fn() -> i32 =
+        *unsafe { lib.get(b"InitializeOls") }
+            .map_err(|e| EcError::DllLoad(e.to_string()))?;
+
+    if unsafe { init() } != 0 {
+        return Err(EcError::InitFailed);
+    }
+
+    let rp: ReadPort = *unsafe { lib.get(b"ReadIoPortByte") }
+        .map_err(|e| EcError::DllLoad(e.to_string()))?;
+
+    let wp: WritePort = *unsafe { lib.get(b"WriteIoPortByte") }
+        .map_err(|e| EcError::DllLoad(e.to_string()))?;
+
+    Ok((lib, rp, wp))
+}
+
 impl WinRing0Backend {
     pub fn new() -> Result<Self, EcError> {
-        let dll_name = if cfg!(target_pointer_width = "64") {
-            "WinRing0x64.dll"
-        } else {
-            "WinRing0.dll"
-        };
+        let name = dll_name();
 
-        let lib = unsafe { Library::new(dll_name) }
-            .map_err(|e| EcError::DllLoad(e.to_string()))?;
-
-        let init: unsafe extern "system" fn() -> i32 =
-            *unsafe { lib.get(b"InitializeOls") }
-                .map_err(|e| EcError::DllLoad(e.to_string()))?;
-
-        if unsafe { init() } != 0 {
-            return Err(EcError::InitFailed);
+        if let Ok(result) = try_load(name) {
+            return Ok(Self { _lib: result.0, rp: result.1, wp: result.2 });
         }
 
-        let rp: ReadPort = *unsafe { lib.get(b"ReadIoPortByte") }
-            .map_err(|e| EcError::DllLoad(e.to_string()))?;
+        if let Ok(extracted_path) = crate::embed::extract_winring0() {
+            let path_str = extracted_path.to_string_lossy().to_string();
+            if let Ok(result) = try_load(&path_str) {
+                return Ok(Self { _lib: result.0, rp: result.1, wp: result.2 });
+            }
+        }
 
-        let wp: WritePort = *unsafe { lib.get(b"WriteIoPortByte") }
-            .map_err(|e| EcError::DllLoad(e.to_string()))?;
-
-        Ok(Self { _lib: lib, rp, wp })
+        Err(EcError::DllLoad(format!("{} not found on disk or embedded", name)))
     }
 }
 

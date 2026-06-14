@@ -12,7 +12,7 @@ crate-type = ["lib", "cdylib", "staticlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", default-features = false, features = ["tray-icon", "wry"] }
+tauri = { version = "2", default-features = false, features = ["tray-icon", "wry", "image-ico"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-process = "2"
 tauri-plugin-shell = "2"
@@ -30,10 +30,12 @@ rust-embed = "8"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_System_Power",
     "Win32_System_LibraryLoader",
     "Win32_System_Registry",
     "Win32_System_Com",
+    "Win32_System_Variant",
     "Win32_System_Wmi",
     "Win32_System_Ole",
 ]}

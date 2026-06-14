@@ -7,8 +7,9 @@ node_modules/
 dist/
 .vite/
 
-# Tauri
-src-tauri/bin/
+# Tauri - WinRing0 DLL/SYS (users obtain separately)
+src-tauri/bin/*.dll
+src-tauri/bin/*.sys
 
 # IDE
 .vs/

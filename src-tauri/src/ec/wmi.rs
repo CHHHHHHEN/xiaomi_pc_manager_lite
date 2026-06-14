@@ -11,15 +11,16 @@ use windows::Win32::System::Ole::SafeArrayCreateVector;
 use windows::Win32::System::Ole::{SafeArrayAccessData, SafeArrayUnaccessData, SafeArrayDestroy};
 use windows::Win32::System::Variant::{VARIANT, VARENUM, VT_ARRAY, VT_UI1};
 use windows::Win32::System::Wmi::*;
-use windows_core::{BSTR, GUID, PCWSTR};
+use windows::core::{BSTR, GUID, PCWSTR};
 
 /// CLSID_WbemLocator — uuid DC12A687-737F-11CF-884D-00AA004B2E24
-const CLSID_WbemLocator: GUID = GUID::new(
-    0xDC12A687,
-    0x737F,
-    0x11CF,
-    [0x88, 0x4D, 0x00, 0xAA, 0x00, 0x4B, 0x2E, 0x24],
-);
+#[allow(non_upper_case_globals)]
+const CLSID_WbemLocator: GUID = GUID {
+    data1: 0xDC12A687,
+    data2: 0x737F,
+    data3: 0x11CF,
+    data4: [0x88, 0x4D, 0x00, 0xAA, 0x00, 0x4B, 0x2E, 0x24],
+};
 
 const RPC_C_AUTHN_WINNT: u32 = 10u32;
 const RPC_C_AUTHZ_NONE: u32 = 0u32;
@@ -43,10 +44,13 @@ pub struct WmiBackend {
     services: IWbemServices,
 }
 
+unsafe impl Send for WmiBackend {}
+unsafe impl Sync for WmiBackend {}
+
 impl WmiBackend {
     pub fn new() -> Result<Self, EcError> {
         unsafe {
-            CoInitializeEx(None, COINIT_MULTITHREADED)
+            CoInitializeEx(None, COINIT_MULTITHREADED).ok()
                 .map_err(|e| EcError::WmiConnect(format!("COM init: {}", e)))?;
 
             let locator: IWbemLocator = CoCreateInstance(&CLSID_WbemLocator, None, CLSCTX_ALL)
@@ -74,7 +78,8 @@ impl WmiBackend {
                 None,
                 EOAC_NONE,
             )
-            .map_err(|e| EcError::WmiConnect(format!("CoSetProxyBlanket: {}", e)))?;
+            .ok()
+            .ok_or(EcError::WmiConnect("CoSetProxyBlanket failed".into()))?;
 
             Ok(Self { services })
         }
@@ -114,14 +119,24 @@ impl WmiBackend {
 
             let mut data_ptr: *mut core::ffi::c_void = std::ptr::null_mut();
             SafeArrayAccessData(sa, &mut data_ptr)
-                .map_err(|e| EcError::WmiConnect(format!("SafeArrayAccessData: {}", e)))?;
+                .ok()
+                .ok_or(EcError::WmiConnect("SafeArrayAccessData failed".into()))?;
             std::ptr::copy_nonoverlapping(buffer.as_ptr(), data_ptr as *mut u8, 32);
             SafeArrayUnaccessData(sa)
-                .map_err(|e| EcError::WmiConnect(format!("SafeArrayUnaccessData: {}", e)))?;
+                .ok()
+                .ok_or(EcError::WmiConnect("SafeArrayUnaccessData failed".into()))?;
 
-            let mut v = VARIANT::default();
-            v.Anonymous.Anonymous.vt = VARENUM(VT_ARRAY.0 | VT_UI1.0);
-            v.Anonymous.Anonymous.Anonymous.parray = sa;
+            let v = VARIANT {
+                Anonymous: windows::Win32::System::Variant::VARIANT_0 {
+                    Anonymous: core::mem::ManuallyDrop::new(windows::Win32::System::Variant::VARIANT_0_0 {
+                        vt: VARENUM(VT_ARRAY.0 | VT_UI1.0),
+                        wReserved1: 0,
+                        wReserved2: 0,
+                        wReserved3: 0,
+                        Anonymous: windows::Win32::System::Variant::VARIANT_0_0_0 { parray: sa as *mut windows::Win32::System::Com::SAFEARRAY },
+                    }),
+                },
+            };
 
             let prop_name = to_pcwstr("Buffer");
             in_params
@@ -129,7 +144,8 @@ impl WmiBackend {
                 .map_err(|e| EcError::WmiConnect(format!("Put Buffer: {}", e)))?;
 
             SafeArrayDestroy(sa)
-                .map_err(|e| EcError::WmiConnect(format!("SafeArrayDestroy: {}", e)))?;
+                .ok()
+                .ok_or(EcError::WmiConnect("SafeArrayDestroy failed".into()))?;
 
             let mut out_params: Option<IWbemClassObject> = None;
             self.services
@@ -150,7 +166,7 @@ impl WmiBackend {
             let mut out_type = 0i32;
             let mut out_flavor = 0i32;
             out_params
-                .Get(prop_name, 0, &mut out_val, &mut out_type, &mut out_flavor)
+                .Get(prop_name, 0, &mut out_val, Some(&mut out_type as *mut i32), Some(&mut out_flavor as *mut i32))
                 .map_err(|e| EcError::WmiConnect(format!("Get Buffer: {}", e)))?;
 
             let expected_vt = VARENUM(VT_ARRAY.0 | VT_UI1.0);
@@ -164,13 +180,15 @@ impl WmiBackend {
 
             let mut out_data: *mut core::ffi::c_void = std::ptr::null_mut();
             SafeArrayAccessData(out_sa, &mut out_data)
-                .map_err(|e| EcError::WmiConnect(format!("SafeArrayAccessData out: {}", e)))?;
+                .ok()
+                .ok_or(EcError::WmiConnect("SafeArrayAccessData out failed".into()))?;
 
             let mut result = [0u8; 32];
             std::ptr::copy_nonoverlapping(out_data as *const u8, result.as_mut_ptr(), 32);
 
             SafeArrayUnaccessData(out_sa)
-                .map_err(|e| EcError::WmiConnect(format!("SafeArrayUnaccessData out: {}", e)))?;
+                .ok()
+                .ok_or(EcError::WmiConnect("SafeArrayUnaccessData out failed".into()))?;
 
             Ok(result)
         }

@@ -78,8 +78,42 @@
     }
   }
 
+  function getNextPerfMode(current: number): number {
+    const modes = [0x02, 0x09, 0x03, 0x04, 0x0A]; // Quiet, Smart, Fast, Extreme, Eco
+    const idx = modes.indexOf(current);
+    return modes[(idx + 1) % modes.length];
+  }
+
   onMount(() => {
     loadStatus();
+
+    const unlisteners: Array<() => void> = [];
+
+    import("@tauri-apps/api/event").then(({ listen }) => {
+      listen("tray-toggle-battery-care", () => {
+        handleBatteryToggle(!batteryCareEnabled);
+      }).then((u) => unlisteners.push(u));
+
+      listen<string>("tray-set-perf-mode", (e) => {
+        const modeName = e.payload.toLowerCase();
+        const modeMap: Record<string, number> = {
+          eco: 0x0A, quiet: 0x02, smart: 0x09, fast: 0x03, extreme: 0x04,
+        };
+        if (modeName in modeMap) {
+          handlePerfModeChange(modeMap[modeName]);
+        }
+      }).then((u) => unlisteners.push(u));
+
+      listen("hotkey-toggle-battery-care", () => {
+        handleBatteryToggle(!batteryCareEnabled);
+      }).then((u) => unlisteners.push(u));
+
+      listen("hotkey-cycle-perf-mode", () => {
+        handlePerfModeChange(getNextPerfMode(perfMode));
+      }).then((u) => unlisteners.push(u));
+    });
+
+    return () => unlisteners.forEach((u) => u());
   });
 </script>
 
