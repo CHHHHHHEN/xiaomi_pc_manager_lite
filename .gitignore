@@ -1,1 +1,21 @@
-.vs
+# Rust
+target/
+**/*.rs.bk
+
+# Node / frontend
+node_modules/
+dist/
+.vite/
+
+# Tauri
+src-tauri/bin/
+
+# IDE
+.vs/
+.vscode/
+*.sln
+*.suo
+
+# OS
+.DS_Store
+Thumbs.db
