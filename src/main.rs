@@ -2,11 +2,10 @@
 
 mod ec;
 mod gui;
-mod tray;
-mod hotkey;
-mod power_event;
 mod msg_window;
+mod msg_worker;
 mod embed;
+mod fnkey;
 
 use ec::backend::EcBackend;
 use ec::config::AppConfig;
@@ -14,25 +13,23 @@ use ec::config::AppConfig;
 fn main() {
     env_logger::init();
 
-    let backend = std::thread::spawn(|| {
-        ec::backend::create_backend(ec::config::BackendPreference::Auto)
-    })
-    .join()
-    .expect("backend init thread panicked");
-
-    let backend = match backend {
-        Ok(b) => b,
-        Err(e) => {
-            log::error!("Failed to create EC backend: {}", e);
-            eprintln!("Fatal: EC backend initialization failed: {}", e);
-            std::process::exit(1);
-        }
-    };
-    log::info!("EC backend: {}", backend.name());
+    let (backend, init_error): (Box<dyn EcBackend>, Option<String>) =
+        match ec::backend::create_backend(ec::config::BackendPreference::Auto) {
+            Ok(b) => {
+                log::info!("EC backend: {}", b.name());
+                (b, None)
+            }
+            Err(e) => {
+                log::error!("Failed to create EC backend: {}", e);
+                (Box::new(ec::backend::NullBackend), Some(e.to_string()))
+            }
+        };
 
     let mut config = AppConfig::load();
 
-    apply_startup_config(&*backend, &config);
+    if init_error.is_none() {
+        apply_startup_config(&*backend, &config);
+    }
 
     config.performance_mode = backend
         .get_performance_mode()
@@ -43,15 +40,18 @@ fn main() {
     config.battery_charge_limit = backend
         .get_charge_limit()
         .unwrap_or(config.battery_charge_limit);
-    if config.auto_apply_on_startup {
-        config.save().ok();
+    if config.auto_apply_on_startup && init_error.is_none() {
+        if let Err(e) = config.save() {
+            log::warn!("save initial config: {}", e);
+        }
     }
 
-    gui::app::run_app(backend, config);
+    gui::app::run_app(backend, config, init_error);
 }
 
 fn apply_startup_config(backend: &dyn EcBackend, config: &AppConfig) {
     if config.auto_apply_on_startup {
+        log::info!("Applying config on startup");
         if let Err(e) = backend.set_battery_care(config.battery_care_enabled) {
             log::warn!("apply battery care on startup: {}", e);
         }

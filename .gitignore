@@ -10,6 +10,8 @@ dist/
 # WinRing0 DLL/SYS (users obtain separately)
 bin/*.dll
 bin/*.sys
+WinRing0x64.dll
+WinRing0x64.sys
 
 # IDE
 .vs/

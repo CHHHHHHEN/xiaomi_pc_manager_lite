@@ -3,9 +3,10 @@
 use super::backend::EcBackend;
 use super::battery;
 use super::error::EcError;
+use super::addr as ec_addr;
 use windows::Win32::System::Com::{
-    CoInitializeEx, CoSetProxyBlanket, CoCreateInstance, CLSCTX_ALL,
-    COINIT_MULTITHREADED, EOAC_NONE, RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE,
+    CoInitializeEx, CoSetProxyBlanket, CoCreateInstance, CLSCTX_INPROC_SERVER,
+    COINIT_APARTMENTTHREADED, EOAC_NONE, RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE,
 };
 use windows::Win32::System::Ole::SafeArrayCreateVector;
 use windows::Win32::System::Ole::{SafeArrayAccessData, SafeArrayUnaccessData, SafeArrayDestroy};
@@ -13,14 +14,11 @@ use windows::Win32::System::Variant::{VARIANT, VARENUM, VT_ARRAY, VT_UI1};
 use windows::Win32::System::Wmi::*;
 use windows::core::{BSTR, GUID, PCWSTR};
 
-/// CLSID_WbemLocator — uuid DC12A687-737F-11CF-884D-00AA004B2E24
-#[allow(non_upper_case_globals)]
-const CLSID_WbemLocator: GUID = GUID {
-    data1: 0xDC12A687,
-    data2: 0x737F,
-    data3: 0x11CF,
-    data4: [0x88, 0x4D, 0x00, 0xAA, 0x00, 0x4B, 0x2E, 0x24],
-};
+/// CLSID_WbemAdministrativeLocator ({CB8555CC-9128-11D1-AD9B-00C04FD8FDFF}).
+/// The classic CLSID_WbemLocator ({DC12A687-...}) is missing on newer
+/// Windows Insider builds; this administrative locator is registered on
+/// all WMI-capable systems and supports IWbemLocator.
+const CLSID_WMI_LOCATOR: GUID = GUID::from_u128(0xCB8555CC_9128_11D1_AD9B_00C04FD8FDFF);
 
 const RPC_C_AUTHN_WINNT: u32 = 10u32;
 const RPC_C_AUTHZ_NONE: u32 = 0u32;
@@ -31,8 +29,8 @@ const CMD_WRITE: u16 = 0xFB00;
 const FUN2_BATTERY: u16 = 0x1000;
 const FUN2_PERF: u16 = 0x0800;
 
-unsafe fn ensure_mta() -> Result<(), EcError> {
-    CoInitializeEx(None, COINIT_MULTITHREADED)
+fn ensure_com() -> Result<(), EcError> {
+    unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
         .ok()
         .map_err(|e| EcError::WmiConnect(format!("COM init: {}", e)))
 }
@@ -42,6 +40,7 @@ fn to_le16(buf: &mut [u8; 32], offset: usize, val: u16) {
     buf[offset + 1] = ((val >> 8) & 0xFF) as u8;
 }
 
+#[allow(dead_code)]
 fn from_le16(buf: &[u8; 32], offset: usize) -> u16 {
     u16::from_le_bytes([buf[offset], buf[offset + 1]])
 }
@@ -56,9 +55,9 @@ unsafe impl Sync for WmiBackend {}
 impl WmiBackend {
     pub fn new() -> Result<Self, EcError> {
         unsafe {
-            ensure_mta()?;
+            ensure_com()?;
 
-            let locator: IWbemLocator = CoCreateInstance(&CLSID_WbemLocator, None, CLSCTX_ALL)
+            let locator: IWbemLocator = CoCreateInstance(&CLSID_WMI_LOCATOR, None, CLSCTX_INPROC_SERVER)
                 .map_err(|e| EcError::WmiConnect(format!("CoCreateInstance: {}", e)))?;
 
             let services = locator
@@ -91,6 +90,12 @@ impl WmiBackend {
     }
 
     /// Send a 32-byte buffer via MiInterface and receive the 32-byte response.
+    ///
+    /// Command buffer layout (per F-HAL-05):
+    ///   fun1(2B) + fun2(2B) + fun3(2B) + fun4(4B) + zero-padding = 32 bytes
+    ///
+    /// Response buffer layout (per F-HAL-08):
+    ///   Status(2B) + Function(2B) + Data0(2B) + Data1(4B) + Data2(4B) + Data3(4B)
     fn mi_interface_call(&self, buffer: &[u8; 32]) -> Result<[u8; 32], EcError> {
         unsafe {
             let mut class: Option<IWbemClassObject> = None;
@@ -107,7 +112,7 @@ impl WmiBackend {
 
             let mut in_sig: Option<IWbemClassObject> = None;
             let mut out_sig: Option<IWbemClassObject> = None;
-            let method_name = to_pcwstr("MiInterface");
+            let (_mn_buf, method_name) = to_pcwstr("MiInterface");
             class
                 .GetMethod(method_name, 0, &mut in_sig, &mut out_sig)
                 .map_err(|e| EcError::WmiConnect(format!("GetMethod: {}", e)))?;
@@ -138,41 +143,58 @@ impl WmiBackend {
                         wReserved1: 0,
                         wReserved2: 0,
                         wReserved3: 0,
-                        Anonymous: windows::Win32::System::Variant::VARIANT_0_0_0 { parray: sa as *mut windows::Win32::System::Com::SAFEARRAY },
+                        Anonymous: windows::Win32::System::Variant::VARIANT_0_0_0 { parray: sa },
                     }),
                 },
             };
 
-            let prop_name = to_pcwstr("Buffer");
+            let (_in_buf, in_name) = to_pcwstr(IN_PARAM);
             in_params
-                .Put(prop_name, 0, &v as *const VARIANT, 0)
-                .map_err(|e| EcError::WmiConnect(format!("Put Buffer: {}", e)))?;
+                .Put(in_name, 0, &v as *const VARIANT, 0)
+                .map_err(|e| EcError::WmiConnect(format!("Put {}: {}", IN_PARAM, e)))?;
 
             SafeArrayDestroy(sa)
                 .ok()
                 .ok_or(EcError::WmiConnect("SafeArrayDestroy failed".into()))?;
 
-            let mut out_params: Option<IWbemClassObject> = None;
+            // Use RETURN_IMMEDIATELY because the WMI provider's synchronous
+            // path fails with WBEM_E_INVALID_METHOD_PARAMETERS on this build.
+            let mut call_result: Option<IWbemCallResult> = None;
             self.services
                 .ExecMethod(
                     &BSTR::from("MICommonInterface"),
                     &BSTR::from("MiInterface"),
-                    WBEM_FLAG_RETURN_WBEM_COMPLETE,
+                    WBEM_FLAG_RETURN_IMMEDIATELY,
                     None::<&IWbemContext>,
                     &in_params,
-                    Some(&mut out_params as *mut Option<IWbemClassObject>),
                     None,
+                    Some(&mut call_result as *mut Option<IWbemCallResult>),
                 )
-                .map_err(|_| EcError::WmiCallFailed(0))?;
+                .map_err(|e| EcError::WmiCallFailed(e.code().0 as u16))?;
 
-            let out_params = out_params.ok_or(EcError::WmiCallFailed(0))?;
+            let call_result =
+                call_result.ok_or(EcError::WmiCallFailed(0))?;
 
+            // Wait up to 10 seconds for the provider to respond
+            log::info!("WMI: GetResultObject waiting...");
+            let out_params = match call_result.GetResultObject(10000) {
+                Ok(p) => p,
+                Err(e) => {
+                    log::error!(
+                        "WMI: GetResultObject failed: hr=0x{:08X}",
+                        e.code().0 as u32
+                    );
+                    return Err(EcError::WmiCallFailed(e.code().0 as u16));
+                }
+            };
+
+            let (_out_buf, out_name) = to_pcwstr(OUT_PARAM);
             let mut out_val = VARIANT::default();
             let mut out_type = 0i32;
             let mut out_flavor = 0i32;
             out_params
-                .Get(prop_name, 0, &mut out_val, Some(&mut out_type as *mut i32), Some(&mut out_flavor as *mut i32))
-                .map_err(|e| EcError::WmiConnect(format!("Get Buffer: {}", e)))?;
+                .Get(out_name, 0, &mut out_val, Some(&mut out_type as *mut i32), Some(&mut out_flavor as *mut i32))
+                .map_err(|e| EcError::WmiConnect(format!("Get {}: {}", OUT_PARAM, e)))?;
 
             let expected_vt = VARENUM(VT_ARRAY.0 | VT_UI1.0);
             if out_val.Anonymous.Anonymous.vt != expected_vt {
@@ -199,36 +221,54 @@ impl WmiBackend {
         }
     }
 
+    /// Build a read command buffer.
+    /// Layout: fun1=0xFA00, fun2=selector, fun3=sub-op, fun4=0
+    /// Per F-HAL-06: 充电读 fun3=0x0002, 性能读 fun3=0x0000
     fn read_battery(&self) -> Result<[u8; 32], EcError> {
         let mut buf = [0u8; 32];
-        to_le16(&mut buf, 0, CMD_READ);
-        to_le16(&mut buf, 2, FUN2_BATTERY);
+        to_le16(&mut buf, 0, CMD_READ);       // fun1
+        to_le16(&mut buf, 2, FUN2_BATTERY);   // fun2
+        to_le16(&mut buf, 4, 0x0002);          // fun3 = 子操作(充电读)
+        // fun4 保持 0x00000000
         self.mi_interface_call(&buf)
     }
 
+    /// Build a write command buffer for battery.
+    /// Layout: fun1=0xFB00, fun2=0x1000, fun3=0x0002, fun4=raw_code
+    /// Per F-HAL-07: 充电写 fun3=0x0002, fun4=充电上限 raw code
     fn write_battery(&self, raw_code: u8) -> Result<(), EcError> {
         let mut buf = [0u8; 32];
-        to_le16(&mut buf, 0, CMD_WRITE);
-        to_le16(&mut buf, 2, FUN2_BATTERY);
-        buf[4] = raw_code;
-        buf[6] = raw_code;
+        to_le16(&mut buf, 0, CMD_WRITE);      // fun1
+        to_le16(&mut buf, 2, FUN2_BATTERY);   // fun2
+        to_le16(&mut buf, 4, 0x0002);          // fun3 = 参数(充电写=0x0002)
+        // fun4 = 充电上限 raw code (4 bytes, LE)
+        let v = raw_code as u32;
+        buf[6] = (v & 0xFF) as u8;
+        buf[7] = ((v >> 8) & 0xFF) as u8;
+        buf[8] = ((v >> 16) & 0xFF) as u8;
+        buf[9] = ((v >> 24) & 0xFF) as u8;
         self.mi_interface_call(&buf)?;
         Ok(())
     }
 
     fn read_perf(&self) -> Result<[u8; 32], EcError> {
         let mut buf = [0u8; 32];
-        to_le16(&mut buf, 0, CMD_READ);
-        to_le16(&mut buf, 2, FUN2_PERF);
+        to_le16(&mut buf, 0, CMD_READ);       // fun1
+        to_le16(&mut buf, 2, FUN2_PERF);      // fun2
+        to_le16(&mut buf, 4, 0x0000);          // fun3 = 子操作(性能读=0x0000)
+        // fun4 保持 0x00000000
         self.mi_interface_call(&buf)
     }
 
+    /// Build a write command buffer for performance mode.
+    /// Layout: fun1=0xFB00, fun2=0x0800, fun3=mode, fun4=0
+    /// Per F-HAL-07: 性能写 fun3=模式 raw code, fun4=0
     fn write_perf(&self, mode: u8) -> Result<(), EcError> {
         let mut buf = [0u8; 32];
-        to_le16(&mut buf, 0, CMD_WRITE);
-        to_le16(&mut buf, 2, FUN2_PERF);
-        buf[4] = mode;
-        buf[6] = mode;
+        to_le16(&mut buf, 0, CMD_WRITE);      // fun1
+        to_le16(&mut buf, 2, FUN2_PERF);      // fun2
+        to_le16(&mut buf, 4, mode as u16);     // fun3 = 参数(模式 raw code)
+        // fun4 保持 0x00000000
         self.mi_interface_call(&buf)?;
         Ok(())
     }
@@ -239,47 +279,53 @@ impl EcBackend for WmiBackend {
         "WMI (MICommonInterface)"
     }
 
-    fn is_available(&self) -> bool {
-        true
-    }
-
     fn read_byte(&self, addr: u16) -> Result<u8, EcError> {
-        unsafe { ensure_mta()?; }
-        let buf = match addr {
-            0x68 => self.read_perf()?,
-            0xA4 | 0xA7 => self.read_battery()?,
-            _ => return Err(EcError::ReadFailed(addr)),
-        };
-        Ok(buf[4])
+        match addr {
+            ec_addr::PERF_MODE => {
+                let buf = self.read_perf()?;
+                Ok(buf[4]) // Data0
+            }
+            ec_addr::CHARGE_LIMIT => {
+                let buf = self.read_battery()?;
+                Ok(buf[6]) // Data1
+            }
+            ec_addr::BATTERY_CARE => {
+                let buf = self.read_battery()?;
+                // WMI 没有独立的电池养护位；充电上限 < 100% 表示已启用
+                let raw = buf[6]; // Data1 = 充电上限 raw code
+                let percent = battery::wmi_rawcode_to_percent(raw).unwrap_or(100);
+                Ok(if percent < 100 { 0x01 } else { 0x00 })
+            }
+            _ => Err(EcError::ReadFailed(addr)),
+        }
     }
 
     fn write_byte(&self, addr: u16, value: u8) -> Result<(), EcError> {
-        unsafe { ensure_mta()?; }
         match addr {
-            0x68 => self.write_perf(value),
-            0xA4 | 0xA7 => self.write_battery(value),
+            ec_addr::PERF_MODE => self.write_perf(value),
+            ec_addr::BATTERY_CARE | ec_addr::CHARGE_LIMIT => self.write_battery(value),
             _ => Err(EcError::WriteFailed(addr)),
         }
     }
 
     fn get_battery_care_enabled(&self) -> Result<bool, EcError> {
-        unsafe { ensure_mta()?; }
         let buf = self.read_battery()?;
-        let limit = from_le16(&buf, 4);
-        let raw = limit as u8;
+        let raw = buf[6]; // Data1 = 充电上限 raw code
         let percent = battery::wmi_rawcode_to_percent(raw).unwrap_or(100);
+        log::info!("WMI: battery care enabled -> {}, limit -> {}%", percent < 100, percent);
         Ok(percent < 100)
     }
 
     fn get_charge_limit(&self) -> Result<u8, EcError> {
-        unsafe { ensure_mta()?; }
         let buf = self.read_battery()?;
-        let raw = buf[4];
-        Ok(battery::wmi_rawcode_to_percent(raw).unwrap_or(100))
+        let raw = buf[6]; // Data1 = 充电上限 raw code
+        let percent = battery::wmi_rawcode_to_percent(raw).unwrap_or(100);
+        log::info!("WMI: charge limit -> {}%", percent);
+        Ok(percent)
     }
 
     fn set_battery_care(&self, enabled: bool) -> Result<(), EcError> {
-        unsafe { ensure_mta()?; }
+        log::info!("WMI: set battery care -> {}", if enabled { "enabled" } else { "disabled" });
         let current = self.get_charge_limit()?;
         if enabled {
             if current == 100 {
@@ -292,28 +338,32 @@ impl EcBackend for WmiBackend {
     }
 
     fn set_charge_limit(&self, percent: u8) -> Result<(), EcError> {
-        unsafe { ensure_mta()?; }
         let percent = percent.min(100);
         let raw = battery::percent_to_wmi_rawcode(percent)
             .or_else(|| Some(battery::nearest_wmi_percent(percent)))
             .unwrap_or(0);
+        log::info!("WMI: set charge limit -> {}% (raw {:#x})", percent, raw);
         self.write_battery(raw)
     }
 
     fn get_performance_mode(&self) -> Result<u8, EcError> {
-        unsafe { ensure_mta()?; }
         let buf = self.read_perf()?;
+        log::info!("WMI: read perf mode -> {:#x}", buf[4]);
         Ok(buf[4])
     }
 
     fn set_performance_mode(&self, mode: u8) -> Result<(), EcError> {
-        unsafe { ensure_mta()?; }
+        log::info!("WMI: set perf mode -> {:#x}", mode);
         self.write_perf(mode)
     }
 }
 
-fn to_pcwstr(s: &str) -> PCWSTR {
+/// Property names on the MICommonInterface.MiInterface method signature.
+const IN_PARAM: &str = "InData";
+const OUT_PARAM: &str = "OutData";
+
+fn to_pcwstr(s: &str) -> (Vec<u16>, PCWSTR) {
     let wide: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
-    let leaked: &'static [u16] = Box::leak(wide.into_boxed_slice());
-    PCWSTR(leaked.as_ptr())
+    let ptr = PCWSTR(wide.as_ptr());
+    (wide, ptr)
 }

@@ -1,8 +1,14 @@
 # opencode agent instructions
 
+## Coding rules
+
+- Always best solution, do not simplify or do half when task is complicate.
+- Always keep high quality, no hack error/warning bypass, solve them directly.
+- No unsafe allowed.
+
 ## build/lint commands
 
-### Build (pure Rust)
+### Build
 - `cargo build` — debug build
 - `cargo build --release` — release build
 - `cargo check` — type check only

@@ -2,6 +2,13 @@
 
 轻量级小米 PC 管理工具 — 电池养护 / 性能模式切换
 
+## 主要功能
+
+WinRing0 和 WMI 双控制后端，两者功能基本相同。
+
+- 设置最大充电水平，开启或者关闭充电保护功能
+- 切换风扇策略 Eco/Quiet/Smart/Fast/Extreme
+
 ## 构建
 
 ```bash
@@ -14,11 +21,3 @@ npm run tauri dev
 # 发布构建
 npm run tauri build
 ```
-
-## 架构
-
-- **后端**: Rust + Tauri v2，双 EC 通信后端（WMI MIInterface 优先 → WinRing0 fallback）
-- **前端**: Svelte 5
-- **分发**: 单一 exe（WinRing0 DLL/SYS 嵌入资源，无需安装）
-
-详见 [refactor-plan.md](refactor-plan.md)
