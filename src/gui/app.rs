@@ -300,37 +300,31 @@ impl eframe::App for XiaomiApp {
                     Color32::WHITE,
                 );
 
+                let btn_size = egui::vec2(32.0, total_rect.height());
                 ui.allocate_new_ui(
                     egui::UiBuilder::new()
                         .max_rect(button_strip_rect)
                         .layout(egui::Layout::right_to_left(egui::Align::Center)),
                     |ui| {
-                        if ui
-                            .button(
-                                egui::RichText::new("✕").color(Color32::WHITE).size(12.0),
-                            )
+                        if titlebar_button(ui, btn_size, "close")
+                            .on_hover_text("关闭")
                             .clicked()
                         {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                         }
                         let is_maximized =
                             ctx.viewport(|v| v.builder.maximized.unwrap_or(false));
-                        let max_icon = if is_maximized { "❐" } else { "□" };
-                        if ui
-                            .button(
-                                egui::RichText::new(max_icon).color(Color32::WHITE).size(12.0),
-                            )
+                        if titlebar_button(ui, btn_size, if is_maximized { "restore" } else { "maximize" })
+                            .on_hover_text(if is_maximized { "还原" } else { "最大化" })
                             .clicked()
                         {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_maximized));
                         }
-                        if ui
-                            .button(
-                                egui::RichText::new("─").color(Color32::WHITE).size(12.0),
-                            )
+                        if titlebar_button(ui, btn_size, "minimize")
+                            .on_hover_text("最小化")
                             .clicked()
                         {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                         }
                     },
                 );
@@ -383,6 +377,62 @@ impl eframe::App for XiaomiApp {
                 }
             });
     }
+}
+
+fn titlebar_button(ui: &mut egui::Ui, size: egui::Vec2, kind: &str) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let hovered = response.hovered();
+    if hovered {
+        ui.painter().rect_filled(rect, 0.0, Color32::from_white_alpha(40));
+    }
+    let stroke = egui::Stroke::new(2.0, Color32::WHITE);
+    let cx = rect.center().x;
+    let cy = rect.center().y;
+    let pad = 10.0;
+    let painter = ui.painter();
+    match kind {
+        "close" | "关闭" => {
+            let r = pad * 0.5;
+            painter.line_segment(
+                [egui::pos2(cx - r, cy - r), egui::pos2(cx + r, cy + r)],
+                stroke,
+            );
+            painter.line_segment(
+                [egui::pos2(cx + r, cy - r), egui::pos2(cx - r, cy + r)],
+                stroke,
+            );
+        }
+        "minimize" | "最小化" => {
+            let half = pad * 0.4;
+            painter.line_segment(
+                [egui::pos2(cx - half, cy), egui::pos2(cx + half, cy)],
+                stroke,
+            );
+        }
+        "maximize" | "最大化" => {
+            let half = pad * 0.45;
+            let r = egui::Rect::from_center_size(
+                egui::pos2(cx, cy),
+                egui::vec2(half * 2.0, half * 2.0),
+            );
+            painter.rect_stroke(r, 2.0, stroke, egui::StrokeKind::Inside);
+        }
+        "restore" | "还原" => {
+            let half = pad * 0.4;
+            let r1 = egui::Rect::from_center_size(
+                egui::pos2(cx + 2.0, cy - 2.0),
+                egui::vec2(half * 2.0, half * 2.0),
+            );
+            let r2 = egui::Rect::from_center_size(
+                egui::pos2(cx - 2.0, cy + 2.0),
+                egui::vec2(half * 2.0, half * 2.0),
+            );
+            painter.rect_stroke(r1, 2.0, stroke, egui::StrokeKind::Inside);
+            painter.rect_stroke(r2, 2.0, stroke, egui::StrokeKind::Inside);
+        }
+        _ => {}
+    }
+    response
 }
 
 impl XiaomiApp {
