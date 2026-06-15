@@ -16,20 +16,15 @@ const EC_DATA: u16 = 0x62;
 const EC_CMD: u16 = 0x66;
 
 fn ec_wait_write(rp: ReadPort) {
-    for _ in 0..1000 {
+    for i in 0..1000 {
         if unsafe { rp(EC_CMD) } & 0x02 == 0 {
-            break;
+            return;
         }
-        core::hint::spin_loop();
-    }
-}
-
-fn ec_wait_read(rp: ReadPort) {
-    for _ in 0..1000 {
-        if unsafe { rp(EC_CMD) } & 0x01 != 0 {
-            break;
+        if i < 100 {
+            core::hint::spin_loop();
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        core::hint::spin_loop();
     }
 }
 
@@ -302,7 +297,7 @@ impl EcBackend for WinRing0Backend {
     fn get_battery_care_enabled(&self) -> Result<bool, EcError> {
         let val = self.read_byte(ec_addr::BATTERY_CARE)?;
         log::info!("WinRing0: read battery care -> {:#x}", val);
-        Ok(val == 0x01)
+        Ok(val & 0x01 != 0)
     }
 
     fn get_charge_limit(&self) -> Result<u8, EcError> {
