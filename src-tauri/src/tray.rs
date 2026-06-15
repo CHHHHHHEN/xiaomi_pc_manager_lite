@@ -1,153 +1,128 @@
-use tauri::{
-    AppHandle, Emitter, Manager, Runtime,
-    menu::{CheckMenuItem, CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder, SubmenuBuilder, PredefinedMenuItem},
-    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    image::Image,
-};
-use crate::AppState;
-use crate::ec::performance::PerfMode;
+use std::sync::{Arc, Mutex, mpsc, OnceLock};
+use windows::Win32::Foundation::*;
+use windows::Win32::UI::WindowsAndMessaging::*;
+use windows::Win32::UI::Shell::*;
+use windows::core::PCWSTR;
+use crate::gui::app::UiCommand;
 
-pub struct TrayState<R: Runtime> {
-    pub battery_care: CheckMenuItem<R>,
+static CMD_TX: OnceLock<mpsc::Sender<UiCommand>> = OnceLock::new();
+pub static TRAY_STATE: OnceLock<Arc<Mutex<TrayState>>> = OnceLock::new();
+
+pub struct TrayState {
+    pub battery_care_enabled: bool,
+    pub perf_mode: u8,
 }
 
-impl<R: Runtime> TrayState<R> {
-    fn new(battery_care: CheckMenuItem<R>) -> Self {
-        Self { battery_care }
+const MID_SHOW: u32 = 100;
+const MID_QUIT: u32 = 101;
+const WM_TRAY: u32 = WM_APP + 1;
+
+pub fn setup_tray(cmd_tx: mpsc::Sender<UiCommand>, state: Arc<Mutex<TrayState>>) {
+    CMD_TX.set(cmd_tx).ok();
+    TRAY_STATE.set(state).ok();
+    std::thread::spawn(|| unsafe { tray_thread() });
+}
+
+unsafe fn tray_thread() {
+    let hwnd = match crate::msg_window::create_message_window() {
+        Ok(w) => w,
+        Err(e) => { log::error!("Tray window: {}", e); return; }
+    };
+    crate::msg_window::set_wndproc(hwnd, tray_wndproc);
+
+    let icon_bytes = include_bytes!("../icons/tray_icon.ico");
+    let hicon = match load_icon(icon_bytes) {
+        Ok(h) => h,
+        Err(e) => { log::error!("Tray icon: {}", e); return; }
+    };
+
+    let mut nid = std::mem::zeroed::<NOTIFYICONDATAW>();
+    nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+    nid.hWnd = hwnd;
+    nid.uID = 1;
+    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    nid.uCallbackMessage = WM_TRAY;
+    nid.hIcon = hicon;
+
+    let tip: Vec<u16> = "Xiaomi PC Manager Lite\0".encode_utf16().collect();
+    let n = tip.len().min(128);
+    nid.szTip[..n].copy_from_slice(&tip[..n]);
+
+    if !Shell_NotifyIconW(NIM_ADD, &nid).as_bool() {
+        log::error!("NIM_ADD failed");
+        let _ = DestroyIcon(hicon);
+        return;
     }
+
+    log::info!("Tray icon created");
+    crate::msg_window::message_loop(hwnd);
+
+    let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
+    let _ = DestroyIcon(hicon);
 }
 
-pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
-    let battery_care = CheckMenuItemBuilder::with_id("battery_care", "电池养护")
-        .checked(false)
-        .build(app)?;
-
-    set_battery_care_checked(app, &battery_care);
-
-    let submenu = SubmenuBuilder::new(app, "性能模式")
-        .items(&[
-            &MenuItemBuilder::with_id("perf_eco", "Eco").build(app)?,
-            &MenuItemBuilder::with_id("perf_quiet", "Quiet").build(app)?,
-            &MenuItemBuilder::with_id("perf_smart", "Smart").build(app)?,
-            &MenuItemBuilder::with_id("perf_fast", "Fast").build(app)?,
-            &MenuItemBuilder::with_id("perf_extreme", "Extreme").build(app)?,
-        ])
-        .build()?;
-
-    let show_hide = MenuItemBuilder::with_id("show_hide", "显示/隐藏窗口").build(app)?;
-    let quit = PredefinedMenuItem::quit(app, Some("退出"))?;
-
-    let menu = MenuBuilder::new(app)
-        .item(&battery_care)
-        .item(&submenu)
-        .separator()
-        .item(&show_hide)
-        .separator()
-        .item(&quit)
-        .build()?;
-
-    let icon = Image::from_bytes(include_bytes!("../icons/tray_icon.ico"))?;
-    let icon = icon.to_owned();
-
-    TrayIconBuilder::new()
-        .icon(icon)
-        .menu(&menu)
-        .tooltip("Xiaomi PC Manager Lite")
-        .on_menu_event(handle_tray_event)
-        .on_tray_icon_event(|tray, event| {
-            if let TrayIconEvent::Click { button, button_state, .. } = event {
-                if button == MouseButton::Left && button_state == MouseButtonState::Up {
-                    let app = tray.app_handle();
-                    toggle_window_visibility(app);
+unsafe extern "system" fn tray_wndproc(
+    hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_DESTROY => { PostQuitMessage(0); LRESULT(0) }
+        WM_COMMAND => {
+            let id = (wparam.0 as u32) & 0xFFFF;
+            match id {
+                MID_SHOW => { if let Some(tx) = CMD_TX.get() { let _ = tx.send(UiCommand::ToggleWindow); } }
+                MID_QUIT => {
+                    if let Some(tx) = CMD_TX.get() { let _ = tx.send(UiCommand::Quit); }
+                    PostQuitMessage(0);
                 }
+                _ => {}
             }
-        })
-        .build(app)?;
-
-    app.manage(TrayState::new(battery_care));
-
-    Ok(())
-}
-
-fn set_battery_care_checked(app: &AppHandle, item: &CheckMenuItem<tauri::Wry>) {
-    if let Some(state) = app.try_state::<AppState>() {
-        if let Ok(config) = state.config.lock() {
-            let _ = item.set_checked(config.battery_care_enabled);
+            LRESULT(0)
         }
-    }
-}
-
-fn toggle_window_visibility(app: &AppHandle) {
-    if let Some(window) = app.get_webview_window("main") {
-        if window.is_visible().unwrap_or(false) {
-            let _ = window.hide();
-        } else {
-            let _ = window.show();
-            let _ = window.set_focus();
-        }
-    }
-}
-
-fn handle_tray_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
-    let id = event.id();
-    match id.as_ref() {
-        "battery_care" => {
-            if let Some(state) = app.try_state::<AppState>() {
-                let result = (|| -> Result<(), String> {
-                    let mut config = state.config.lock().map_err(|e| e.to_string())?;
-                    let new_val = !config.battery_care_enabled;
-                    config.battery_care_enabled = new_val;
-                    if let Ok(backend) = state.backend.lock() {
-                        backend.set_battery_care(new_val).ok();
-                    }
-                    config.save()?;
-                    if let Some(tray) = app.try_state::<TrayState<tauri::Wry>>() {
-                        tray.battery_care.set_checked(new_val).ok();
-                    }
-                    let _ = app.emit("tray-toggle-battery-care", ());
-                    Ok(())
-                })();
-                if let Err(e) = result {
-                    log::error!("tray battery_care: {}", e);
+        m if m == WM_TRAY => {
+            match lparam.0 as u32 {
+                WM_LBUTTONUP => {
+                    if let Some(tx) = CMD_TX.get() { let _ = tx.send(UiCommand::ToggleWindow); }
                 }
+                WM_RBUTTONUP => show_tray_menu(hwnd),
+                _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
             }
+            LRESULT(0)
         }
-        "show_hide" => toggle_window_visibility(app),
-        id_str if id_str.starts_with("perf_") => {
-            let mode_name = id_str.strip_prefix("perf_").unwrap();
-            if let Some(mode) = PerfMode::all().iter()
-                .find(|m| m.name().to_lowercase() == mode_name)
-            {
-                let mode_val = *mode as u8;
-                let result = (|| -> Result<(), String> {
-                    if let Some(state) = app.try_state::<AppState>() {
-                        if let Ok(backend) = state.backend.lock() {
-                            backend.set_performance_mode(mode_val).map_err(|e| e.to_string())?;
-                        }
-                        if let Ok(mut config) = state.config.lock() {
-                            config.performance_mode = mode_val;
-                            config.save()?;
-                        }
-                    }
-                    let _ = app.emit("tray-set-perf-mode", mode_name);
-                    Ok(())
-                })();
-                if let Err(e) = result {
-                    log::error!("tray perf mode: {}", e);
-                }
-            }
-        }
-        _ => {}
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
 
-pub fn sync_tray_state(app: &AppHandle) {
-    if let (Some(state), Some(tray)) = (
-        app.try_state::<AppState>(),
-        app.try_state::<TrayState<tauri::Wry>>(),
-    ) {
-        if let Ok(config) = state.config.lock() {
-            let _ = tray.battery_care.set_checked(config.battery_care_enabled);
-        }
+unsafe fn show_tray_menu(hwnd: HWND) {
+    let hmenu = CreatePopupMenu().unwrap_or(HMENU::default());
+    let show = wstr("显示/隐藏窗口");
+    let _ = AppendMenuW(hmenu, MF_STRING, MID_SHOW as usize, PCWSTR(show.as_ptr()));
+    let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null());
+    let quit = wstr("退出");
+    let _ = AppendMenuW(hmenu, MF_STRING, MID_QUIT as usize, PCWSTR(quit.as_ptr()));
+
+    let mut pt = POINT { x: 0, y: 0 };
+    let _ = GetCursorPos(&mut pt);
+    let _ = SetForegroundWindow(hwnd);
+    let _ = TrackPopupMenu(hmenu, TPM_LEFTALIGN | TPM_BOTTOMALIGN | TPM_LEFTBUTTON, pt.x, pt.y, Some(0), hwnd, None);
+    let _ = DestroyMenu(hmenu);
+}
+
+unsafe fn wstr(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+unsafe fn load_icon(bytes: &[u8]) -> Result<HICON, String> {
+    if bytes.len() < 6 {
+        return Err("ICO too short".into());
     }
+    let count = u16::from_le_bytes([bytes[4], bytes[5]]) as usize;
+    if count == 0 || bytes.len() < 6 + count * 16 {
+        return Err("No icon entries".into());
+    }
+    let e = 6;
+    let off = u32::from_le_bytes([bytes[e+12], bytes[e+13], bytes[e+14], bytes[e+15]]) as usize;
+    let sz = u32::from_le_bytes([bytes[e+8], bytes[e+9], bytes[e+10], bytes[e+11]]) as usize;
+    if off + sz > bytes.len() { return Err("OOB".into()); }
+    CreateIconFromResourceEx(&bytes[off..off+sz], true, 0x00030000, 0, 0, LR_DEFAULTCOLOR)
+        .map_err(|e| format!("CreateIconFromResourceEx: {}", e))
 }

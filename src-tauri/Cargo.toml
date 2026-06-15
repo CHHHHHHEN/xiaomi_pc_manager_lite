@@ -1,21 +1,12 @@
 [package]
 name = "xiaomi-pc-manager-lite"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Xiaomi PC Manager Lite - Battery care / Performance mode"
 
-[lib]
-name = "xiaomi_pc_manager_lite_lib"
-crate-type = ["lib", "cdylib", "staticlib"]
-
-[build-dependencies]
-tauri-build = { version = "2", features = [] }
-
 [dependencies]
-tauri = { version = "2", default-features = false, features = ["tray-icon", "wry", "image-ico"] }
-tauri-plugin-dialog = "2"
-tauri-plugin-process = "2"
-tauri-plugin-shell = "2"
+eframe = "0.31"
+egui = "0.31"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
@@ -31,6 +22,7 @@ windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
     "Win32_System_Power",
     "Win32_System_LibraryLoader",
     "Win32_System_Registry",
