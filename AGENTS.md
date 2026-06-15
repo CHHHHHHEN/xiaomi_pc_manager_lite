@@ -12,6 +12,8 @@
 - `cargo run` — run from terminal
 - The binary is at `target/debug/xiaomi-pc-manager-lite.exe`
 
+All commands run from project root (`D:\VSCodeProjects\xiaomi_pc_manager_lite`).
+
 ### Full verify before commit
 ```
 cargo check && cargo clippy
