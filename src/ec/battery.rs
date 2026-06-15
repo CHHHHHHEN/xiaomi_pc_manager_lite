@@ -26,7 +26,7 @@ pub fn nearest_wmi_percent(percent: u8) -> u8 {
         .iter()
         .map(|(_, p)| *p)
         .min_by_key(|p| (*p as i16 - percent as i16).abs())
-        .unwrap_or(80)
+        .expect("WMI_CHARGE_LIMITS is a non-empty compile-time constant")
 }
 
 #[cfg(test)]

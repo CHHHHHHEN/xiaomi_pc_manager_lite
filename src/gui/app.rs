@@ -1,31 +1,24 @@
-use eframe::egui::{self, Color32, Frame, Margin, Vec2};
+use eframe::egui::{self, Color32, Frame, Margin};
 use eframe::egui::ViewportCommand;
-use std::sync::{Arc, Mutex, mpsc};
-use windows::Win32::System::Power::GetSystemPowerStatus;
+use std::sync::mpsc;
 
+use crate::command::UiCommand;
 use crate::ec;
 use crate::ec::config::BackendPreference;
 
-#[derive(Debug)]
-pub enum UiCommand {
-    ToggleWindow,
-    Quit,
-    ToggleBatteryCare,
-    CyclePerfMode,
-    ReapplyConfig,
-}
+use super::view;
 
 pub struct XiaomiApp {
     pub cmd_tx: mpsc::Sender<UiCommand>,
-    cmd_rx: mpsc::Receiver<UiCommand>,
-    backend: Box<dyn ec::backend::EcBackend>,
-    config: ec::config::AppConfig,
-    current_pref: BackendPreference,
-    backend_name: String,
-    battery_care_enabled: bool,
-    charge_limit: u8,
-    performance_mode: u8,
-    error_msg: Option<String>,
+    pub(crate) cmd_rx: mpsc::Receiver<UiCommand>,
+    pub(crate) backend: Box<dyn ec::backend::EcBackend>,
+    pub(crate) config: ec::config::AppConfig,
+    pub(crate) current_pref: BackendPreference,
+    pub(crate) backend_name: String,
+    pub(crate) battery_care_enabled: bool,
+    pub(crate) charge_limit: u8,
+    pub(crate) performance_mode: u8,
+    pub(crate) error_msg: Option<String>,
 }
 
 impl XiaomiApp {
@@ -51,48 +44,15 @@ impl XiaomiApp {
     }
 }
 
-fn load_cjk_font() -> Option<(String, Vec<u8>)> {
-    const CJK_FONTS: &[(&str, &str)] = &[
-        ("msyh", r"C:\Windows\Fonts\msyh.ttc"),
-        ("msyhbd", r"C:\Windows\Fonts\msyhbd.ttc"),
-        ("simhei", r"C:\Windows\Fonts\simhei.ttf"),
-        ("simsun", r"C:\Windows\Fonts\simsun.ttc"),
-        ("noto-cjk", r"C:\Windows\Fonts\NotoSansCJK-Regular.ttc"),
-    ];
-    for (name, path) in CJK_FONTS {
-        if let Ok(data) = std::fs::read(path) {
-            return Some(((*name).to_owned(), data));
-        }
-    }
-    None
-}
-
-fn load_icon_data() -> Option<egui::IconData> {
-    let png_bytes = include_bytes!("../../icons/icon.png");
-    let img = image::load_from_memory(png_bytes).ok()?;
-    let rgba = img.to_rgba8();
-    let (w, h) = rgba.dimensions();
-    Some(egui::IconData {
-        rgba: rgba.into_raw(),
-        width: w,
-        height: h,
-    })
-}
-
 pub fn run_app(backend: Box<dyn ec::backend::EcBackend>, config: ec::config::AppConfig, init_error: Option<String>) {
-    let pref = config.backend.clone();
+    let pref = config.backend;
     let app = XiaomiApp::new(backend, config, pref, init_error);
     let cmd_tx = app.cmd_tx.clone();
 
-    let tray_state = Arc::new(Mutex::new(crate::msg_worker::TrayState {
-        battery_care_enabled: app.battery_care_enabled,
-        perf_mode: app.performance_mode,
-    }));
+    crate::tray::spawn(cmd_tx.clone());
+    crate::ec::fnkey::spawn(cmd_tx.clone());
 
-    crate::msg_worker::spawn(cmd_tx.clone(), tray_state);
-    crate::fnkey::spawn(cmd_tx.clone());
-
-    let icon = load_icon_data();
+    let icon = view::load_icon_data();
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([520.0, 680.0])
@@ -108,7 +68,7 @@ pub fn run_app(backend: Box<dyn ec::backend::EcBackend>, config: ec::config::App
         native_options,
         Box::new(move |cc| {
             let mut fonts = egui::FontDefinitions::default();
-            if let Some((name, data)) = load_cjk_font() {
+            if let Some((name, data)) = view::load_cjk_font() {
                 fonts.font_data.insert(name.clone(), egui::FontData::from_owned(data).into());
                 if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
                     family.insert(0, name.clone());
@@ -125,135 +85,11 @@ pub fn run_app(backend: Box<dyn ec::backend::EcBackend>, config: ec::config::App
     );
 }
 
-impl XiaomiApp {
-    fn process_commands(&mut self, ctx: &egui::Context) {
-        let mut needs_repaint = false;
-        while let Ok(cmd) = self.cmd_rx.try_recv() {
-            needs_repaint = true;
-            match cmd {
-                UiCommand::ToggleWindow => {
-                    let visible = ctx.viewport(|vp| vp.builder.visible.unwrap_or(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(!visible));
-                }
-                UiCommand::Quit => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-                UiCommand::ToggleBatteryCare => {
-                    let new_val = !self.battery_care_enabled;
-                    match self.backend.set_battery_care(new_val) {
-                        Ok(_) => log::info!("Battery care set to {}", if new_val { "enabled" } else { "disabled" }),
-                        Err(e) => log::error!("Failed to set battery care: {}", e),
-                    }
-                    self.config.battery_care_enabled = new_val;
-                    self.battery_care_enabled = new_val;
-                    self.save_state();
-                }
-                UiCommand::CyclePerfMode => {
-                    // 3-mode cycle: Smart(0x09) → Quiet(0x02) → Extreme → Smart ...
-                    // Extreme = 0x04 (Beast) when plugged, 0x03 (Fast) on battery
-                    const CYCLE: [u8; 3] = [0x09, 0x02, 0x04]; // Smart, Quiet, Extreme
-                    let current = self.performance_mode;
-                    let next_raw = if current == CYCLE[0] {
-                        CYCLE[1]
-                    } else if current == CYCLE[1] {
-                        CYCLE[2]
-                    } else {
-                        CYCLE[0]
-                    };
-                    let ac_online = ac_power_status();
-                    let next_val = if next_raw == 0x04 && !ac_online {
-                        0x03 // Fast on battery
-                    } else {
-                        next_raw
-                    };
-                    let mode_name = ec::performance::PerfMode::from_ec_value(next_val)
-                        .map(|m| m.name())
-                        .unwrap_or("未知");
-                    match self.backend.set_performance_mode(next_val) {
-                        Ok(_) => log::info!("Performance mode set to {} ({:#x})", mode_name, next_val),
-                        Err(e) => log::error!("Failed to set performance mode: {}", e),
-                    }
-                    self.config.performance_mode = next_val;
-                    self.performance_mode = next_val;
-                    self.save_state();
-                }
-                UiCommand::ReapplyConfig => {
-                    if self.config.auto_reapply_on_power_change {
-                        log::info!("Reapplying config on power change");
-                        if let Err(e) = self.backend.set_battery_care(self.config.battery_care_enabled) {
-                            log::error!("Reapply battery care: {}", e);
-                        }
-                        if let Err(e) = self.backend.set_charge_limit(self.config.battery_charge_limit) {
-                            log::error!("Reapply charge limit: {}", e);
-                        }
-                        if let Err(e) = self.backend.set_performance_mode(self.config.performance_mode) {
-                            log::error!("Reapply perf mode: {}", e);
-                        }
-                        self.refresh_from_backend();
-                    }
-                }
-            }
-        }
-        if needs_repaint {
-            ctx.request_repaint();
-        }
-    }
-
-    fn try_switch_backend(&mut self, pref: BackendPreference) -> bool {
-        match ec::backend::create_backend(pref.clone()) {
-            Ok(new_backend) => {
-                log::info!("Switched EC backend to: {}", new_backend.name());
-                self.backend = new_backend;
-                self.backend_name = self.backend.name().to_string();
-                self.current_pref = pref;
-                self.config.backend = self.current_pref.clone();
-                if let Err(e) = self.config.save() {
-                    log::error!("save config: {}", e);
-                }
-                self.refresh_from_backend();
-                self.error_msg = None;
-                true
-            }
-            Err(e) => {
-                log::error!("Failed to switch EC backend: {}", e);
-                self.error_msg = Some(format!("后端切换失败: {}", e));
-                false
-            }
-        }
-    }
-
-    fn refresh_from_backend(&mut self) {
-        if let Ok(mode) = self.backend.get_performance_mode() {
-            self.performance_mode = mode;
-        }
-        if let Ok(enabled) = self.backend.get_battery_care_enabled() {
-            self.battery_care_enabled = enabled;
-        }
-        if let Ok(limit) = self.backend.get_charge_limit() {
-            self.charge_limit = limit;
-        }
-    }
-
-    /// Persist current in-memory state to disk and push it to the tray icon.
-    fn save_state(&self) {
-        if let Err(e) = self.config.save() {
-            log::error!("save config: {}", e);
-        }
-        if let Some(state) = crate::msg_worker::TRAY_STATE.get() {
-            if let Ok(mut s) = state.lock() {
-                s.battery_care_enabled = self.battery_care_enabled;
-                s.perf_mode = self.performance_mode;
-            }
-        }
-    }
-}
-
 impl eframe::App for XiaomiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.process_commands(ctx);
         ctx.request_repaint_after(std::time::Duration::from_secs(5));
 
-        // Title bar
         egui::TopBottomPanel::top("title_bar")
             .frame(Frame {
                 fill: Color32::from_rgb(0x25, 0x50, 0xAA),
@@ -306,21 +142,21 @@ impl eframe::App for XiaomiApp {
                         .max_rect(button_strip_rect)
                         .layout(egui::Layout::right_to_left(egui::Align::Center)),
                     |ui| {
-                        if titlebar_button(ui, btn_size, "close")
-                            .on_hover_text("关闭")
+                        if view::titlebar_button(ui, btn_size, "close")
+                            .on_hover_text("退出")
                             .clicked()
                         {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
                         let is_maximized =
                             ctx.viewport(|v| v.builder.maximized.unwrap_or(false));
-                        if titlebar_button(ui, btn_size, if is_maximized { "restore" } else { "maximize" })
+                        if view::titlebar_button(ui, btn_size, if is_maximized { "restore" } else { "maximize" })
                             .on_hover_text(if is_maximized { "还原" } else { "最大化" })
                             .clicked()
                         {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_maximized));
                         }
-                        if titlebar_button(ui, btn_size, "minimize")
+                        if view::titlebar_button(ui, btn_size, "minimize")
                             .on_hover_text("最小化")
                             .clicked()
                         {
@@ -330,14 +166,12 @@ impl eframe::App for XiaomiApp {
                 );
             });
 
-        // Content
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 self.show_main_view(ui);
             });
         });
 
-        // Resize handle
         egui::TopBottomPanel::bottom("resize_handle")
             .min_height(0.0)
             .show_separator_line(false)
@@ -376,250 +210,6 @@ impl eframe::App for XiaomiApp {
                     );
                 }
             });
-    }
-}
-
-fn titlebar_button(ui: &mut egui::Ui, size: egui::Vec2, kind: &str) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
-    let hovered = response.hovered();
-    if hovered {
-        ui.painter().rect_filled(rect, 0.0, Color32::from_white_alpha(40));
-    }
-    let stroke = egui::Stroke::new(2.0, Color32::WHITE);
-    let cx = rect.center().x;
-    let cy = rect.center().y;
-    let pad = 10.0;
-    let painter = ui.painter();
-    match kind {
-        "close" | "关闭" => {
-            let r = pad * 0.5;
-            painter.line_segment(
-                [egui::pos2(cx - r, cy - r), egui::pos2(cx + r, cy + r)],
-                stroke,
-            );
-            painter.line_segment(
-                [egui::pos2(cx + r, cy - r), egui::pos2(cx - r, cy + r)],
-                stroke,
-            );
-        }
-        "minimize" | "最小化" => {
-            let half = pad * 0.4;
-            painter.line_segment(
-                [egui::pos2(cx - half, cy), egui::pos2(cx + half, cy)],
-                stroke,
-            );
-        }
-        "maximize" | "最大化" => {
-            let half = pad * 0.45;
-            let r = egui::Rect::from_center_size(
-                egui::pos2(cx, cy),
-                egui::vec2(half * 2.0, half * 2.0),
-            );
-            painter.rect_stroke(r, 2.0, stroke, egui::StrokeKind::Inside);
-        }
-        "restore" | "还原" => {
-            let half = pad * 0.4;
-            let r1 = egui::Rect::from_center_size(
-                egui::pos2(cx + 2.0, cy - 2.0),
-                egui::vec2(half * 2.0, half * 2.0),
-            );
-            let r2 = egui::Rect::from_center_size(
-                egui::pos2(cx - 2.0, cy + 2.0),
-                egui::vec2(half * 2.0, half * 2.0),
-            );
-            painter.rect_stroke(r1, 2.0, stroke, egui::StrokeKind::Inside);
-            painter.rect_stroke(r2, 2.0, stroke, egui::StrokeKind::Inside);
-        }
-        _ => {}
-    }
-    response
-}
-
-impl XiaomiApp {
-    fn show_main_view(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.heading("状态");
-            if ui
-                .button(egui::RichText::new("刷新").size(13.0))
-                .on_hover_text("重新读取后端状态")
-                .clicked()
-            {
-                self.refresh_from_backend();
-                self.error_msg = None;
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.label("后端:");
-            ui.colored_label(Color32::from_rgb(0x25, 0x50, 0xAA), &self.backend_name);
-        });
-        ui.horizontal(|ui| {
-            let status = if self.battery_care_enabled { "开启" } else { "关闭" };
-            ui.label(
-                egui::RichText::new(format!("电池养护: {}", status)).strong(),
-            );
-            if !self.battery_care_enabled {
-                ui.colored_label(Color32::GRAY, "(充电至100%)");
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.label(format!("充电上限: {}%", self.charge_limit));
-        });
-        let perf_name = ec::performance::PerfMode::from_ec_value(self.performance_mode)
-            .map(|m| m.name())
-            .unwrap_or("未知");
-        ui.horizontal(|ui| {
-            ui.label("性能模式: ");
-            ui.colored_label(Color32::from_rgb(0x25, 0x50, 0xAA), perf_name);
-        });
-        if let Some(err) = &self.error_msg {
-            ui.colored_label(Color32::RED, err);
-        }
-
-        ui.separator();
-        ui.add_space(8.0);
-
-        // Battery care
-        ui.heading("电池养护");
-        ui.horizontal(|ui| {
-            let mut enabled = self.battery_care_enabled;
-            if ui.checkbox(&mut enabled, "启用电池养护").changed() {
-                self.battery_care_enabled = enabled;
-                self.config.battery_care_enabled = enabled;
-                match self.backend.set_battery_care(enabled) {
-                    Ok(_) => log::info!("Battery care {}", if enabled { "enabled" } else { "disabled" }),
-                    Err(e) => log::error!("Failed to set battery care: {}", e),
-                }
-                self.save_state();
-            }
-        });
-        if self.battery_care_enabled {
-            let mut limit = self.charge_limit as f32;
-            ui.horizontal(|ui| {
-                ui.label("充电上限:");
-                if ui
-                    .add(egui::Slider::new(&mut limit, 40.0..=100.0).step_by(1.0).suffix("%"))
-                    .changed()
-                {
-                    let new_limit = limit.round() as u8;
-                    self.charge_limit = new_limit;
-                    self.config.battery_charge_limit = new_limit;
-                    match self.backend.set_charge_limit(new_limit) {
-                        Ok(_) => log::info!("Charge limit set to {}%", new_limit),
-                        Err(e) => log::error!("Failed to set charge limit: {}", e),
-                    }
-                    self.save_state();
-                }
-            });
-        }
-
-        ui.separator();
-        ui.add_space(8.0);
-
-        // Performance mode
-        ui.heading("性能模式");
-        let modes = ec::performance::PerfMode::all();
-        let ncols = 3;
-        egui::Grid::new("perf_grid")
-            .min_col_width(100.0)
-            .max_col_width(140.0)
-            .spacing([8.0, 8.0])
-            .show(ui, |ui| {
-                for (i, mode) in modes.iter().enumerate() {
-                    let val = *mode as u8;
-                    let is_selected = val == self.performance_mode;
-                    let btn = egui::Button::new(egui::RichText::new(mode.name()).size(14.0))
-                        .min_size(Vec2::new(100.0, 36.0))
-                        .fill(if is_selected {
-                            Color32::from_rgb(0x25, 0x50, 0xAA)
-                        } else {
-                            Color32::from_gray(220)
-                        })
-                        .stroke(egui::Stroke::new(
-                            1.0,
-                            if is_selected {
-                                Color32::from_rgb(0x1A, 0x3C, 0x80)
-                            } else {
-                                Color32::from_gray(180)
-                            },
-                        ))
-                        .corner_radius(6);
-
-                    if ui.add(btn).clicked() {
-                        self.performance_mode = val;
-                        self.config.performance_mode = val;
-                        match self.backend.set_performance_mode(val) {
-                            Ok(_) => log::info!("Performance mode set to {} ({:#x})", mode.name(), val),
-                            Err(e) => log::error!("Failed to set performance mode: {}", e),
-                        }
-                        self.save_state();
-                    }
-
-                    if (i + 1) % ncols == 0 {
-                        ui.end_row();
-                    }
-                }
-            });
-
-        ui.separator();
-        ui.add_space(8.0);
-
-        // Settings
-        ui.heading("设置");
-        ui.add_space(4.0);
-
-        ui.horizontal(|ui| {
-            ui.label("EC 后端偏好:");
-            let mut pref = self.current_pref.clone();
-            let changed = ui
-                .radio_value(&mut pref, BackendPreference::Auto, "自动")
-                .changed()
-                | ui
-                    .radio_value(&mut pref, BackendPreference::Wmi, "WMI")
-                    .changed()
-                | ui
-                    .radio_value(&mut pref, BackendPreference::WinRing0, "WinRing0")
-                    .changed();
-            if changed && pref != self.current_pref {
-                self.try_switch_backend(pref);
-                self.refresh_from_backend();
-            }
-        });
-
-        ui.add_space(8.0);
-
-        let mut auto = self.config.auto_apply_on_startup;
-        if ui.checkbox(&mut auto, "启动时自动应用设置").changed() {
-            self.config.auto_apply_on_startup = auto;
-            if let Err(e) = self.config.save() {
-                log::error!("save config: {}", e);
-            }
-        }
-
-        let mut reapply = self.config.auto_reapply_on_power_change;
-        if ui.checkbox(&mut reapply, "电源切换时自动重设").changed() {
-            self.config.auto_reapply_on_power_change = reapply;
-            if let Err(e) = self.config.save() {
-                log::error!("save config: {}", e);
-            }
-        }
-
-        ui.add_space(16.0);
-        ui.separator();
-        ui.add_space(8.0);
-        ui.label(
-            egui::RichText::new("版本 0.2.0")
-                .color(Color32::GRAY)
-                .size(11.0),
-        );
-    }
-}
-
-fn ac_power_status() -> bool {
-    let mut status = unsafe { std::mem::zeroed() };
-    if unsafe { GetSystemPowerStatus(&mut status).is_ok() } {
-        status.ACLineStatus == 1
-    } else {
-        false
     }
 }
 
@@ -690,9 +280,9 @@ mod tests {
     fn test_cycle_perf_mode_internal_const() {
         let cycle: [u8; 3] = [0x09, 0x02, 0x04];
         assert_eq!(cycle.len(), 3);
-        assert_eq!(cycle[0], 0x09); // Smart
-        assert_eq!(cycle[1], 0x02); // Quiet
-        assert_eq!(cycle[2], 0x04); // Extreme / Beast
+        assert_eq!(cycle[0], 0x09);
+        assert_eq!(cycle[1], 0x02);
+        assert_eq!(cycle[2], 0x04);
     }
 
     #[test]

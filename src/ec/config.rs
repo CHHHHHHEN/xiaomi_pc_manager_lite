@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub enum BackendPreference {
     #[default]
     Auto,
@@ -46,10 +46,20 @@ fn config_path() -> PathBuf {
 impl AppConfig {
     pub fn load() -> Self {
         let path = config_path();
-        std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| toml::from_str(&s).ok())
-            .unwrap_or_default()
+        match std::fs::read_to_string(&path) {
+            Ok(s) => match toml::from_str(&s) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    log::warn!("Config parse error at {:?}: {}; using defaults", path, e);
+                    AppConfig::default()
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => AppConfig::default(),
+            Err(e) => {
+                log::warn!("Config load error at {:?}: {}; using defaults", path, e);
+                AppConfig::default()
+            }
+        }
     }
 
     pub fn save(&self) -> Result<(), String> {

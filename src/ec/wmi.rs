@@ -4,15 +4,18 @@ use super::backend::EcBackend;
 use super::battery;
 use super::error::EcError;
 use super::addr as ec_addr;
+use std::sync::OnceLock;
+
 use windows::Win32::System::Com::{
     CoInitializeEx, CoSetProxyBlanket, CoCreateInstance, CLSCTX_INPROC_SERVER,
-    COINIT_APARTMENTTHREADED, EOAC_NONE, RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE,
+    COINIT_MULTITHREADED, EOAC_NONE, RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE,
 };
 use windows::Win32::System::Ole::SafeArrayCreateVector;
 use windows::Win32::System::Ole::{SafeArrayAccessData, SafeArrayUnaccessData, SafeArrayDestroy};
 use windows::Win32::System::Variant::{VARIANT, VARENUM, VT_ARRAY, VT_UI1};
 use windows::Win32::System::Wmi::*;
 use windows::core::{BSTR, GUID, PCWSTR};
+use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
 
 /// CLSID_WbemAdministrativeLocator ({CB8555CC-9128-11D1-AD9B-00C04FD8FDFF}).
 /// The classic CLSID_WbemLocator ({DC12A687-...}) is missing on newer
@@ -29,10 +32,26 @@ const CMD_WRITE: u16 = 0xFB00;
 const FUN2_BATTERY: u16 = 0x1000;
 const FUN2_PERF: u16 = 0x0800;
 
+static COM_INIT: OnceLock<Result<(), EcError>> = OnceLock::new();
+
 fn ensure_com() -> Result<(), EcError> {
-    unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
-        .ok()
-        .map_err(|e| EcError::WmiConnect(format!("COM init: {}", e)))
+    COM_INIT.get_or_init(|| {
+        let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        let ok = hr.is_ok() || hr.0 == RPC_E_CHANGED_MODE.0;
+        if hr.is_ok() {
+            log::info!("COM initialized (MTA)");
+        } else if hr.0 == RPC_E_CHANGED_MODE.0 {
+            log::warn!("COM already initialized with different mode; proceeding");
+        }
+        if ok {
+            Ok(())
+        } else {
+            let err = EcError::WmiConnect(format!("COM init: {}", hr));
+            log::error!("COM init failed: {}", err);
+            Err(err)
+        }
+    })
+    .clone()
 }
 
 fn to_le16(buf: &mut [u8; 32], offset: usize, val: u16) {
@@ -40,15 +59,14 @@ fn to_le16(buf: &mut [u8; 32], offset: usize, val: u16) {
     buf[offset + 1] = ((val >> 8) & 0xFF) as u8;
 }
 
-#[allow(dead_code)]
-fn from_le16(buf: &[u8; 32], offset: usize) -> u16 {
-    u16::from_le_bytes([buf[offset], buf[offset + 1]])
-}
-
 pub struct WmiBackend {
     services: IWbemServices,
 }
 
+// SAFETY: WmiBackend wraps an IWbemServices COM pointer that was created
+// under MTA. All calls go through that same apartment via &self, and
+// IWbemServices is thread-safe under MTA (the proxy/stub layer handles
+// concurrency via COM's internal mechanisms).
 unsafe impl Send for WmiBackend {}
 unsafe impl Sync for WmiBackend {}
 
@@ -82,8 +100,7 @@ impl WmiBackend {
                 None,
                 EOAC_NONE,
             )
-            .ok()
-            .ok_or(EcError::WmiConnect("CoSetProxyBlanket failed".into()))?;
+            .map_err(|_| EcError::WmiConnect("CoSetProxyBlanket failed".into()))?;
 
             Ok(Self { services })
         }
@@ -112,7 +129,7 @@ impl WmiBackend {
 
             let mut in_sig: Option<IWbemClassObject> = None;
             let mut out_sig: Option<IWbemClassObject> = None;
-            let (_mn_buf, method_name) = to_pcwstr("MiInterface");
+            let (_mn_buf, method_name) = crate::util::to_pcwstr("MiInterface");
             class
                 .GetMethod(method_name, 0, &mut in_sig, &mut out_sig)
                 .map_err(|e| EcError::WmiConnect(format!("GetMethod: {}", e)))?;
@@ -148,7 +165,7 @@ impl WmiBackend {
                 },
             };
 
-            let (_in_buf, in_name) = to_pcwstr(IN_PARAM);
+            let (_in_buf, in_name) = crate::util::to_pcwstr(IN_PARAM);
             in_params
                 .Put(in_name, 0, &v as *const VARIANT, 0)
                 .map_err(|e| EcError::WmiConnect(format!("Put {}: {}", IN_PARAM, e)))?;
@@ -188,7 +205,7 @@ impl WmiBackend {
                 }
             };
 
-            let (_out_buf, out_name) = to_pcwstr(OUT_PARAM);
+            let (_out_buf, out_name) = crate::util::to_pcwstr(OUT_PARAM);
             let mut out_val = VARIANT::default();
             let mut out_type = 0i32;
             let mut out_flavor = 0i32;
@@ -308,6 +325,10 @@ impl EcBackend for WmiBackend {
         }
     }
 
+    fn supports_continuous_charge_limit(&self) -> bool {
+        false
+    }
+
     fn get_battery_care_enabled(&self) -> Result<bool, EcError> {
         let buf = self.read_battery()?;
         let raw = buf[6]; // Data1 = 充电上限 raw code
@@ -326,13 +347,10 @@ impl EcBackend for WmiBackend {
 
     fn set_battery_care(&self, enabled: bool) -> Result<(), EcError> {
         log::info!("WMI: set battery care -> {}", if enabled { "enabled" } else { "disabled" });
-        let current = self.get_charge_limit()?;
-        if enabled {
-            if current == 100 {
-                self.set_charge_limit(80)?;
-            }
-        } else {
+        if !enabled {
             self.set_charge_limit(100)?;
+        } else {
+            self.set_charge_limit(80)?;
         }
         Ok(())
     }
@@ -340,7 +358,7 @@ impl EcBackend for WmiBackend {
     fn set_charge_limit(&self, percent: u8) -> Result<(), EcError> {
         let percent = percent.min(100);
         let raw = battery::percent_to_wmi_rawcode(percent)
-            .or_else(|| Some(battery::nearest_wmi_percent(percent)))
+            .or_else(|| battery::percent_to_wmi_rawcode(battery::nearest_wmi_percent(percent)))
             .unwrap_or(0);
         log::info!("WMI: set charge limit -> {}% (raw {:#x})", percent, raw);
         self.write_battery(raw)
@@ -361,9 +379,3 @@ impl EcBackend for WmiBackend {
 /// Property names on the MICommonInterface.MiInterface method signature.
 const IN_PARAM: &str = "InData";
 const OUT_PARAM: &str = "OutData";
-
-fn to_pcwstr(s: &str) -> (Vec<u16>, PCWSTR) {
-    let wide: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
-    let ptr = PCWSTR(wide.as_ptr());
-    (wide, ptr)
-}

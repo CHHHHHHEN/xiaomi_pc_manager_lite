@@ -1,11 +1,4 @@
-//! Single-threaded message pump for tray icon, global hotkeys and power events.
-//!
-//! Windows requires a `HWND` (or thread message queue) to receive
-//! `WM_TRAY`/`WM_HOTKEY`/`WM_POWERBROADCAST` messages. This module
-//! creates a single message-only window and runs one message loop,
-//! dispatching the three message families to their respective handlers.
-
-use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::sync::{mpsc, OnceLock};
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, MOD_ALT, MOD_CONTROL};
@@ -14,14 +7,14 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateIconFromResourceEx, CreatePopupMenu, DefWindowProcW, DestroyIcon,
-    DestroyMenu, GetCursorPos, PostQuitMessage, SetForegroundWindow, TrackPopupMenu,
-    WM_APP, WM_COMMAND, WM_DESTROY, WM_HOTKEY, WM_LBUTTONUP, WM_RBUTTONUP, MF_SEPARATOR,
-    MF_STRING, LR_DEFAULTCOLOR, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_LEFTBUTTON,
+    DestroyMenu, GetCursorPos, PostQuitMessage, SetForegroundWindow,
+    TrackPopupMenu, WM_APP, WM_COMMAND, WM_DESTROY, WM_HOTKEY, WM_LBUTTONUP, WM_RBUTTONUP,
+    MF_SEPARATOR, MF_STRING, LR_DEFAULTCOLOR, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_LEFTBUTTON,
 };
 use windows::core::PCWSTR;
 
-use crate::gui::app::UiCommand;
-use crate::msg_window;
+use crate::command::UiCommand;
+use crate::tray::window;
 
 const WM_TRAY: u32 = WM_APP + 1;
 const WM_POWERBROADCAST: u32 = 0x0218;
@@ -33,35 +26,26 @@ const MID_QUIT: u32 = 101;
 const HK_TOGGLE_BATTERY: i32 = 1;
 const HK_CYCLE_PERF: i32 = 2;
 
-pub struct TrayState {
-    pub battery_care_enabled: bool,
-    pub perf_mode: u8,
-}
-
 static CMD_TX: OnceLock<mpsc::Sender<UiCommand>> = OnceLock::new();
-pub static TRAY_STATE: OnceLock<Arc<Mutex<TrayState>>> = OnceLock::new();
 
-/// Spawn the single background thread that hosts the tray icon,
-/// global hotkeys, and power-event listener.
-pub fn spawn(cmd_tx: mpsc::Sender<UiCommand>, state: Arc<Mutex<TrayState>>) {
+pub fn spawn(cmd_tx: mpsc::Sender<UiCommand>) {
     CMD_TX.set(cmd_tx).ok();
-    TRAY_STATE.set(state).ok();
     std::thread::spawn(worker_thread);
 }
 
 fn worker_thread() {
-    let hwnd = match msg_window::create_message_window() {
+    let hwnd = match window::create_message_window() {
         Ok(w) => w,
         Err(e) => {
             log::error!("Message worker window: {}", e);
             return;
         }
     };
-    msg_window::set_wndproc(hwnd, wndproc);
+    window::set_wndproc(hwnd, wndproc);
 
     if let Err(e) = register_tray_icon(hwnd) {
         log::error!("Tray icon: {}", e);
-        msg_window::message_loop(hwnd);
+        window::message_loop(hwnd);
         return;
     }
 
@@ -73,8 +57,7 @@ fn worker_thread() {
         log::error!("Register hotkey (P): {:?}", e);
     }
 
-    msg_window::message_loop(hwnd);
-    // Tray icon and hotkeys are torn down with the window.
+    window::message_loop(hwnd);
 }
 
 unsafe extern "system" fn wndproc(
@@ -97,10 +80,9 @@ fn handle_menu_command(wparam: WPARAM, _lparam: LPARAM) -> LRESULT {
     let id = (wparam.0 as u32) & 0xFFFF;
     if let Some(tx) = CMD_TX.get() {
         match id {
-            MID_SHOW => {                 let _ = tx.send(UiCommand::ToggleWindow); }
+            MID_SHOW => { let _ = tx.send(UiCommand::ToggleWindow); }
             MID_QUIT => {
                 let _ = tx.send(UiCommand::Quit);
-                unsafe { PostQuitMessage(0); }
             }
             _ => {}
         }
@@ -147,7 +129,7 @@ fn handle_tray_event(hwnd: HWND, lparam: LPARAM) -> LRESULT {
 }
 
 fn register_tray_icon(hwnd: HWND) -> Result<(), String> {
-    let icon_bytes = include_bytes!("../icons/tray_icon.ico");
+    let icon_bytes = include_bytes!("../../icons/tray_icon.ico");
     let hicon = load_icon(icon_bytes)?;
 
     let mut nid: NOTIFYICONDATAW = unsafe { std::mem::zeroed() };
@@ -158,7 +140,8 @@ fn register_tray_icon(hwnd: HWND) -> Result<(), String> {
     nid.uCallbackMessage = WM_TRAY;
     nid.hIcon = hicon;
 
-    let tip: Vec<u16> = "Xiaomi PC Manager Lite\0".encode_utf16().collect();
+    nid.szTip = [0u16; 128];
+    let (tip, _) = crate::util::to_pcwstr("Xiaomi PC Manager Lite");
     let n = tip.len().min(128);
     nid.szTip[..n].copy_from_slice(&tip[..n]);
 
@@ -172,11 +155,11 @@ fn register_tray_icon(hwnd: HWND) -> Result<(), String> {
 
 fn show_tray_menu(hwnd: HWND) {
     let hmenu = unsafe { CreatePopupMenu().unwrap_or_default() };
-    let show = wstr("显示/隐藏窗口");
-    let _ = unsafe { AppendMenuW(hmenu, MF_STRING, MID_SHOW as usize, PCWSTR(show.as_ptr())) };
+    let (_show_buf, show) = crate::util::to_pcwstr("显示/隐藏窗口");
+    let _ = unsafe { AppendMenuW(hmenu, MF_STRING, MID_SHOW as usize, show) };
     let _ = unsafe { AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null()) };
-    let quit = wstr("退出");
-    let _ = unsafe { AppendMenuW(hmenu, MF_STRING, MID_QUIT as usize, PCWSTR(quit.as_ptr())) };
+    let (_quit_buf, quit) = crate::util::to_pcwstr("退出");
+    let _ = unsafe { AppendMenuW(hmenu, MF_STRING, MID_QUIT as usize, quit) };
 
     let mut pt = POINT { x: 0, y: 0 };
     let _ = unsafe { GetCursorPos(&mut pt) };
@@ -193,10 +176,6 @@ fn show_tray_menu(hwnd: HWND) {
         )
     };
     let _ = unsafe { DestroyMenu(hmenu) };
-}
-
-fn wstr(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 fn load_icon(bytes: &[u8]) -> Result<windows::Win32::UI::WindowsAndMessaging::HICON, String> {

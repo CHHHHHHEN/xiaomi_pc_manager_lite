@@ -1,7 +1,4 @@
-//! Fn+Key 功能键 WMI 事件监控 (F-FNKEY)
-
 use std::sync::mpsc;
-use std::time::Duration;
 
 use windows::Win32::System::Com::{
     CoInitializeEx, CoSetProxyBlanket, CoCreateInstance, CLSCTX_INPROC_SERVER,
@@ -12,22 +9,18 @@ use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::System::Ole::{SafeArrayAccessData, SafeArrayUnaccessData, SafeArrayGetUBound};
 use windows::core::{BSTR, GUID, PCWSTR};
 
-use crate::gui::app::UiCommand;
+use windows::Win32::System::Variant::{VARENUM, VT_ARRAY, VT_UI1};
+
+use crate::command::UiCommand;
 
 const CLSID_WMI_LOCATOR: GUID = GUID::from_u128(0xCB8555CC_9128_11D1_AD9B_00C04FD8FDFF);
 
 const RPC_C_AUTHN_WINNT: u32 = 10u32;
 const RPC_C_AUTHZ_NONE: u32 = 0u32;
 
-const WMI_CLASSES: &[&str] = &[
-    "HID_EVENT20",
-    "HID_EVENT21",
-    "HID_EVENT22",
-    "HID_EVENT23",
-    "WMIEvent",
-];
+const WMI_CLASSES: &[&str] = &["HID_EVENT20"];
 
-#[allow(dead_code)]
+#[derive(Debug)]
 pub enum FnAction {
     CyclePerformanceMode,
     ShowFnLockOsd,
@@ -35,23 +28,8 @@ pub enum FnAction {
     ShowKeyboardBacklightOsd,
     MicrophoneMuteOn,
     MicrophoneMuteOff,
-    ToggleTouchpad,
-    VolumeUp,
-    VolumeDown,
-    VolumeMute,
-    BrightnessUp,
-    BrightnessDown,
-    MediaPrevious,
-    MediaNext,
-    MediaPlayPause,
-    ToggleAirplaneMode,
-    LockWindows,
-    Screenshot,
-    OpenCalculator,
     OpenSettings,
     OpenProjection,
-    OpenApplication,
-    SendStandardKey,
 }
 
 pub struct FnKeyDef {
@@ -77,7 +55,6 @@ const BUILTIN_KEYS: &[FnKeyDef] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gui::app::UiCommand;
 
     #[test]
     fn test_builtin_keys_count() {
@@ -246,9 +223,10 @@ mod tests {
     }
 }
 
-/// Wrapper that makes `IEnumWbemClassObject` `Send`.
-/// COM interfaces are safe to send when each thread initializes its own apartment.
 struct SafeEnumerator(IEnumWbemClassObject);
+// SAFETY: SafeEnumerator is only used on the dedicated fnkey watcher thread.
+// COM is initialized in MTA on that thread, and the enumerator is never
+// accessed from any other thread.
 unsafe impl Send for SafeEnumerator {}
 
 fn dispatch_action(action: &FnAction, cmd_tx: &mpsc::Sender<UiCommand>) {
@@ -256,72 +234,7 @@ fn dispatch_action(action: &FnAction, cmd_tx: &mpsc::Sender<UiCommand>) {
         FnAction::CyclePerformanceMode => {
             let _ = cmd_tx.send(UiCommand::CyclePerfMode);
         }
-        FnAction::ShowFnLockOsd => {
-            log::info!("FnKey action: Fn 锁 OSD (not yet implemented)");
-        }
-        FnAction::ShowCapsLockOsd => {
-            log::info!("FnKey action: 大写锁定 OSD (not yet implemented)");
-        }
-        FnAction::ShowKeyboardBacklightOsd => {
-            log::info!("FnKey action: 键盘背光 OSD (not yet implemented)");
-        }
-        FnAction::MicrophoneMuteOn => {
-            log::info!("FnKey action: 麦克风静音开 (not yet implemented)");
-        }
-        FnAction::MicrophoneMuteOff => {
-            log::info!("FnKey action: 麦克风静音关 (not yet implemented)");
-        }
-        FnAction::ToggleTouchpad => {
-            log::info!("FnKey action: 切换触摸板 (not yet implemented)");
-        }
-        FnAction::VolumeUp => {
-            log::info!("FnKey action: 音量加 (not yet implemented)");
-        }
-        FnAction::VolumeDown => {
-            log::info!("FnKey action: 音量减 (not yet implemented)");
-        }
-        FnAction::VolumeMute => {
-            log::info!("FnKey action: 音量静音 (not yet implemented)");
-        }
-        FnAction::BrightnessUp => {
-            log::info!("FnKey action: 亮度加 (not yet implemented)");
-        }
-        FnAction::BrightnessDown => {
-            log::info!("FnKey action: 亮度减 (not yet implemented)");
-        }
-        FnAction::MediaPrevious => {
-            log::info!("FnKey action: 上一首 (not yet implemented)");
-        }
-        FnAction::MediaNext => {
-            log::info!("FnKey action: 下一首 (not yet implemented)");
-        }
-        FnAction::MediaPlayPause => {
-            log::info!("FnKey action: 播放/暂停 (not yet implemented)");
-        }
-        FnAction::ToggleAirplaneMode => {
-            log::info!("FnKey action: 飞行模式 (not yet implemented)");
-        }
-        FnAction::LockWindows => {
-            log::info!("FnKey action: 锁定工作站 (not yet implemented)");
-        }
-        FnAction::Screenshot => {
-            log::info!("FnKey action: 截图 (not yet implemented)");
-        }
-        FnAction::OpenCalculator => {
-            log::info!("FnKey action: 打开计算器 (not yet implemented)");
-        }
-        FnAction::OpenSettings => {
-            log::info!("FnKey action: 打开设置 (not yet implemented)");
-        }
-        FnAction::OpenProjection => {
-            log::info!("FnKey action: 打开投影切换 (not yet implemented)");
-        }
-        FnAction::OpenApplication => {
-            log::info!("FnKey action: 启动自定义应用 (not yet implemented)");
-        }
-        FnAction::SendStandardKey => {
-            log::info!("FnKey action: 发送标准键 (not yet implemented)");
-        }
+        _ => log::info!("FnKey action: {:?} (not yet implemented)", action),
     }
 }
 
@@ -402,7 +315,6 @@ fn run_watcher(cmd_tx: &mpsc::Sender<UiCommand>) -> Result<(), String> {
         log::warn!("FnKey: no WMI event classes available");
     }
 
-    // Single polling loop across all enumerators
     loop {
         for (class_name, SafeEnumerator(ref enumerator)) in &enumerators {
             let mut objects: [Option<IWbemClassObject>; 1] = [None];
@@ -410,7 +322,7 @@ fn run_watcher(cmd_tx: &mpsc::Sender<UiCommand>) -> Result<(), String> {
 
             let hr = unsafe {
                 enumerator.Next(
-                    1000, // 1 second timeout
+                    1000,
                     &mut objects,
                     &mut returned as *mut u32,
                 )
@@ -424,8 +336,6 @@ fn run_watcher(cmd_tx: &mpsc::Sender<UiCommand>) -> Result<(), String> {
                 process_event(obj, class_name, cmd_tx);
             }
         }
-
-        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -445,7 +355,6 @@ fn process_event(
         }
     };
 
-    // Extract InstanceName and Active per F-FNKEY-04
     let instance_name = get_string_prop(obj, "InstanceName").unwrap_or_default();
     let active = get_bool_prop(obj, "Active");
 
@@ -471,29 +380,25 @@ fn process_event(
     log::debug!("FnKey [{}]: unmatched event {} (InstanceName={})", class_name, report_hex, instance_name);
 }
 
-fn get_detail_hex(obj: &IWbemClassObject) -> Option<String> {
-    let wide: Vec<u16> = "EventDetail\0".encode_utf16().collect();
+/// Shared helper: get a VARIANT property from a WMI object by name.
+fn get_variant(obj: &IWbemClassObject, name: &str) -> Option<VARIANT> {
+    let (_wide, prop_name) = crate::util::to_pcwstr(name);
     let mut val = VARIANT::default();
     let mut _type = 0i32;
     let mut _flavor = 0i32;
-
-    if unsafe {
+    unsafe {
         obj
-            .Get(
-                PCWSTR(wide.as_ptr()),
-                0,
-                &mut val,
-                Some(&mut _type as *mut i32),
-                Some(&mut _flavor as *mut i32),
-            )
-    }.is_err() {
-        return None;
+            .Get(prop_name, 0, &mut val, Some(&mut _type as *mut i32), Some(&mut _flavor as *mut i32))
+            .ok()?;
     }
+    Some(val)
+}
 
-    let vt = unsafe { val.Anonymous.Anonymous.vt.0 };
+fn get_detail_hex(obj: &IWbemClassObject) -> Option<String> {
+    let val = get_variant(obj, "EventDetail")?;
+    let vt = unsafe { val.Anonymous.Anonymous.vt };
 
-    // VT_ARRAY | VT_UI1 = 0x2008 = 8200
-    if vt == 0x2008 {
+    if vt == VARENUM(VT_ARRAY.0 | VT_UI1.0) {
         let sa = unsafe { val.Anonymous.Anonymous.Anonymous.parray };
         if !sa.is_null() {
             let mut data: *mut std::ffi::c_void = std::ptr::null_mut();
@@ -510,76 +415,15 @@ fn get_detail_hex(obj: &IWbemClassObject) -> Option<String> {
         }
     }
 
-    // VT_BSTR = 8
-    if vt == 8 {
-        let bstr = unsafe { &*val.Anonymous.Anonymous.Anonymous.bstrVal };
-        let ptr = bstr.as_ptr();
-        if !ptr.is_null() {
-            let len = bstr.len();
-            let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
-            let s = String::from_utf16_lossy(slice);
-            return Some(s);
-        }
-    }
-
-    None
+    unsafe { crate::ec::wmi_util::bstr_from_variant(&val) }
 }
 
 fn get_bool_prop(obj: &IWbemClassObject, name: &str) -> Option<bool> {
-    let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
-    let mut val = VARIANT::default();
-    let mut _type = 0i32;
-    let mut _flavor = 0i32;
-
-    if unsafe {
-        obj.Get(
-            PCWSTR(wide.as_ptr()),
-            0,
-            &mut val,
-            Some(&mut _type as *mut i32),
-            Some(&mut _flavor as *mut i32),
-        )
-    }.is_err() {
-        return None;
-    }
-
-    // VT_BOOL = 11
-    if unsafe { val.Anonymous.Anonymous.vt.0 == 11 } {
-        // VARIANT_TRUE = -1 (0xFFFF), VARIANT_FALSE = 0
-        Some(unsafe { val.Anonymous.Anonymous.Anonymous.boolVal } != windows::Win32::Foundation::VARIANT_BOOL(0))
-    } else {
-        None
-    }
+    let val = get_variant(obj, name)?;
+    unsafe { crate::ec::wmi_util::bool_from_variant(&val) }
 }
 
 fn get_string_prop(obj: &IWbemClassObject, name: &str) -> Option<String> {
-    let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
-    let mut val = VARIANT::default();
-    let mut _type = 0i32;
-    let mut _flavor = 0i32;
-
-    if unsafe {
-        obj.Get(
-            PCWSTR(wide.as_ptr()),
-            0,
-            &mut val,
-            Some(&mut _type as *mut i32),
-            Some(&mut _flavor as *mut i32),
-        )
-    }.is_err() {
-        return None;
-    }
-
-    if unsafe { val.Anonymous.Anonymous.vt.0 == 8 } {
-        let bstr = unsafe { &*val.Anonymous.Anonymous.Anonymous.bstrVal };
-        let ptr = bstr.as_ptr();
-        if !ptr.is_null() {
-            let len = bstr.len();
-            let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
-            let s = String::from_utf16_lossy(slice);
-            return Some(s);
-        }
-    }
-
-    None
+    let val = get_variant(obj, name)?;
+    unsafe { crate::ec::wmi_util::bstr_from_variant(&val) }
 }
