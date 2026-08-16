@@ -27,7 +27,6 @@ impl XiaomiApp {
                 .clicked()
             {
                 self.refresh_from_backend();
-                self.error_msg = None;
             }
         });
         ui.horizontal(|ui| {
@@ -79,10 +78,14 @@ impl XiaomiApp {
                 let mut limit = self.charge_limit as f32;
                 ui.horizontal(|ui| {
                     ui.label("充电上限:");
-                    if ui
-                        .add(egui::Slider::new(&mut limit, 40.0..=100.0).step_by(1.0).suffix("%"))
-                        .changed()
-                    {
+                    let resp = ui.add(
+                        egui::Slider::new(&mut limit, 40.0..=100.0).step_by(1.0).suffix("%"),
+                    );
+                    // 只在拖动结束（或点击/键盘改变）时一次性写入硬件：若每个
+                    // changed() 帧都调用 set_charge_limit_internal，拖动一次滑块
+                    // 会触发几十次 EC 写入 + 读回 + 配置文件落盘（WMI 后端单次
+                    // 调用可达数十毫秒），造成界面卡顿并长时间占用 EC（NFR-UX-02）。
+                    if resp.drag_stopped() || (resp.changed() && !resp.dragged()) {
                         self.set_charge_limit_internal(limit.round() as u8);
                     }
                 });
