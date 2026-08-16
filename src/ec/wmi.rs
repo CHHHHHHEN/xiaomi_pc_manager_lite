@@ -1,5 +1,7 @@
 //! WMI EC backend — MICommonInterface.MiInterface protocol
 
+use std::sync::Mutex;
+
 use super::backend::EcBackend;
 use super::battery;
 use super::error::EcError;
@@ -33,6 +35,47 @@ const CMD_READ: u16 = 0xFA00;
 const CMD_WRITE: u16 = 0xFB00;
 const FUN2_BATTERY: u16 = 0x1000;
 const FUN2_PERF: u16 = 0x0800;
+
+/// GetResultObject 等待上限。健康固件上单次调用数十毫秒即可返回；
+/// 原 10000ms 意味着坏固件（协议被拒绝）上每次调用冻结 GUI 最长 10 秒
+/// （B-WMI-2）。3000ms 仍是宽裕值，同时把最坏阻塞降到有界范围。
+const GET_RESULT_TIMEOUT_MS: i32 = 3000;
+
+/// 是否属于确定性致命错误（应熔断）：固件/提供程序层面的确定性失败，
+/// 重试必然再次失败。瞬态错误（超时、服务忙、连接中断等）不熔断，
+/// 否则 WMI 服务重启等临时故障会永久禁用后端（B-WMI-2）。
+fn is_latching_hresult(hr: u32) -> bool {
+    const FATAL: &[u32] = &[
+        // WBEM_E_PROVIDER_FAILURE：固件拒绝协议。2025 RedmiBook Pro 14
+        // 实测每次调用都返回该错误（见 mi_interface_call GetResultObject
+        // 失败分支的注释），不熔断则每次调用都重复等待完整超时。
+        WBEM_E_PROVIDER_FAILURE.0 as u32,
+        // 类/方法层面不存在或不受支持：机器不支持该接口，重试不会成功。
+        WBEM_E_INVALID_CLASS.0 as u32,
+        WBEM_E_NOT_FOUND.0 as u32,
+        WBEM_E_INVALID_METHOD.0 as u32,
+        WBEM_E_NOT_SUPPORTED.0 as u32,
+        WBEM_E_INVALID_PARAMETER.0 as u32,
+    ];
+    FATAL.contains(&hr)
+}
+
+/// 将错误写入熔断状态（hr 为确定性致命错误或 None 表示必然失败时），
+/// 返回原始错误。独立为自由函数以便在无 COM 环境下单测熔断语义。
+fn latch_into(state: &Mutex<Option<EcError>>, hr: Option<u32>, err: EcError) -> EcError {
+    let fatal = match hr {
+        None => true,
+        Some(hr) => is_latching_hresult(hr),
+    };
+    if fatal {
+        let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            log::error!("WMI: latching fatal error '{}'; subsequent calls fail fast", err);
+            *guard = Some(err.clone());
+        }
+    }
+    err
+}
 
 /// 初始化当前线程的 COM 公寓（MTA）。
 ///
@@ -88,6 +131,9 @@ fn wmi_rawcode_for_percent(percent: u8) -> u8 {
 
 pub struct WmiBackend {
     services: IWbemServices,
+    /// 确定性致命错误熔断（B-WMI-2）：首次确定性失败后缓存错误，后续调用
+    /// 立即返回，不再重复等待超时。None = 未熔断。
+    fatal: Mutex<Option<EcError>>,
 }
 
 // SAFETY: WmiBackend wraps an IWbemServices COM pointer that was created
@@ -129,8 +175,13 @@ impl WmiBackend {
             )
             .map_err(|_| EcError::WmiConnect("CoSetProxyBlanket failed".into()))?;
 
-            Ok(Self { services })
+            Ok(Self { services, fatal: Mutex::new(None) })
         }
+    }
+
+    /// hr 为确定性致命错误（或接口缺失等必然失败）时写入熔断；返回原始错误。
+    fn maybe_latch(&self, hr: Option<u32>, err: EcError) -> EcError {
+        latch_into(&self.fatal, hr, err)
     }
 
     /// Discover the first user-defined property name from a WMI class/instance
@@ -203,6 +254,14 @@ impl WmiBackend {
     ///   Status(2B) + Function(2B) + Data0(2B) + Data1(4B) + Data2(4B) + Data3(4B)
     fn mi_interface_call(&self, buffer: &[u8; 32]) -> Result<[u8; 32], EcError> {
         unsafe {
+            // 熔断检查：确定性失败（如固件拒绝协议）后不再发起任何 WMI 调用，
+            // 直接返回缓存错误——坏固件上每次调用本会走完 GetResultObject 的
+            // 完整超时，GUI 刷新/启动会冻结数十秒（B-WMI-2）。
+            if let Some(err) = self.fatal.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+                log::warn!("WMI: MiInterface latched as failed ({}); failing fast", err);
+                return Err(err);
+            }
+
             // 本函数是对 self.services 代理的**唯一**调用入口，而调用方可能
             // 来自任意线程（后端初始化线程、GUI 线程、后端切换线程）。
             // COM 按线程初始化，必须先在本线程建立公寓才能调用代理接口，
@@ -222,17 +281,29 @@ impl WmiBackend {
                     Some(&mut class as *mut Option<IWbemClassObject>),
                     None,
                 )
-                .map_err(|e| EcError::WmiConnect(format!("GetObject: {}", e)))?;
-            let class = class.ok_or(EcError::WmiInterfaceNotFound)?;
+                .map_err(|e| {
+                    let hr = e.code().0 as u32;
+                    self.maybe_latch(Some(hr), EcError::WmiConnect(format!("GetObject: {}", e)))
+                })?;
+            let class = match class {
+                Some(c) => c,
+                None => return Err(self.maybe_latch(None, EcError::WmiInterfaceNotFound)),
+            };
 
             let mut in_sig: Option<IWbemClassObject> = None;
             let mut out_sig: Option<IWbemClassObject> = None;
             let (_mn_buf, method_name) = crate::util::to_pcwstr("MiInterface");
             class
                 .GetMethod(method_name, 0, &mut in_sig, &mut out_sig)
-                .map_err(|e| EcError::WmiConnect(format!("GetMethod: {}", e)))?;
+                .map_err(|e| {
+                    let hr = e.code().0 as u32;
+                    self.maybe_latch(Some(hr), EcError::WmiConnect(format!("GetMethod: {}", e)))
+                })?;
 
-            let in_sig = in_sig.ok_or(EcError::WmiInterfaceNotFound)?;
+            let in_sig = match in_sig {
+                Some(s) => s,
+                None => return Err(self.maybe_latch(None, EcError::WmiInterfaceNotFound)),
+            };
             let in_param_name = Self::param_name_from_schema(&in_sig, "InData");
             log::info!("WMI: MiInterface input parameter -> '{}'", in_param_name);
 
@@ -295,7 +366,8 @@ impl WmiBackend {
                 // 先 drop in_params，再销毁数组（Put 保留的是引用而非拷贝）。
                 drop(in_params);
                 SafeArrayDestroy(sa).ok();
-                return Err(EcError::WmiCallHResult(e.code().0 as u32));
+                let hr = e.code().0 as u32;
+                return Err(self.maybe_latch(Some(hr), EcError::WmiCallHResult(hr)));
             }
 
             let call_result = match call_result {
@@ -311,12 +383,13 @@ impl WmiBackend {
             };
 
             log::info!("WMI: GetResultObject waiting...");
-            let out_params = match call_result.GetResultObject(10000) {
+            let out_params = match call_result.GetResultObject(GET_RESULT_TIMEOUT_MS) {
                 Ok(p) => p,
                 Err(e) => {
+                    let hr = e.code().0 as u32;
                     log::error!(
                         "WMI: GetResultObject failed: hr=0x{:08X}",
-                        e.code().0 as u32
+                        hr
                     );
                     // 调用失败（如固件拒绝协议，hr=0x8004102F）时**绝不**
                     // 释放输入数组。实测（本机 2025 RedmiBook Pro 14 固件，
@@ -333,7 +406,7 @@ impl WmiBackend {
                     // （sa 为裸指针无析构器，不调用 SafeArrayDestroy 即不
                     // 释放；in_params 是 COM 对象，forget 防止自动 Release。）
                     std::mem::forget(in_params);
-                    return Err(EcError::WmiCallHResult(e.code().0 as u32));
+                    return Err(self.maybe_latch(Some(hr), EcError::WmiCallHResult(hr)));
                 }
             };
 
@@ -575,6 +648,63 @@ impl EcBackend for WmiBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 回归测试（B-WMI-2）：确定性致命错误必须熔断——坏固件上每次调用都
+    /// 返回相同的确定性错误，不熔断则每次调用都重复等待完整超时。
+    #[test]
+    fn test_is_latching_hresult_deterministic_errors() {
+        assert!(is_latching_hresult(WBEM_E_PROVIDER_FAILURE.0 as u32));
+        assert!(is_latching_hresult(WBEM_E_INVALID_CLASS.0 as u32));
+        assert!(is_latching_hresult(WBEM_E_NOT_FOUND.0 as u32));
+        assert!(is_latching_hresult(WBEM_E_INVALID_METHOD.0 as u32));
+        assert!(is_latching_hresult(WBEM_E_NOT_SUPPORTED.0 as u32));
+        assert!(is_latching_hresult(WBEM_E_INVALID_PARAMETER.0 as u32));
+    }
+
+    /// 回归测试（B-WMI-2）：瞬态错误不得熔断，否则 WMI 服务重启、休眠
+    /// 唤醒等临时故障会永久禁用后端。
+    #[test]
+    fn test_is_latching_hresult_transient_errors() {
+        // GetResultObject 超时经 windows-rs from_abi(NULL) 掩盖为 E_FAIL；
+        // 均属瞬态，不得熔断。
+        assert!(!is_latching_hresult(0x80004003)); // E_POINTER
+        assert!(!is_latching_hresult(0x80004005)); // E_FAIL
+        assert!(!is_latching_hresult(WBEM_E_TIMED_OUT.0 as u32));
+        assert!(!is_latching_hresult(0x80041017)); // WBEM_E_OUT_OF_MEMORY
+        assert!(!is_latching_hresult(0x800401F0)); // CO_E_NOTINITIALIZED
+        assert!(!is_latching_hresult(0x800706BA)); // RPC_S_SERVER_UNAVAILABLE
+    }
+
+    /// 回归测试（B-WMI-2）：熔断只保存首个错误，后续错误不覆盖。
+    #[test]
+    fn test_latch_into_stores_first_error_only() {
+        let state = Mutex::new(None::<EcError>);
+        let first = EcError::WmiCallHResult(WBEM_E_PROVIDER_FAILURE.0 as u32);
+        let returned = latch_into(&state, Some(WBEM_E_PROVIDER_FAILURE.0 as u32), first.clone());
+        assert_eq!(returned.to_string(), first.to_string());
+
+        let second = EcError::WmiCallHResult(WBEM_E_INVALID_CLASS.0 as u32);
+        let _ = latch_into(&state, Some(WBEM_E_INVALID_CLASS.0 as u32), second);
+        let latched = state.lock().unwrap().as_ref().expect("latched").to_string();
+        assert_eq!(latched, first.to_string());
+    }
+
+    /// 回归测试（B-WMI-2）：接口缺失（无 hr）视为必然失败，必须熔断。
+    #[test]
+    fn test_latch_into_force_on_missing_interface() {
+        let state = Mutex::new(None::<EcError>);
+        let err = EcError::WmiInterfaceNotFound;
+        let _ = latch_into(&state, None, err);
+        assert!(state.lock().unwrap().is_some());
+    }
+
+    /// 回归测试（B-WMI-2）：瞬态错误不写入熔断状态。
+    #[test]
+    fn test_latch_into_ignores_transient() {
+        let state = Mutex::new(None::<EcError>);
+        let _ = latch_into(&state, Some(0x80004005), EcError::WmiCallHResult(0x80004005));
+        assert!(state.lock().unwrap().is_none());
+    }
 
     /// 回归测试（本机实证）：COM 是**每线程**初始化的。修复前 ensure_com
     /// 用 OnceLock 只在第一个调用线程（main.rs 的后端初始化后台线程）初始化
