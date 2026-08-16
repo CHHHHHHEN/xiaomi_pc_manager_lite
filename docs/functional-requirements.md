@@ -2,7 +2,7 @@
 
 ## Xiaomi PC Manager Lite
 
-| 文档版本 | 1.3 |
+| 文档版本 | 1.4 |
 |---------|-----|
 | 产品版本 | 0.2.0 |
 | 制定日期 | 2026-06-15 |
@@ -18,6 +18,7 @@
 | 1.1 | 2026-08-16 | 新增 3.12 开机自启动需求（计划任务方案），同步更新范围、配置字段、GUI 需求 | opencode |
 | 1.2 | 2026-08-16 | Fn+Key 功能键监控收缩为仅 Fn+K 性能模式切换（3.11 F-FNK），删除其余功能键、自定义映射与 OSD 需求；同步更新代码与范围说明 | opencode |
 | 1.3 | 2026-08-16 | WMI 后端本机实证修复：MiInterface 改为实例调用（F-HAL-08c/d）、Status 成功值修正为 0x8000（F-HAL-08a）、响应下限 18 字节（F-HAL-08b）、输入数组永不释放（F-HAL-08e） | opencode |
+| 1.4 | 2026-08-16 | WMI 后端重构为线程亲和 worker 模式（F-HAL-08f）：根治本机 exe 环境跨线程 COM 调用必崩（STATUS_ACCESS_VIOLATION），同时消除 GUI 冻结 | opencode |
 
 ---
 
@@ -266,6 +267,7 @@ graph TD
 | F-HAL-08c | **MiInterface 方法必须在实例上调用**：应先枚举 `MICommonInterface` 实例（`SELECT * FROM MICommonInterface`），优先选择 `Active=true` 且 `InstanceName` 含 `MIFS` 的实例（否则取第一个），对实例路径（如 `MICommonInterface.InstanceName="ACPI\\PNP0C14\\MIFS_0"`）调用 ExecMethod；对类路径调用会被 WinMgmt 以 `WBEM_E_INVALID_METHOD_PARAMETERS` (0x8004102F) 拒绝（与输入无关，1~64 字节输入全部复现） | Must |
 | F-HAL-08d | 方法签名（参数名 InData/OutData）应从**类对象**获取（对实例对象调用 `GetMethod` 返回 `WBEM_E_INVALID_OPERATION` 0x8004101E），调用则走实例路径 | Must |
 | F-HAL-08e | 输入数组（SAFEARRAY）一旦经 `Put` 写入方法参数，**任何时机都不得释放**：提供程序对数组的内部引用存活到连接关闭，成功或失败路径释放均会触发 OLE 堆损坏（STATUS_HEAP_CORRUPTION，本机实测）；每次调用泄漏约 32 字节，宁泄漏不崩溃 | Must |
+| F-HAL-08f | WMI 后端应为**线程亲和 worker 模式**：所有 COM 调用（连接、实例枚举、方法调用）固定在专用 worker 线程执行，对外以命令通道同步代理暴露，任意线程调用均安全。本机 2025 RedmiBook Pro 14 实测：跨线程直接调用 `IWbemServices` 在本项目 exe 环境 100% 触发 STATUS_ACCESS_VIOLATION（同一代码在 cargo test 进程不崩，与加载器/DLL 环境相关），worker 模式从架构上根除该问题 | Must |
 | F-HAL-09 | 系统应提供 `WinRing0Backend` 结构体实现 `EcBackend`，通过 I/O 端口 `0x62`/`0x66` 直接读写 EC 内存 | Must |
 | F-HAL-10 | WinRing0 的 I/O 操作应以 `Mutex<()>` 同步，确保线程安全 | Must |
 | F-HAL-11 | WinRing0 应通过动态加载方式调用：`InitializeOls()`, `ReadIoPortByte()`, `WriteIoPortByte()`, `DeinitializeOls()` | Must |
