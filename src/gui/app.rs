@@ -119,7 +119,10 @@ impl eframe::App for XiaomiApp {
 
         // 标题栏应用图标：首帧由 icon.png 创建纹理（窗口图标与任务栏图标
         // 已由 with_icon 设置；标题栏图标补齐自绘标题栏的显示）。
+        // 任务栏/窗口图标用多尺寸 ICO 覆盖设置（with_icon 对大 PNG 的
+        // 任务栏缩小渲染效果差，见 platform::window::set_main_window_icon）。
         if self.icon_tex.is_none() {
+            crate::platform::window::set_main_window_icon();
             if let Some(icon) = view::load_icon_data() {
                 let color_image = egui::ColorImage::from_rgba_unmultiplied(
                     [icon.width as usize, icon.height as usize],
