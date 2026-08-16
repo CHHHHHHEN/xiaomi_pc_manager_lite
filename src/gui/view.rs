@@ -105,24 +105,54 @@ impl XiaomiApp {
                 for (i, mode) in modes.iter().enumerate() {
                     let val = *mode as u8;
                     let is_selected = val == self.performance_mode;
-                    let btn = egui::Button::new(egui::RichText::new(mode.name()).size(14.0))
-                        .min_size(Vec2::new(100.0, 36.0))
-                        .fill(if is_selected {
-                            Color32::from_rgb(0x25, 0x50, 0xAA)
-                        } else {
-                            Color32::from_gray(220)
-                        })
-                        .stroke(egui::Stroke::new(
-                            1.0,
-                            if is_selected {
-                                Color32::from_rgb(0x1A, 0x3C, 0x80)
-                            } else {
-                                Color32::from_gray(180)
-                            },
-                        ))
-                        .corner_radius(6);
 
-                    if ui.add(btn).clicked() {
+                    // 先注册交互（点击/hover），背景与文字由下方自定义绘制：
+                    // egui 默认按钮样式在浅色填充下文字对比度差（背景≈纯白、
+                    // 字体跟随主题浅色→灰色）。选中 = 品牌蓝底白字；
+                    // 未选中 = 柔和浅灰底深色字，hover 时背景加深。
+                    let resp = ui.add(
+                        egui::Button::new(egui::RichText::new(mode.name()).size(14.0))
+                            .min_size(Vec2::new(100.0, 36.0))
+                            .fill(Color32::TRANSPARENT)
+                            .stroke(egui::Stroke::NONE)
+                            .corner_radius(6),
+                    );
+
+                    let fill = if is_selected {
+                        Color32::from_rgb(0x25, 0x50, 0xAA)
+                    } else if resp.hovered() {
+                        Color32::from_rgb(0xD6, 0xD9, 0xDE)
+                    } else {
+                        Color32::from_rgb(0xEF, 0xF1, 0xF4)
+                    };
+                    let stroke_color = if is_selected {
+                        Color32::from_rgb(0x1A, 0x3C, 0x80)
+                    } else {
+                        Color32::from_rgb(0xC2, 0xC6, 0xCC)
+                    };
+                    let text_color = if is_selected {
+                        Color32::WHITE
+                    } else {
+                        Color32::from_rgb(0x33, 0x33, 0x33)
+                    };
+
+                    let painter = ui.painter();
+                    painter.rect_filled(resp.rect, 6.0, fill);
+                    painter.rect_stroke(
+                        resp.rect,
+                        6.0,
+                        egui::Stroke::new(1.0, stroke_color),
+                        egui::StrokeKind::Inside,
+                    );
+                    painter.text(
+                        resp.rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        mode.name(),
+                        egui::FontId::proportional(14.0),
+                        text_color,
+                    );
+
+                    if resp.clicked() {
                         self.set_perf_mode_internal(val);
                     }
 
