@@ -261,6 +261,13 @@ impl EcBackend for WinRing0Backend {
         self.write_byte(ec_addr::CHARGE_LIMIT, pct)
     }
 
+    fn get_battery_state(&self) -> Result<(bool, u8), EcError> {
+        // 单次端口读：养护位由限值推导（见 get_battery_care_enabled），
+        // 避免默认实现再读一次限值（B-WMI-1）。
+        let limit = self.get_charge_limit()?;
+        Ok((limit < 100, limit))
+    }
+
     // ── High-level performance mode ──
 
     fn get_performance_mode(&self) -> Result<u8, EcError> {

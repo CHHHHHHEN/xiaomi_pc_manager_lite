@@ -14,6 +14,17 @@ pub trait EcBackend: Send + Sync {
     fn set_battery_care(&self, enabled: bool) -> Result<(), EcError>;
     fn set_charge_limit(&self, percent: u8) -> Result<(), EcError>;
 
+    /// 一次调用同时获取电池养护状态与充电上限。
+    ///
+    /// 默认实现分别调用两个 getter；能一次往返同时返回两者的后端
+    /// （如 WMI：养护位与上限来自同一条命令的同一响应字段）应覆写，
+    /// 否则 GUI 每次刷新会多一次完整硬件往返（B-WMI-1）。
+    fn get_battery_state(&self) -> Result<(bool, u8), EcError> {
+        let care = self.get_battery_care_enabled()?;
+        let limit = self.get_charge_limit()?;
+        Ok((care, limit))
+    }
+
     // ── High-level performance mode operations ──
     fn get_performance_mode(&self) -> Result<u8, EcError>;
     fn set_performance_mode(&self, mode: u8) -> Result<(), EcError>;

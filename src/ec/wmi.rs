@@ -521,29 +521,35 @@ impl EcBackend for WmiBackend {
     }
 
     fn get_battery_care_enabled(&self) -> Result<bool, EcError> {
-        let buf = self.read_battery()?;
-        let raw = buf[6]; // Data1 = 充电上限 raw code
-        let percent = battery::wmi_rawcode_to_percent(raw).unwrap_or(100);
-        log::info!("WMI: battery care enabled -> {}, limit -> {}%", percent < 100, percent);
-        Ok(percent < 100)
+        self.get_battery_state().map(|(care, _)| care)
     }
 
     fn get_charge_limit(&self) -> Result<u8, EcError> {
+        self.get_battery_state().map(|(_, limit)| limit)
+    }
+
+    fn get_battery_state(&self) -> Result<(bool, u8), EcError> {
+        // B-WMI-1: 养护位与上限来自同一条读命令的同一响应字段（Data1），
+        // 一次往返同时返回两者；默认实现会发起两次相同的 WMI 往返。
         let buf = self.read_battery()?;
         let raw = buf[6]; // Data1 = 充电上限 raw code
         let percent = battery::wmi_rawcode_to_percent(raw).unwrap_or(100);
-        log::info!("WMI: charge limit -> {}%", percent);
-        Ok(percent)
+        log::info!("WMI: battery state -> care {}, limit {}%", percent < 100, percent);
+        Ok((percent < 100, percent))
     }
 
     fn set_battery_care(&self, enabled: bool) -> Result<(), EcError> {
-        log::info!("WMI: set battery care -> {}", if enabled { "enabled" } else { "disabled" });
-        if !enabled {
-            // WMI has no independent battery-care bit: care is the charge
-            // limit being below 100%.  Disabling care must therefore raise the
-            // limit to 100%; when enabling, the caller sets the desired limit.
-            self.set_charge_limit(100)?;
-        }
+        // B-WMI-3: WMI 没有独立的电池养护位（养护 = 充电上限 < 100%，见
+        // get_battery_state 的推导），因此这里是契约性 no-op——全部调用方
+        // （GUI 切换 set_battery_care_internal、启动应用 apply_startup_config、
+        // 电源重设 ReapplyConfig、限值联动 set_charge_limit_internal）都已先
+        // 显式 set_charge_limit 设置上限。曾在 !enabled 时重复
+        // set_charge_limit(100)，与调用方刚写过的 100% 完全相同，每次关闭
+        // 养护浪费一次完整 WMI 往返。
+        log::info!(
+            "WMI: set battery care -> {} (no-op; derived from charge limit)",
+            if enabled { "enabled" } else { "disabled" }
+        );
         Ok(())
     }
 

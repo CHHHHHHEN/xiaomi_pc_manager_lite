@@ -277,17 +277,12 @@ impl XiaomiApp {
             }
             Err(e) => errors.push(format!("读取性能模式: {}", e)),
         }
-        match self.backend.get_battery_care_enabled() {
-            Ok(enabled) => {
-                self.battery_care_enabled = enabled;
-            }
-            Err(e) => errors.push(format!("读取电池养护: {}", e)),
-        }
-        match self.backend.get_charge_limit() {
-            Ok(limit) => {
+        match self.backend.get_battery_state() {
+            Ok((care, limit)) => {
+                self.battery_care_enabled = care;
                 self.charge_limit = limit;
             }
-            Err(e) => errors.push(format!("读取充电上限: {}", e)),
+            Err(e) => errors.push(format!("读取电池状态: {}", e)),
         }
         // Only the runtime state is refreshed here; the persisted config keeps
         // the user's desired settings so they are not silently overwritten by
@@ -321,6 +316,8 @@ mod tests {
         charge_limit: std::sync::Arc<std::sync::atomic::AtomicU8>,
         battery_care: std::sync::Arc<std::sync::atomic::AtomicBool>,
         perf_mode: std::sync::Arc<std::sync::atomic::AtomicU8>,
+        /// get_battery_state 调用计数（回归测试：刷新必须单次往返）。
+        battery_state_calls: std::sync::Arc<std::sync::atomic::AtomicU32>,
     }
 
     impl EcBackend for MockBackend {
@@ -338,6 +335,13 @@ mod tests {
         }
         fn get_charge_limit(&self) -> Result<u8, EcError> {
             Ok(self.charge_limit.load(std::sync::atomic::Ordering::Relaxed))
+        }
+        fn get_battery_state(&self) -> Result<(bool, u8), EcError> {
+            self.battery_state_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok((
+                self.battery_care.load(std::sync::atomic::Ordering::Relaxed),
+                self.charge_limit.load(std::sync::atomic::Ordering::Relaxed),
+            ))
         }
         fn set_battery_care(&self, enabled: bool) -> Result<(), EcError> {
             self.battery_care.store(enabled, std::sync::atomic::Ordering::Relaxed);
@@ -603,6 +607,33 @@ mod tests {
         assert!(!app.config.battery_care_enabled);
     }
 
+    /// 回归测试（B-WMI-1）：刷新必须通过 get_battery_state 单次往返获取电池
+    /// 数据。旧实现分别调用 get_battery_care_enabled + get_charge_limit，
+    /// 在 WMI 后端下每次刷新做两次请求相同数据的完整 WMI 往返。
+    #[test]
+    fn test_refresh_uses_single_battery_roundtrip() {
+        redirect_config_dir();
+        let mock = MockBackend::default();
+        let calls = mock.battery_state_calls.clone();
+        let mut app = XiaomiApp::new(
+            Box::new(mock.clone()),
+            AppConfig::default(),
+            crate::ec::config::BackendPreference::Auto,
+            None,
+        );
+        // 构造时已刷新过一次，清零后验证显式刷新只发一次电池往返。
+        calls.store(0, std::sync::atomic::Ordering::Relaxed);
+        mock.battery_care.store(true, std::sync::atomic::Ordering::Relaxed);
+        mock.charge_limit.store(80, std::sync::atomic::Ordering::Relaxed);
+
+        app.refresh_from_backend();
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(app.battery_care_enabled);
+        assert_eq!(app.charge_limit, 80);
+        assert!(app.error_msg.is_none());
+    }
+
     /// 回归测试：切换后端后，新后端读取失败产生的错误必须保留在 GUI 中展示
     /// （F-ERR-03），不得被切换逻辑清空（曾因 refresh 后无条件 error_msg=None
     /// 导致切换到一个读取全部失败的后端时错误信息被立即抹掉）。
@@ -624,8 +655,7 @@ mod tests {
         assert_eq!(app.backend_name, "failing");
         let err = app.error_msg.as_deref().unwrap_or_default();
         assert!(err.contains("读取性能模式"), "unexpected: {}", err);
-        assert!(err.contains("读取电池养护"), "unexpected: {}", err);
-        assert!(err.contains("读取充电上限"), "unexpected: {}", err);
+        assert!(err.contains("读取电池状态"), "unexpected: {}", err);
     }
 
     /// 回归测试：电源切换重设失败时，错误必须合并进 GUI 展示（F-ERR-03），
