@@ -26,6 +26,20 @@ fn ec_wait_write(rp: ReadPort) -> Result<(), EcError> {
     Err(EcError::Timeout(ec_addr::EC_CMD))
 }
 
+fn ec_wait_read(rp: ReadPort) -> Result<(), EcError> {
+    for i in 0..1000 {
+        if unsafe { rp(ec_addr::EC_CMD) } & 0x01 != 0 {
+            return Ok(());
+        }
+        if i < 100 {
+            core::hint::spin_loop();
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    Err(EcError::Timeout(ec_addr::EC_CMD))
+}
+
 pub struct WinRing0Backend {
     rp: ReadPort,
     wp: WritePort,
@@ -200,7 +214,7 @@ impl EcBackend for WinRing0Backend {
         unsafe { (self.wp)(ec_addr::EC_CMD, 0x80) };
         ec_wait_write(self.rp)?;
         unsafe { (self.wp)(ec_addr::EC_DATA, addr as u8) };
-        ec_wait_write(self.rp)?;
+        ec_wait_read(self.rp)?;
         Ok(unsafe { (self.rp)(ec_addr::EC_DATA) })
     }
 
@@ -222,9 +236,11 @@ impl EcBackend for WinRing0Backend {
     // ── High-level battery ──
 
     fn get_battery_care_enabled(&self) -> Result<bool, EcError> {
-        let val = self.read_byte(ec_addr::BATTERY_CARE)?;
-        log::info!("WinRing0: read battery care -> {:#x}", val);
-        Ok(val & 0x01 != 0)
+        // Derive from charge limit — EC may auto-sync BATTERY_CARE from
+        // CHARGE_LIMIT on real hardware, so reading 0xA4 directly is unreliable.
+        let limit = self.get_charge_limit()?;
+        log::info!("WinRing0: battery care enabled by charge limit -> {}%", limit);
+        Ok(limit < 100)
     }
 
     fn get_charge_limit(&self) -> Result<u8, EcError> {
