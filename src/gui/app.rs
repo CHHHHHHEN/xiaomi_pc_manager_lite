@@ -109,11 +109,15 @@ pub fn run_app(backend: Box<dyn ec::backend::EcBackend>, config: ec::config::App
 
 impl eframe::App for XiaomiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // F-AUTO-07: --autostart 启动时首帧最小化驻留托盘（不能用隐藏——
-        // 隐藏会停掉重绘循环，托盘命令得不到处理，见下方注释）。
+        // F-AUTO-07: --autostart 启动时隐藏驻留托盘（任务栏不显示图标）。
+        // 首帧窗口可能尚未创建完成（FindWindow 找不到），保持标记并重试。
         if self.start_minimized {
-            self.start_minimized = false;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            if crate::platform::window::main_window_visible() {
+                self.start_minimized = false;
+                crate::platform::window::hide_main_window();
+            } else {
+                ctx.request_repaint();
+            }
         }
 
         // 标题栏应用图标：首帧由 icon.png 创建纹理（窗口图标与任务栏图标
@@ -132,17 +136,17 @@ impl eframe::App for XiaomiApp {
             }
         }
 
-        // AC-GUI-05 / F-TRAY-02: 关闭窗口（标题栏关闭按钮 / Alt+F4）时驻留托盘
-        // 而非退出进程；仅当用户通过托盘菜单“退出”（quitting）才真正关闭。
+        // AC-GUI-05 / F-TRAY-02: 关闭窗口（标题栏关闭按钮 / Alt+F4）时隐藏到
+        // 托盘（任务栏图标消失）而非退出进程；仅当用户通过托盘菜单"退出"
+        // （quitting）才真正关闭。
         //
-        // 注意：不能使用 ViewportCommand::Visible(false) 来“隐藏”窗口——
-        // eframe/winit 在窗口隐藏后不再投递 RedrawRequested（已实测验证），
-        // update() 将永久停止运行，托盘恢复窗口、退出等命令都得不到处理，
-        // 应用会变成无法恢复的僵尸进程。改为最小化：winit 对最小化窗口仍
-        // 持续投递重绘事件，托盘/热键命令可以正常消费。
+        // 隐藏用 ShowWindow(SW_HIDE) 实现（platform::window）：winit 不知道
+        // 窗口被隐藏，仍持续投递重绘事件，托盘/热键命令可以正常消费；
+        // 而 ViewportCommand::Visible(false) 会停掉整个重绘循环，应用变成
+        // 无法恢复的僵尸进程（已实测验证）。
         if ctx.input(|i| i.viewport().close_requested()) && !self.quitting {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            crate::platform::window::hide_main_window();
         }
 
         self.process_commands(ctx);

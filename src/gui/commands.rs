@@ -16,15 +16,11 @@ impl XiaomiApp {
             needs_repaint = true;
             match cmd {
                 UiCommand::ToggleWindow => {
-                    // egui 的 ViewportInfo 不提供可见性查询，只能用最小化状态
-                    // 作为窗口是否驻留的判据（见 app.rs update 中关闭→最小化
-                    // 的说明：隐藏窗口会停掉整个重绘循环，托盘命令永远得不到
-                    // 处理）。最小化时恢复窗口，否则最小化到任务栏/托盘。
-                    let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
-                    if minimized {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    // 可见 → 隐藏到托盘（任务栏图标消失）；隐藏 → 显示并激活。
+                    if crate::platform::window::main_window_visible() {
+                        crate::platform::window::hide_main_window();
                     } else {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                        crate::platform::window::show_main_window();
                     }
                 }
                 UiCommand::Quit => {
@@ -467,44 +463,19 @@ mod tests {
         assert_eq!(app.config.performance_mode, PerfMode::Quiet as u8);
     }
 
+    /// 回归测试：ToggleWindow 改为基于真实窗口可见性的隐藏/显示
+    /// （ShowWindow SW_HIDE/SW_SHOW，任务栏图标随可见性消失）。
+    /// 测试进程没有同名窗口：应安全 no-op，不崩溃并请求重绘。
     #[test]
-    fn test_toggle_window_minimizes_and_restores() {
+    fn test_toggle_window_hide_show_is_noop_without_window() {
         let ctx = egui::Context::default();
         let mut app = test_app();
 
-        // 第一帧：窗口可见 → 点击托盘 → 最小化。
-        let output = ctx.run(egui::RawInput::default(), |ctx| {
-            app.cmd_tx.send(UiCommand::ToggleWindow).unwrap();
-            app.process_commands(ctx);
-        });
-        assert!(output
-            .viewport_output[&egui::ViewportId::ROOT]
-            .commands
-            .contains(&egui::ViewportCommand::Minimized(true)));
-
-        // 第二帧：模拟窗口已被最小化（ViewportInfo.minimized=true）→ 恢复。
-        let mut viewports = egui::ViewportIdMap::default();
-        viewports.insert(
-            egui::ViewportId::ROOT,
-            egui::ViewportInfo {
-                minimized: Some(true),
-                ..Default::default()
-            },
-        );
-        let output = ctx.run(
-            egui::RawInput {
-                viewports,
-                ..Default::default()
-            },
-            |ctx| {
-                app.cmd_tx.send(UiCommand::ToggleWindow).unwrap();
-                app.process_commands(ctx);
-            },
-        );
-        assert!(output
-            .viewport_output[&egui::ViewportId::ROOT]
-            .commands
-            .contains(&egui::ViewportCommand::Minimized(false)));
+        app.cmd_tx.send(UiCommand::ToggleWindow).unwrap();
+        app.process_commands(&ctx);
+        app.cmd_tx.send(UiCommand::ToggleWindow).unwrap();
+        app.process_commands(&ctx);
+        assert!(!app.quitting);
     }
 
     #[test]
@@ -739,44 +710,17 @@ mod tests {
         assert!(app.error_msg.is_none());
     }
 
+    /// 回归测试：ToggleWindow 在无窗口环境（测试进程）下安全 no-op。
     #[test]
-    fn test_toggle_window_restores_minimized_window() {
+    fn test_toggle_window_restores_when_hidden() {
         let ctx = egui::Context::default();
         let mut app = test_app();
 
-        // 模拟窗口处于最小化状态（用户点击了标题栏最小化按钮或关闭了窗口）。
-        let mut viewports = egui::ViewportIdMap::default();
-        viewports.insert(
-            egui::ViewportId::ROOT,
-            egui::ViewportInfo {
-                minimized: Some(true),
-                ..Default::default()
-            },
-        );
-        let raw_input = egui::RawInput {
-            viewports,
-            ..Default::default()
-        };
-        let output = ctx.run(raw_input, |ctx| {
-            app.cmd_tx.send(UiCommand::ToggleWindow).unwrap();
-            app.process_commands(ctx);
-        });
-
-        // 最小化状态下点击托盘应恢复窗口，而不是再次最小化。
-        let cmds = &output.viewport_output[&egui::ViewportId::ROOT].commands;
-        assert!(cmds.contains(&egui::ViewportCommand::Minimized(false)));
-        assert!(!cmds.contains(&egui::ViewportCommand::Minimized(true)));
-    }
-
-    #[test]
-    fn test_toggle_window_minimizes_when_not_minimized() {
-        let ctx = egui::Context::default();
-        let mut app = test_app();
-
+        // 隐藏状态（main_window_visible()==false）下点击托盘：应调用显示
+        // 路径（无窗口时为 no-op），不崩溃、不请求退出。
         app.cmd_tx.send(UiCommand::ToggleWindow).unwrap();
         app.process_commands(&ctx);
-        let cmds = ctx.viewport(|v| v.commands.clone());
-        assert!(cmds.contains(&egui::ViewportCommand::Minimized(true)));
+        assert!(!app.quitting);
     }
 
     #[test]
