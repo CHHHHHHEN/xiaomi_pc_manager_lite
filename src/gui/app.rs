@@ -19,6 +19,8 @@ pub struct XiaomiApp {
     pub(crate) charge_limit: u8,
     pub(crate) performance_mode: u8,
     pub(crate) error_msg: Option<String>,
+    /// 用户已通过托盘菜单请求退出；为 true 时窗口关闭不再拦截为驻留托盘。
+    pub(crate) quitting: bool,
 }
 
 impl XiaomiApp {
@@ -29,7 +31,7 @@ impl XiaomiApp {
         let charge_limit = config.battery_charge_limit;
         let performance_mode = config.performance_mode;
 
-        Self {
+        let mut app = Self {
             cmd_tx,
             cmd_rx,
             backend,
@@ -39,8 +41,21 @@ impl XiaomiApp {
             battery_care_enabled,
             charge_limit,
             performance_mode,
-            error_msg: init_error,
+            quitting: false,
+            error_msg: None,
+        };
+
+        // AC-START-03: GUI 启动后应显示硬件当前实际状态，而非仅显示
+        // 持久化的配置（auto_apply 关闭时两者可能不一致）。
+        app.refresh_from_backend();
+        if let Some(init) = init_error {
+            app.error_msg = Some(match app.error_msg.take() {
+                Some(reads) => format!("{}; {}", init, reads),
+                None => init,
+            });
         }
+
+        app
     }
 }
 
@@ -87,8 +102,25 @@ pub fn run_app(backend: Box<dyn ec::backend::EcBackend>, config: ec::config::App
 
 impl eframe::App for XiaomiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // AC-GUI-05 / F-TRAY-02: 关闭窗口（标题栏关闭按钮 / Alt+F4）时驻留托盘
+        // 而非退出进程；仅当用户通过托盘菜单“退出”（quitting）才真正关闭。
+        //
+        // 注意：不能使用 ViewportCommand::Visible(false) 来“隐藏”窗口——
+        // eframe/winit 在窗口隐藏后不再投递 RedrawRequested（已实测验证），
+        // update() 将永久停止运行，托盘恢复窗口、退出等命令都得不到处理，
+        // 应用会变成无法恢复的僵尸进程。改为最小化：winit 对最小化窗口仍
+        // 持续投递重绘事件，托盘/热键命令可以正常消费。
+        if ctx.input(|i| i.viewport().close_requested()) && !self.quitting {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
+
         self.process_commands(ctx);
-        ctx.request_repaint_after(std::time::Duration::from_secs(5));
+        // 窗口隐藏到托盘后 GUI 线程会一直休眠到定时器到期才被唤醒：若间隔过大，
+        // 托盘点击 / 全局快捷键 / Fn+K 命令最长要等一个间隔才会被处理
+        // （egui 的 mpsc 不会唤醒事件循环）。500ms 上限保证命令延迟 ≤ NFR-UX-02
+        // 要求（≤500ms），空闲时每 500ms 一帧的 CPU 开销可忽略。
+        ctx.request_repaint_after(std::time::Duration::from_millis(500));
 
         egui::TopBottomPanel::top("title_bar")
             .frame(Frame {
@@ -124,7 +156,7 @@ impl eframe::App for XiaomiApp {
                 }
                 if title_drag.double_clicked() {
                     let is_maximized =
-                        ctx.viewport(|v| v.builder.maximized.unwrap_or(false));
+                        ctx.input(|i| i.viewport().maximized.unwrap_or(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_maximized));
                 }
 
@@ -143,13 +175,13 @@ impl eframe::App for XiaomiApp {
                         .layout(egui::Layout::right_to_left(egui::Align::Center)),
                     |ui| {
                         if view::titlebar_button(ui, btn_size, "close")
-                            .on_hover_text("退出")
+                            .on_hover_text("隐藏到托盘")
                             .clicked()
                         {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
                         let is_maximized =
-                            ctx.viewport(|v| v.builder.maximized.unwrap_or(false));
+                            ctx.input(|i| i.viewport().maximized.unwrap_or(false));
                         if view::titlebar_button(ui, btn_size, if is_maximized { "restore" } else { "maximize" })
                             .on_hover_text(if is_maximized { "还原" } else { "最大化" })
                             .clicked()
@@ -236,7 +268,9 @@ mod tests {
         assert!(!app.battery_care_enabled);
         assert_eq!(app.charge_limit, 80);
         assert_eq!(app.performance_mode, 0x09);
-        assert!(app.error_msg.is_none());
+        assert!(!app.quitting);
+        // NullBackend 所有读取均失败，启动刷新后应呈现错误信息。
+        assert!(app.error_msg.is_some());
     }
 
     #[test]
@@ -259,7 +293,8 @@ mod tests {
         assert_eq!(app.charge_limit, 60);
         assert_eq!(app.performance_mode, 0x02);
         assert_eq!(app.current_pref, crate::ec::config::BackendPreference::Wmi);
-        assert_eq!(app.error_msg.as_deref(), Some("初始化失败"));
+        // 初始化错误与启动刷新产生的读取错误合并展示。
+        assert!(app.error_msg.as_deref().unwrap_or_default().contains("初始化失败"));
     }
 
     #[test]
@@ -273,7 +308,7 @@ mod tests {
             Some("后端不可用".into()),
         );
 
-        assert_eq!(app.error_msg.as_deref(), Some("后端不可用"));
+        assert_eq!(app.error_msg.as_deref().map(|s| s.contains("后端不可用")), Some(true));
     }
 
     #[test]
