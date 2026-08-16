@@ -4,7 +4,6 @@ use super::backend::EcBackend;
 use super::battery;
 use super::error::EcError;
 use super::addr as ec_addr;
-use std::sync::OnceLock;
 
 use windows::Win32::System::Com::{
     CoInitializeEx, CoSetProxyBlanket, CoCreateInstance, CLSCTX_INPROC_SERVER,
@@ -35,26 +34,44 @@ const CMD_WRITE: u16 = 0xFB00;
 const FUN2_BATTERY: u16 = 0x1000;
 const FUN2_PERF: u16 = 0x0800;
 
-static COM_INIT: OnceLock<Result<(), EcError>> = OnceLock::new();
-
+/// 初始化当前线程的 COM 公寓（MTA）。
+///
+/// COM 是**按线程**初始化的：必须先在本线程调用 CoInitializeEx 才能在本
+/// 线程创建/调用 COM 接口。之前这里用 OnceLock 只初始化一次——初始化发生在
+/// 创建后端的那一个线程（main.rs 的后端初始化后台线程），但后续所有 WMI
+/// 调用（GUI 线程的 refresh_from_backend、set_charge_limit、GUI 内切换 WMI
+/// 后端等）都发生在另一个从未初始化 COM 的线程上，CoCreateInstance 在该
+/// 线程实测返回 CO_E_NOTINITIALIZED (0x800401F0)，WMI 后端完全不可用。
+/// 每次调用 CoInitializeEx 的开销可忽略：同一线程重复调用返回 S_FALSE
+/// （成功），不同线程各自独立初始化，互不影响。
 fn ensure_com() -> Result<(), EcError> {
-    COM_INIT.get_or_init(|| {
-        let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-        let ok = hr.is_ok() || hr.0 == RPC_E_CHANGED_MODE.0;
-        if hr.is_ok() {
+    let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+    match hr.0 {
+        // S_OK：本线程首次初始化；S_FALSE：本线程已初始化过，无需任何处理。
+        0 => {
             log::info!("COM initialized (MTA)");
-        } else if hr.0 == RPC_E_CHANGED_MODE.0 {
-            log::warn!("COM already initialized with different mode; proceeding");
-        }
-        if ok {
             Ok(())
-        } else {
+        }
+        1 => Ok(()),
+        _ if hr.0 == RPC_E_CHANGED_MODE.0 => {
+            // 本线程已被其它组件初始化为其它公寓模式（如 OleInitialize 的
+            // STA）。**不得**继续在此线程调用在 MTA 下创建的代理接口：COM
+            // 不会自动调度跨公寓的原始接口指针（跨公寓调用必须显式封送），
+            // 未封送直接调用属未定义行为。与 fnkey.rs 把同一状态视为致命
+            // 错误的语义保持一致，明确失败并上报，而不是带病继续。
+            let err = EcError::WmiConnect(format!(
+                "COM already initialized with a different mode on this thread (need MTA, hr=0x{:08X})",
+                hr.0
+            ));
+            log::error!("{}", err);
+            Err(err)
+        }
+        _ => {
             let err = EcError::WmiConnect(format!("COM init: {}", hr));
             log::error!("COM init failed: {}", err);
             Err(err)
         }
-    })
-    .clone()
+    }
 }
 
 fn to_le16(buf: &mut [u8; 32], offset: usize, val: u16) {
@@ -186,6 +203,16 @@ impl WmiBackend {
     ///   Status(2B) + Function(2B) + Data0(2B) + Data1(4B) + Data2(4B) + Data3(4B)
     fn mi_interface_call(&self, buffer: &[u8; 32]) -> Result<[u8; 32], EcError> {
         unsafe {
+            // 本函数是对 self.services 代理的**唯一**调用入口，而调用方可能
+            // 来自任意线程（后端初始化线程、GUI 线程、后端切换线程）。
+            // COM 按线程初始化，必须先在本线程建立公寓才能调用代理接口，
+            // 否则 GetObject/ExecMethod 一律返回 CO_E_NOTINITIALIZED
+            // (0x800401F0)。因此每次调用前必须在**当前线程**初始化 COM
+            // （重复调用返回 S_FALSE，开销可忽略）。曾只在 WmiBackend::new()
+            // 初始化——那只覆盖了创建后端的线程，GUI 线程上的读写在
+            // 未初始化 COM 的线程上全部失败（回归测试见 tests）。
+            ensure_com()?;
+
             let mut class: Option<IWbemClassObject> = None;
             self.services
                 .GetObject(
@@ -250,25 +277,38 @@ impl WmiBackend {
             // HeapValidate 逐步检测）IWbemClassObject::Put 对 SAFEARRAY 保留
             // 引用而非深拷贝：Put 后立即释放数组，ExecMethod 内部仍会访问该
             // 数组，造成 OLE 堆损坏（进程以 STATUS_HEAP_CORRUPTION 退出）。
-            // 数组必须存活到异步调用完成（GetResultObject 成功）且 in_params
-            // 释放之后；中途出错时宁可泄漏数组也不得提前释放（异步操作可能
-            // 仍在引用它）。
+            // 数组必须存活到异步调用终止（GetResultObject 返回成功）且
+            // in_params 释放之后才能销毁。
 
             let mut call_result: Option<IWbemCallResult> = None;
-            self.services
-                .ExecMethod(
-                    &BSTR::from("MICommonInterface"),
-                    &BSTR::from("MiInterface"),
-                    WBEM_FLAG_RETURN_IMMEDIATELY,
-                    None::<&IWbemContext>,
-                    &in_params,
-                    None,
-                    Some(&mut call_result as *mut Option<IWbemCallResult>),
-                )
-                .map_err(|e| EcError::WmiCallHResult(e.code().0 as u32))?;
+            if let Err(e) = self.services.ExecMethod(
+                &BSTR::from("MICommonInterface"),
+                &BSTR::from("MiInterface"),
+                WBEM_FLAG_RETURN_IMMEDIATELY,
+                None::<&IWbemContext>,
+                &in_params,
+                None,
+                Some(&mut call_result as *mut Option<IWbemCallResult>),
+            ) {
+                // ExecMethod 同步返回错误意味着异步调用**从未启动**，输入
+                // 数组唯一的引用方是 in_params；按成功路径相同的顺序释放：
+                // 先 drop in_params，再销毁数组（Put 保留的是引用而非拷贝）。
+                drop(in_params);
+                SafeArrayDestroy(sa).ok();
+                return Err(EcError::WmiCallHResult(e.code().0 as u32));
+            }
 
-            let call_result =
-                call_result.ok_or(EcError::WmiCallFailed(0))?;
+            let call_result = match call_result {
+                Some(cr) => cr,
+                None => {
+                    // 理论上 ExecMethod(RETURN_IMMEDIATELY) 成功必然返回
+                    // call result；防御性处理。此时异步调用**已启动**、输入
+                    // 数组已交给提供程序：不得释放（原因见下方 GetResultObject
+                    // 失败分支），宁可泄漏也不崩溃。
+                    std::mem::forget(in_params);
+                    return Err(EcError::WmiCallFailed(0));
+                }
+            };
 
             log::info!("WMI: GetResultObject waiting...");
             let out_params = match call_result.GetResultObject(10000) {
@@ -278,9 +318,31 @@ impl WmiBackend {
                         "WMI: GetResultObject failed: hr=0x{:08X}",
                         e.code().0 as u32
                     );
+                    // 调用失败（如固件拒绝协议，hr=0x8004102F）时**绝不**
+                    // 释放输入数组。实测（本机 2025 RedmiBook Pro 14 固件，
+                    // 含半同步调用对照实验）：提供程序在错误返回后仍会访问
+                    // 输入数组（其对数组的内部引用存活到连接关闭），任何
+                    // 时机释放——失败后立即释放、延迟到下一次调用、甚至
+                    // 等到连接关闭时释放——都会触发 OLE 堆损坏，进程以
+                    // STATUS_HEAP_CORRUPTION 退出（概率性乃至确定性复现）；
+                    // 全程不释放则零崩溃（该堆损坏经 PowerShell/C# 调用同样
+                    // 复现，属提供程序缺陷，客户端无法安全释放）。
+                    // 代价：失败调用每次泄漏一个约 32 字节的数组——失败在
+                    // 正常机器上罕见，且此固件上 WMI 后端本就不可用，
+                    // 泄漏有界且无害；宁泄漏不崩溃。
+                    // （sa 为裸指针无析构器，不调用 SafeArrayDestroy 即不
+                    // 释放；in_params 是 COM 对象，forget 防止自动 Release。）
+                    std::mem::forget(in_params);
                     return Err(EcError::WmiCallHResult(e.code().0 as u32));
                 }
             };
+
+            // 异步调用成功完成（GetResultObject 返回），输入数组不再被任何
+            // 一方引用：立即按序释放 in_params 与数组（见上方 Put 处的说明，
+            // 顺序不可颠倒）。提前释放后，下方所有输出侧错误路径（Get 失败、
+            // 类型不符、数组过短、AccessData 失败）都不会再泄漏输入数组。
+            drop(in_params);
+            SafeArrayDestroy(sa).ok();
 
             let out_param_name = Self::param_name_from_schema(&out_params, "OutData");
             log::info!("WMI: MiInterface output parameter -> '{}'", out_param_name);
@@ -333,11 +395,6 @@ impl WmiBackend {
             SafeArrayUnaccessData(out_sa).ok();
             // Release the output VARIANT (and the SafeArray it owns).
             VariantClear(&mut out_val).ok();
-
-            // 异步调用已完成：先释放仍引用输入数组的 in_params，再销毁数组
-            // （见上方 Put 处的说明，顺序不可颠倒）。
-            drop(in_params);
-            SafeArrayDestroy(sa).ok();
 
             // F-HAL-08: 响应前 2 字节为 Status（小端）。非 0 表示 EC 拒绝了
             // 该命令：读操作的数据字段无意义，写操作实际并未生效。
@@ -512,6 +569,61 @@ impl EcBackend for WmiBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 回归测试（本机实证）：COM 是**每线程**初始化的。修复前 ensure_com
+    /// 用 OnceLock 只在第一个调用线程（main.rs 的后端初始化后台线程）初始化
+    /// COM，此后 GUI 线程上的所有 WMI 调用（刷新状态、设置上限、切换 WMI
+    /// 后端）都发生在从未初始化 COM 的线程上，实测 CoCreateInstance 返回
+    /// CO_E_NOTINITIALIZED (0x800401F0)。修复后 ensure_com 在每次调用时于
+    /// 当前线程执行 CoInitializeEx(MTA)，任意线程调用都必须成功（同一线程
+    /// 重复调用返回 S_FALSE 同样视为成功）。
+    #[test]
+    fn test_ensure_com_initializes_on_any_thread() {
+        let t1 = std::thread::spawn(ensure_com);
+        let t2 = std::thread::spawn(ensure_com);
+        assert!(t1.join().unwrap().is_ok());
+        assert!(t2.join().unwrap().is_ok());
+    }
+
+    /// 回归测试（本机实证）：后端创建于后台初始化线程，但 GUI 线程的
+    /// refresh_from_backend / set_charge_limit 都在**从未初始化 COM** 的线程
+    /// 上调用。修复前 ensure_com 只在 WmiBackend::new() 执行——那只初始化了
+    /// 创建后端的线程，其它线程上 GetObject/ExecMethod 全部返回
+    /// CO_E_NOTINITIALIZED (0x800401F0)，WMI 后端在 GUI 上完全不可用。
+    /// 修复后 mi_interface_call（代理调用的唯一入口）在每次调用时于当前
+    /// 线程初始化 COM：任意线程调用必须能走到 COM 之后的调用链。
+    ///
+    /// 本机没有 MICommonInterface 类（非小米机器）或固件拒绝协议时，调用
+    /// 会以类不存在/状态错误等其它原因失败——只要不是 0x800401F0 即说明
+    /// 调用路径已自行完成 COM 初始化，断言通过；无 WMI 环境直接跳过。
+    #[test]
+    fn test_wmi_backend_callable_from_foreign_thread() {
+        let backend = match WmiBackend::new() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skip: WMI unavailable ({})", e);
+                return;
+            }
+        };
+        let handle = std::thread::spawn(move || match backend.get_performance_mode() {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("0x800401F0") {
+                    Err(format!(
+                        "calling thread COM not initialized by call path: {}",
+                        msg
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+        });
+        assert!(
+            handle.join().unwrap().is_ok(),
+            "WMI backend calls must initialize COM on the calling thread"
+        );
+    }
 
     #[test]
     fn test_wmi_rawcode_for_percent_exact() {
