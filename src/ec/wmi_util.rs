@@ -1,3 +1,4 @@
+use windows::Win32::Foundation::VARIANT_BOOL;
 use windows::Win32::System::Variant::VARIANT;
 
 pub unsafe fn bstr_from_variant(val: &VARIANT) -> Option<String> {
@@ -12,4 +13,12 @@ pub unsafe fn bstr_from_variant(val: &VARIANT) -> Option<String> {
         return None;
     }
     Some(String::from_utf16_lossy(bstr))
+}
+
+pub unsafe fn bool_from_variant(val: &VARIANT) -> Option<bool> {
+    let vt = val.Anonymous.Anonymous.vt.0;
+    if vt != 11 {
+        return None;
+    }
+    Some(val.Anonymous.Anonymous.Anonymous.boolVal != VARIANT_BOOL(0))
 }

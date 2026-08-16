@@ -1,6 +1,6 @@
 //! WMI EC backend — MICommonInterface.MiInterface protocol
 
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use super::backend::EcBackend;
 use super::battery;
@@ -36,19 +36,31 @@ const CMD_WRITE: u16 = 0xFB00;
 const FUN2_BATTERY: u16 = 0x1000;
 const FUN2_PERF: u16 = 0x0800;
 
-/// GetResultObject 等待上限。健康固件上单次调用数十毫秒即可返回；
+/// GetResultObject 等待上限。健康固件上单次调用 5~16ms 即可返回；
 /// 原 10000ms 意味着坏固件（协议被拒绝）上每次调用冻结 GUI 最长 10 秒
 /// （B-WMI-2）。3000ms 仍是宽裕值，同时把最坏阻塞降到有界范围。
 const GET_RESULT_TIMEOUT_MS: i32 = 3000;
+
+/// MiInterface 响应 Status 成功值（本机 2025 RedmiBook Pro 14 实测：
+/// 所有成功调用恒返回 0x8000；写入无效值返回 0x0000）。
+const WMI_STATUS_SUCCESS: u16 = 0x8000;
+
+/// MiInterface 响应有效字段长度：Status(2)+Function(2)+Data0(2)+
+/// Data1(4)+Data2(4)+Data3(4) = 18 字节。本机实测 OutData 为 30 字节
+/// （MOF OutData MAX=30），历史实现要求 ≥32 字节导致成功响应全被误判。
+const MIN_OUTPUT_LEN: usize = 18;
 
 /// 是否属于确定性致命错误（应熔断）：固件/提供程序层面的确定性失败，
 /// 重试必然再次失败。瞬态错误（超时、服务忙、连接中断等）不熔断，
 /// 否则 WMI 服务重启等临时故障会永久禁用后端（B-WMI-2）。
 fn is_latching_hresult(hr: u32) -> bool {
     const FATAL: &[u32] = &[
-        // WBEM_E_PROVIDER_FAILURE：固件拒绝协议。2025 RedmiBook Pro 14
-        // 实测每次调用都返回该错误（见 mi_interface_call GetResultObject
-        // 失败分支的注释），不熔断则每次调用都重复等待完整超时。
+        // WBEM_E_INVALID_METHOD_PARAMETERS (0x8004102F)：2025 RedmiBook
+        // Pro 14 实测，对**类路径**调用 MiInterface 时恒被 WinMgmt 以此
+        // 拒绝（1~64 字节输入全部复现）。修复后正确调用不会出现该错误，
+        // 保留在列表作为防御。注意此错误**不是** WBEM_E_PROVIDER_FAILURE
+        // （0x80041004）——windows crate 中两者是不同常量。
+        WBEM_E_INVALID_METHOD_PARAMETERS.0 as u32,
         WBEM_E_PROVIDER_FAILURE.0 as u32,
         // 类/方法层面不存在或不受支持：机器不支持该接口，重试不会成功。
         WBEM_E_INVALID_CLASS.0 as u32,
@@ -129,8 +141,17 @@ fn wmi_rawcode_for_percent(percent: u8) -> u8 {
         .unwrap_or(0)
 }
 
+/// WMI 对象路径中的字符串值转义：反斜杠与引号需加倍（Meow-Box 的实例路径
+/// 亦为 `MICommonInterface.InstanceName="ACPI\\PNP0C14\\MIFS_0"` 形式）。
+fn escape_instance_name(name: &str) -> String {
+    name.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 pub struct WmiBackend {
     services: IWbemServices,
+    /// MiInterface 的目标实例路径（如 `MICommonInterface.InstanceName="ACPI\\PNP0C14\\MIFS_0"`）。
+    /// 首次调用时经 resolve_target 枚举实例发现并缓存。
+    target: OnceLock<String>,
     /// 确定性致命错误熔断（B-WMI-2）：首次确定性失败后缓存错误，后续调用
     /// 立即返回，不再重复等待超时。None = 未熔断。
     fatal: Mutex<Option<EcError>>,
@@ -175,8 +196,106 @@ impl WmiBackend {
             )
             .map_err(|_| EcError::WmiConnect("CoSetProxyBlanket failed".into()))?;
 
-            Ok(Self { services, fatal: Mutex::new(None) })
+            Ok(Self {
+                services,
+                target: OnceLock::new(),
+                fatal: Mutex::new(None),
+            })
         }
+    }
+
+    /// 枚举 `MICommonInterface` 实例并确定 MiInterface 的调用目标。
+    ///
+    /// **必须在实例上调用方法**（2025 RedmiBook Pro 14 实测）：对类路径
+    /// （`"MICommonInterface"`）调用 ExecMethod 会被 WinMgmt 以
+    /// WBEM_E_INVALID_METHOD_PARAMETERS (0x8004102F) 拒绝，与输入缓冲区的
+    /// 长度/内容无关（1~64 字节、读/写命令、空参数全部复现）；对实例路径
+    /// （如 `MICommonInterface.InstanceName="ACPI\\PNP0C14\\MIFS_0"`）调用
+    /// 一切正常（5~16ms，ReturnCode=0，OutData 30 字节）。Meow-Box
+    /// （Xiaomi Book Pro 14 2026 机型）采用相同方式：枚举实例 → 优先选择
+    /// Active 且 InstanceName 含 "MIFS" 的实例（否则取第一个）→ 对实例
+    /// 路径调用。
+    ///
+    /// 目标发现成功一次后缓存（OnceLock），之后不再枚举。
+    fn resolve_target(&self, services: &IWbemServices) -> Result<String, EcError> {
+        if let Some(t) = self.target.get() {
+            return Ok(t.clone());
+        }
+        let enumerator = unsafe {
+            services
+                .ExecQuery(
+                    &BSTR::from("WQL"),
+                    &BSTR::from("SELECT * FROM MICommonInterface"),
+                    WBEM_FLAG_RETURN_IMMEDIATELY | WBEM_FLAG_FORWARD_ONLY,
+                    None::<&IWbemContext>,
+                )
+                .map_err(|e| EcError::WmiConnect(format!("ExecQuery instances: {}", e)))?
+        };
+
+        // (instance_name, active, is_mifs)：收集全部实例后按 Meow-Box 的
+        // 选择策略挑选：active 且含 MIFS 优先，否则取第一个。
+        let mut instances: Vec<(String, bool, bool)> = Vec::new();
+        loop {
+            let mut objects: [Option<IWbemClassObject>; 1] = [None];
+            let mut returned: u32 = 0;
+            let hr = unsafe { enumerator.Next(500, &mut objects, &mut returned as *mut u32) };
+            if hr.is_err() || returned == 0 {
+                break;
+            }
+            if let Some(ref obj) = objects[0] {
+                let name = Self::get_str_prop(obj, "InstanceName").unwrap_or_default();
+                let active = Self::get_bool_prop(obj, "Active").unwrap_or(false);
+                let is_mifs = name.to_ascii_uppercase().contains("MIFS");
+                log::info!(
+                    "WMI: MICommonInterface instance '{}' (active={}, mifs={})",
+                    name, active, is_mifs
+                );
+                instances.push((name, active, is_mifs));
+            }
+        }
+        if instances.is_empty() {
+            return Err(EcError::WmiInterfaceNotFound);
+        }
+        let (name, _, _) = instances
+            .iter()
+            .find(|(_, active, is_mifs)| *active && *is_mifs)
+            .or_else(|| instances.first())
+            .expect("instances is non-empty");
+        let path = format!(
+            "MICommonInterface.InstanceName=\"{}\"",
+            escape_instance_name(name)
+        );
+        let _ = self.target.set(path.clone());
+        log::info!("WMI: MiInterface target instance -> '{}'", path);
+        Ok(path)
+    }
+
+    fn get_str_prop(obj: &IWbemClassObject, name: &str) -> Option<String> {
+        let mut val = VARIANT::default();
+        let mut _type = 0i32;
+        let mut _flavor = 0i32;
+        let (_wide, prop_name) = crate::util::to_pcwstr(name);
+        unsafe {
+            obj.Get(prop_name, 0, &mut val, Some(&mut _type as *mut i32), Some(&mut _flavor as *mut i32))
+                .ok()?;
+        }
+        let result = unsafe { crate::ec::wmi_util::bstr_from_variant(&val) };
+        unsafe { windows::Win32::System::Variant::VariantClear(&mut val).ok() };
+        result
+    }
+
+    fn get_bool_prop(obj: &IWbemClassObject, name: &str) -> Option<bool> {
+        let mut val = VARIANT::default();
+        let mut _type = 0i32;
+        let mut _flavor = 0i32;
+        let (_wide, prop_name) = crate::util::to_pcwstr(name);
+        unsafe {
+            obj.Get(prop_name, 0, &mut val, Some(&mut _type as *mut i32), Some(&mut _flavor as *mut i32))
+                .ok()?;
+        }
+        let result = unsafe { crate::ec::wmi_util::bool_from_variant(&val) };
+        unsafe { windows::Win32::System::Variant::VariantClear(&mut val).ok() };
+        result
     }
 
     /// hr 为确定性致命错误（或接口缺失等必然失败）时写入熔断；返回原始错误。
@@ -245,18 +364,22 @@ impl WmiBackend {
         fallback.to_string()
     }
 
-    /// Send a 32-byte buffer via MiInterface and receive the 32-byte response.
+    /// Send a 32-byte command buffer via MiInterface and receive the response.
     ///
     /// Command buffer layout (per F-HAL-05):
     ///   fun1(2B) + fun2(2B) + fun3(2B) + fun4(4B) + zero-padding = 32 bytes
     ///
     /// Response buffer layout (per F-HAL-08):
     ///   Status(2B) + Function(2B) + Data0(2B) + Data1(4B) + Data2(4B) + Data3(4B)
+    ///
+    /// 注意：响应数组**不是 32 字节**——本机（2025 RedmiBook Pro 14）实测
+    /// OutData 为 30 字节（MOF 声明 OutData MAX=30），有效字段仅前 18 字节。
+    /// 历史实现对类路径调用且要求 ≥32 字节，两者叠加导致 WMI 后端完全不可用。
     fn mi_interface_call(&self, buffer: &[u8; 32]) -> Result<[u8; 32], EcError> {
         unsafe {
-            // 熔断检查：确定性失败（如固件拒绝协议）后不再发起任何 WMI 调用，
-            // 直接返回缓存错误——坏固件上每次调用本会走完 GetResultObject 的
-            // 完整超时，GUI 刷新/启动会冻结数十秒（B-WMI-2）。
+            // 熔断检查：确定性失败后不再发起任何 WMI 调用，直接返回缓存错误
+            // ——错误固件/错误调用方式下每次调用都会走完完整超时，GUI 刷新/
+            // 启动会冻结数十秒（B-WMI-2）。
             if let Some(err) = self.fatal.lock().unwrap_or_else(|e| e.into_inner()).clone() {
                 log::warn!("WMI: MiInterface latched as failed ({}); failing fast", err);
                 return Err(err);
@@ -271,6 +394,12 @@ impl WmiBackend {
             // 初始化——那只覆盖了创建后端的线程，GUI 线程上的读写在
             // 未初始化 COM 的线程上全部失败（回归测试见 tests）。
             ensure_com()?;
+
+            // 必须在**实例**上调用方法：对类路径调用 ExecMethod 被 WinMgmt
+            // 拒绝（0x8004102F，详见 resolve_target）。但方法**签名**定义在
+            // 类对象上——对实例对象 GetMethod 返回 WBEM_E_INVALID_OPERATION
+            // (0x8004101E)。因此：GetMethod 用类对象，ExecMethod 用实例路径。
+            let target = self.resolve_target(&self.services)?;
 
             let mut class: Option<IWbemClassObject> = None;
             self.services
@@ -353,7 +482,7 @@ impl WmiBackend {
 
             let mut call_result: Option<IWbemCallResult> = None;
             if let Err(e) = self.services.ExecMethod(
-                &BSTR::from("MICommonInterface"),
+                &BSTR::from(&target),
                 &BSTR::from("MiInterface"),
                 WBEM_FLAG_RETURN_IMMEDIATELY,
                 None::<&IWbemContext>,
@@ -391,18 +520,16 @@ impl WmiBackend {
                         "WMI: GetResultObject failed: hr=0x{:08X}",
                         hr
                     );
-                    // 调用失败（如固件拒绝协议，hr=0x8004102F）时**绝不**
-                    // 释放输入数组。实测（本机 2025 RedmiBook Pro 14 固件，
-                    // 含半同步调用对照实验）：提供程序在错误返回后仍会访问
-                    // 输入数组（其对数组的内部引用存活到连接关闭），任何
-                    // 时机释放——失败后立即释放、延迟到下一次调用、甚至
-                    // 等到连接关闭时释放——都会触发 OLE 堆损坏，进程以
-                    // STATUS_HEAP_CORRUPTION 退出（概率性乃至确定性复现）；
-                    // 全程不释放则零崩溃（该堆损坏经 PowerShell/C# 调用同样
-                    // 复现，属提供程序缺陷，客户端无法安全释放）。
-                    // 代价：失败调用每次泄漏一个约 32 字节的数组——失败在
-                    // 正常机器上罕见，且此固件上 WMI 后端本就不可用，
-                    // 泄漏有界且无害；宁泄漏不崩溃。
+                    // 调用失败时**绝不**释放输入数组。实测（本机 2025
+                    // RedmiBook Pro 14，含半同步调用对照实验）：提供程序在
+                    // 错误返回后仍会访问输入数组（其对数组的内部引用存活到
+                    // 连接关闭），任何时机释放——失败后立即释放、延迟到下一次
+                    // 调用、甚至等到连接关闭时释放——都会触发 OLE 堆损坏，
+                    // 进程以 STATUS_HEAP_CORRUPTION 退出（概率性乃至确定性
+                    // 复现）；全程不释放则零崩溃（该堆损坏经 PowerShell/C#
+                    // 调用同样复现，属提供程序缺陷，客户端无法安全释放）。
+                    // 代价：失败调用每次泄漏一个约 32 字节的数组——正确调用
+                    // 下失败罕见，泄漏有界且无害；宁泄漏不崩溃。
                     // （sa 为裸指针无析构器，不调用 SafeArrayDestroy 即不
                     // 释放；in_params 是 COM 对象，forget 防止自动 Release。）
                     std::mem::forget(in_params);
@@ -410,12 +537,19 @@ impl WmiBackend {
                 }
             };
 
-            // 异步调用成功完成（GetResultObject 返回），输入数组不再被任何
-            // 一方引用：立即按序释放 in_params 与数组（见上方 Put 处的说明，
-            // 顺序不可颠倒）。提前释放后，下方所有输出侧错误路径（Get 失败、
-            // 类型不符、数组过短、AccessData 失败）都不会再泄漏输入数组。
-            drop(in_params);
-            SafeArrayDestroy(sa).ok();
+            // 异步调用成功完成（GetResultObject 返回）后**同样不得**释放输入
+            // 数组。实测（本机 2025 RedmiBook Pro 14，首次真机成功调用）：
+            // 提供程序对输入数组的内部引用**存活到连接关闭**——perf read
+            // 成功返回（Ok(9)）后按旧逻辑 drop(in_params)+SafeArrayDestroy(sa)
+            // 释放数组，下一次调用时进程以 STATUS_HEAP_CORRUPTION 崩溃。
+            // 与下方失败路径采取相同策略：**永不释放输入数组**（forget
+            // in_params 防止自动 Release，不调用 SafeArrayDestroy）。
+            // 代价：每次调用泄漏一个约 32 字节的数组，有界且无害；
+            // 宁泄漏不崩溃。
+            std::mem::forget(in_params);
+            // 注意：sa 为裸指针无析构器，不调用 SafeArrayDestroy 即不释放；
+            // 输出侧所有错误路径（Get 失败、类型不符、数组过短、
+            // AccessData 失败）也因此不再需要处理输入数组的释放。
 
             let out_param_name = Self::param_name_from_schema(&out_params, "OutData");
             log::info!("WMI: MiInterface output parameter -> '{}'", out_param_name);
@@ -445,12 +579,15 @@ impl WmiBackend {
                 return Err(EcError::WmiCallFailed(0));
             }
 
-            // The response is expected to be a 32-byte array; refuse to read a
-            // shorter one instead of over-reading the buffer.
+            // 响应结构需要 18 字节（Status 2 + Function 2 + Data0 2 + Data1 4
+            // + Data2 4 + Data3 4）。本机实测 OutData 为 **30 字节**
+            // （MOF OutData MAX=30）——历史实现对类路径调用且要求 ≥32 字节，
+            // 把成功响应全部误判为失败（B-WMI-1 的响应侧）。只要 ≥18 字节
+            // 即可安全读取全部有效字段；超过 32 字节的部分忽略。
             let lbound = SafeArrayGetLBound(out_sa, 1).unwrap_or(0);
             let ubound = SafeArrayGetUBound(out_sa, 1).unwrap_or(-1);
             let len = ubound.saturating_sub(lbound).saturating_add(1) as usize;
-            if len < 32 {
+            if len < MIN_OUTPUT_LEN {
                 log::error!("WMI: output array too short ({} bytes)", len);
                 VariantClear(&mut out_val).ok();
                 return Err(EcError::WmiCallFailed(0));
@@ -463,17 +600,20 @@ impl WmiBackend {
             }
 
             let mut result = [0u8; 32];
-            std::ptr::copy_nonoverlapping(out_data as *const u8, result.as_mut_ptr(), 32);
+            let copy_len = len.min(32);
+            std::ptr::copy_nonoverlapping(out_data as *const u8, result.as_mut_ptr(), copy_len);
 
             SafeArrayUnaccessData(out_sa).ok();
             // Release the output VARIANT (and the SafeArray it owns).
             VariantClear(&mut out_val).ok();
 
-            // F-HAL-08: 响应前 2 字节为 Status（小端）。非 0 表示 EC 拒绝了
-            // 该命令：读操作的数据字段无意义，写操作实际并未生效。
-            // 不校验的话，写失败会被误判为成功，读失败会返回垃圾数据。
+            // F-HAL-08: 响应前 2 字节为 Status。本机实测（2025 RedmiBook
+            // Pro 14）：**0x8000 = 成功**（所有成功调用的恒常返回值，
+            // 含读写操作；Meow-Box 同款响应），0x0000 = 失败（如写入无效
+            // 充电上限 raw code 0xFF 时返回 0x0000 且状态未变）。历史实现
+            // 把"非 0 即失败"当作判定，导致每次成功调用都被误判为失败。
             let status = u16::from_le_bytes([result[0], result[1]]);
-            if status != 0 {
+            if status != WMI_STATUS_SUCCESS {
                 log::error!("WMI: MiInterface returned status {:#x}", status);
                 return Err(EcError::WmiCallFailed(status));
             }
@@ -649,10 +789,53 @@ impl EcBackend for WmiBackend {
 mod tests {
     use super::*;
 
+    /// 实例名转义：WMI 对象路径中反斜杠与引号必须加倍，
+    /// 否则路径解析失败（Meow-Box 同款路径格式）。
+    #[test]
+    fn test_escape_instance_name() {
+        assert_eq!(escape_instance_name("MIFS"), "MIFS");
+        assert_eq!(
+            escape_instance_name("ACPI\\PNP0C14\\MIFS_0"),
+            "ACPI\\\\PNP0C14\\\\MIFS_0"
+        );
+        assert_eq!(escape_instance_name("a\"b"), "a\\\"b");
+        assert_eq!(
+            escape_instance_name("A\\B\"C"),
+            "A\\\\B\\\"C"
+        );
+    }
+
+    /// 回归测试（本机实证）：响应 Status 成功值为 0x8000 而非 0。
+    #[test]
+    fn test_status_success_is_0x8000() {
+        assert_eq!(WMI_STATUS_SUCCESS, 0x8000);
+        // 成功响应（实测 perf read）：00 80 00 08 09 00 ...
+        let out = [0x00u8, 0x80, 0x00, 0x08, 0x09, 0x00];
+        let status = u16::from_le_bytes([out[0], out[1]]);
+        assert_eq!(status, WMI_STATUS_SUCCESS);
+        // 失败响应（实测非法充电值写入）：00 00 ...
+        let fail = [0x00u8, 0x00];
+        assert_ne!(u16::from_le_bytes([fail[0], fail[1]]), WMI_STATUS_SUCCESS);
+    }
+
+    /// 回归测试（本机实证）：输出数组为 30 字节（MOF MAX=30），
+    /// 有效字段 18 字节；历史实现要求 ≥32 字节导致成功响应全被误判。
+    #[test]
+    fn test_output_min_length_is_18() {
+        assert_eq!(MIN_OUTPUT_LEN, 18);
+        // 实测 30 字节响应必须通过长度校验。
+        assert!(30 >= MIN_OUTPUT_LEN);
+        // 响应前 18 字节内的字段偏移（F-HAL-08）。
+        assert_eq!(MIN_OUTPUT_LEN, 2 + 2 + 2 + 4 + 4 + 4);
+    }
+
     /// 回归测试（B-WMI-2）：确定性致命错误必须熔断——坏固件上每次调用都
     /// 返回相同的确定性错误，不熔断则每次调用都重复等待完整超时。
+    /// 0x8004102F（WBEM_E_INVALID_METHOD_PARAMETERS）是 2025 RedmiBook
+    /// Pro 14 实测的固件拒绝错误，曾因与 WBEM_E_PROVIDER_FAILURE 混淆而漏熔断。
     #[test]
     fn test_is_latching_hresult_deterministic_errors() {
+        assert!(is_latching_hresult(WBEM_E_INVALID_METHOD_PARAMETERS.0 as u32));
         assert!(is_latching_hresult(WBEM_E_PROVIDER_FAILURE.0 as u32));
         assert!(is_latching_hresult(WBEM_E_INVALID_CLASS.0 as u32));
         assert!(is_latching_hresult(WBEM_E_NOT_FOUND.0 as u32));
