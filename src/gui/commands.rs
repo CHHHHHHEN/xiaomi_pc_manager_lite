@@ -90,6 +90,33 @@ impl XiaomiApp {
                         }
                     }
                 }
+                UiCommand::SetAutostart(enabled) => {
+                    // 计划任务注册/删除走后台线程：ITaskService 需要在本线程
+                    // 初始化 COM，GUI 线程的 COM 状态由 eframe/winit 管理，
+                    // 不得污染（见 21e0aaf 的公寓冲突教训）。
+                    let tx = self.cmd_tx.clone();
+                    std::thread::spawn(move || {
+                        let result = if enabled {
+                            crate::platform::autostart::enable()
+                        } else {
+                            crate::platform::autostart::disable()
+                        };
+                        let _ = tx.send(UiCommand::SetAutostartResult(enabled, result));
+                    });
+                }
+                UiCommand::SetAutostartResult(enabled, result) => {
+                    match result {
+                        Ok(()) => {
+                            log::info!("Autostart set to {}", enabled);
+                            self.config.auto_start_on_boot = enabled;
+                            self.save_state();
+                        }
+                        Err(e) => {
+                            log::error!("Autostart operation failed: {}", e);
+                            self.error_msg = Some(format!("设置开机自启动失败: {}", e));
+                        }
+                    }
+                }
             }
         }
         if needs_repaint {
@@ -408,6 +435,7 @@ mod tests {
             AppConfig::default(),
             crate::ec::config::BackendPreference::Auto,
             None,
+            false,
         )
     }
 
@@ -418,6 +446,7 @@ mod tests {
             AppConfig::default(),
             crate::ec::config::BackendPreference::Auto,
             None,
+            false,
         )
     }
 
@@ -558,6 +587,7 @@ mod tests {
             AppConfig::default(),
             crate::ec::config::BackendPreference::Auto,
             None,
+            false,
         );
         // 模拟：硬件养护已开启（limit=60），持久化配置仍是旧值
         // care=false, limit=100（如 auto_apply 关闭时外部改动硬件）。
@@ -587,6 +617,7 @@ mod tests {
             AppConfig::default(),
             crate::ec::config::BackendPreference::Auto,
             None,
+            false,
         );
         app.config.battery_charge_limit = 60;
         app.config.battery_care_enabled = false;
@@ -620,6 +651,7 @@ mod tests {
             AppConfig::default(),
             crate::ec::config::BackendPreference::Auto,
             None,
+            false,
         );
         // 构造时已刷新过一次，清零后验证显式刷新只发一次电池往返。
         calls.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -645,6 +677,7 @@ mod tests {
             AppConfig::default(),
             crate::ec::config::BackendPreference::Auto,
             None,
+            false,
         );
         assert!(app.error_msg.is_none());
 
@@ -690,6 +723,7 @@ mod tests {
             AppConfig::default(),
             crate::ec::config::BackendPreference::Auto,
             None,
+            false,
         );
         app.config.battery_care_enabled = true;
         app.config.battery_charge_limit = 100;
@@ -835,6 +869,7 @@ mod tests {
             AppConfig::default(),
             crate::ec::config::BackendPreference::Auto,
             None,
+            false,
         );
         // 模拟用户当前养护关闭、上限 100%（运行时与配置一致）。
         app.battery_care_enabled = false;
@@ -930,6 +965,7 @@ mod tests {
             AppConfig::default(),
             crate::ec::config::BackendPreference::Auto,
             None,
+            false,
         );
         // 模拟之前用 WinRing0 保存的非预设上限。
         app.config.battery_charge_limit = 85;
@@ -957,6 +993,7 @@ mod tests {
             AppConfig::default(),
             crate::ec::config::BackendPreference::Auto,
             None,
+            false,
         );
         app.config.battery_charge_limit = 100;
         app.battery_care_enabled = false;

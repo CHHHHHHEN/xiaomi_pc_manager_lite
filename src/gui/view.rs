@@ -168,6 +168,14 @@ impl XiaomiApp {
             self.save_state();
         }
 
+        // F-AUTO-01: 开机自启动复选框。注册/删除走后台线程
+        // （UiCommand::SetAutostart），结果经 SetAutostartResult 回传；
+        // 不直接改配置——成功后才持久化。
+        let mut autostart = self.config.auto_start_on_boot;
+        if ui.checkbox(&mut autostart, "开机自启动").changed() {
+            let _ = self.cmd_tx.send(crate::command::UiCommand::SetAutostart(autostart));
+        }
+
         ui.add_space(16.0);
         ui.separator();
         ui.add_space(8.0);

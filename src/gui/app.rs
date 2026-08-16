@@ -21,10 +21,14 @@ pub struct XiaomiApp {
     pub(crate) error_msg: Option<String>,
     /// 用户已通过托盘菜单请求退出；为 true 时窗口关闭不再拦截为驻留托盘。
     pub(crate) quitting: bool,
+    /// `--autostart` 启动（F-AUTO-07）：首帧最小化驻留托盘，不打扰用户。
+    pub(crate) start_minimized: bool,
+    /// 标题栏应用图标纹理（首帧由 icon.png 创建）。
+    pub(crate) icon_tex: Option<egui::TextureHandle>,
 }
 
 impl XiaomiApp {
-    pub fn new(backend: Box<dyn ec::backend::EcBackend>, config: ec::config::AppConfig, pref: BackendPreference, init_error: Option<String>) -> Self {
+    pub fn new(backend: Box<dyn ec::backend::EcBackend>, config: ec::config::AppConfig, pref: BackendPreference, init_error: Option<String>, start_minimized: bool) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let backend_name = backend.name().to_string();
         let battery_care_enabled = config.battery_care_enabled;
@@ -43,6 +47,8 @@ impl XiaomiApp {
             performance_mode,
             quitting: false,
             error_msg: None,
+            start_minimized,
+            icon_tex: None,
         };
 
         // AC-START-03: GUI 启动后应显示硬件当前实际状态，而非仅显示
@@ -60,9 +66,9 @@ impl XiaomiApp {
     }
 }
 
-pub fn run_app(backend: Box<dyn ec::backend::EcBackend>, config: ec::config::AppConfig, init_error: Option<String>) {
+pub fn run_app(backend: Box<dyn ec::backend::EcBackend>, config: ec::config::AppConfig, init_error: Option<String>, start_minimized: bool) {
     let pref = config.backend;
-    let app = XiaomiApp::new(backend, config, pref, init_error);
+    let app = XiaomiApp::new(backend, config, pref, init_error, start_minimized);
     let cmd_tx = app.cmd_tx.clone();
 
     crate::tray::spawn(cmd_tx.clone());
@@ -103,6 +109,29 @@ pub fn run_app(backend: Box<dyn ec::backend::EcBackend>, config: ec::config::App
 
 impl eframe::App for XiaomiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // F-AUTO-07: --autostart 启动时首帧最小化驻留托盘（不能用隐藏——
+        // 隐藏会停掉重绘循环，托盘命令得不到处理，见下方注释）。
+        if self.start_minimized {
+            self.start_minimized = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
+
+        // 标题栏应用图标：首帧由 icon.png 创建纹理（窗口图标与任务栏图标
+        // 已由 with_icon 设置；标题栏图标补齐自绘标题栏的显示）。
+        if self.icon_tex.is_none() {
+            if let Some(icon) = view::load_icon_data() {
+                let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                    [icon.width as usize, icon.height as usize],
+                    &icon.rgba,
+                );
+                self.icon_tex = Some(ctx.load_texture(
+                    "app_icon",
+                    color_image,
+                    egui::TextureOptions::LINEAR,
+                ));
+            }
+        }
+
         // AC-GUI-05 / F-TRAY-02: 关闭窗口（标题栏关闭按钮 / Alt+F4）时驻留托盘
         // 而非退出进程；仅当用户通过托盘菜单“退出”（quitting）才真正关闭。
         //
@@ -161,13 +190,30 @@ impl eframe::App for XiaomiApp {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_maximized));
                 }
 
-                ui.painter().text(
-                    title_rect.left_center() + egui::vec2(4.0, 0.0),
-                    egui::Align2::LEFT_CENTER,
-                    "Xiaomi PC Manager Lite",
-                    egui::FontId::proportional(14.0),
-                    Color32::WHITE,
-                );
+                // 标题栏：左侧应用图标 + 标题文字。
+                let icon_size = 18.0;
+                if let Some(tex) = &self.icon_tex {
+                    let icon_rect = egui::Rect::from_center_size(
+                        egui::pos2(title_rect.left() + 2.0 + icon_size / 2.0, title_rect.center().y),
+                        egui::vec2(icon_size, icon_size),
+                    );
+                    ui.painter().image(tex.id(), icon_rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+                    ui.painter().text(
+                        egui::pos2(icon_rect.right() + 4.0, title_rect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        "Xiaomi PC Manager Lite",
+                        egui::FontId::proportional(14.0),
+                        Color32::WHITE,
+                    );
+                } else {
+                    ui.painter().text(
+                        title_rect.left_center() + egui::vec2(4.0, 0.0),
+                        egui::Align2::LEFT_CENTER,
+                        "Xiaomi PC Manager Lite",
+                        egui::FontId::proportional(14.0),
+                        Color32::WHITE,
+                    );
+                }
 
                 let btn_size = egui::vec2(32.0, total_rect.height());
                 ui.allocate_new_ui(
@@ -263,7 +309,7 @@ mod tests {
     fn test_xiaomi_app_new_with_defaults() {
         let backend = Box::new(crate::ec::backend::NullBackend);
         let config = crate::ec::config::AppConfig::default();
-        let app = XiaomiApp::new(backend, config, crate::ec::config::BackendPreference::Auto, None);
+        let app = XiaomiApp::new(backend, config, crate::ec::config::BackendPreference::Auto, None, false);
 
         assert_eq!(app.backend_name, "无后端");
         assert!(!app.battery_care_enabled);
@@ -288,6 +334,7 @@ mod tests {
             config,
             crate::ec::config::BackendPreference::Wmi,
             Some("初始化失败".into()),
+            false,
         );
 
         assert!(app.battery_care_enabled);
@@ -307,6 +354,7 @@ mod tests {
             config,
             crate::ec::config::BackendPreference::Auto,
             Some("后端不可用".into()),
+            false,
         );
 
         assert_eq!(app.error_msg.as_deref().map(|s| s.contains("后端不可用")), Some(true));

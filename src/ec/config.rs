@@ -17,6 +17,7 @@ pub struct AppConfig {
     pub performance_mode: u8,
     pub auto_apply_on_startup: bool,
     pub auto_reapply_on_power_change: bool,
+    pub auto_start_on_boot: bool,
     pub backend: BackendPreference,
 }
 
@@ -28,6 +29,7 @@ impl Default for AppConfig {
             performance_mode: 0x09,
             auto_apply_on_startup: true,
             auto_reapply_on_power_change: true,
+            auto_start_on_boot: false,
             backend: BackendPreference::Auto,
         }
     }
@@ -94,6 +96,7 @@ mod tests {
         assert_eq!(cfg.performance_mode, 0x09);
         assert!(cfg.auto_apply_on_startup);
         assert!(cfg.auto_reapply_on_power_change);
+        assert!(!cfg.auto_start_on_boot);
         assert_eq!(cfg.backend, BackendPreference::Auto);
     }
 
@@ -110,6 +113,7 @@ mod tests {
             performance_mode: 0x02,
             auto_apply_on_startup: false,
             auto_reapply_on_power_change: false,
+            auto_start_on_boot: true,
             backend: BackendPreference::Wmi,
         };
         let s = toml::to_string_pretty(&cfg).expect("serialize");
@@ -119,6 +123,7 @@ mod tests {
         assert_eq!(cfg.performance_mode, deserialized.performance_mode);
         assert_eq!(cfg.auto_apply_on_startup, deserialized.auto_apply_on_startup);
         assert_eq!(cfg.auto_reapply_on_power_change, deserialized.auto_reapply_on_power_change);
+        assert_eq!(cfg.auto_start_on_boot, deserialized.auto_start_on_boot);
         assert_eq!(cfg.backend, deserialized.backend);
     }
 
@@ -159,6 +164,7 @@ mod tests {
         assert_eq!(cfg.performance_mode, 0x09);
         assert!(cfg.auto_apply_on_startup);
         assert!(cfg.auto_reapply_on_power_change);
+        assert!(!cfg.auto_start_on_boot);
         assert_eq!(cfg.backend, BackendPreference::Auto);
     }
 
@@ -171,6 +177,7 @@ mod tests {
         assert!(s.contains("performance_mode"));
         assert!(s.contains("auto_apply_on_startup"));
         assert!(s.contains("auto_reapply_on_power_change"));
+        assert!(s.contains("auto_start_on_boot"));
         assert!(s.contains("backend"));
     }
 
@@ -191,6 +198,7 @@ mod tests {
         assert_eq!(cfg.performance_mode, cloned.performance_mode);
         assert_eq!(cfg.auto_apply_on_startup, cloned.auto_apply_on_startup);
         assert_eq!(cfg.auto_reapply_on_power_change, cloned.auto_reapply_on_power_change);
+        assert_eq!(cfg.auto_start_on_boot, cloned.auto_start_on_boot);
         assert_eq!(cfg.backend, cloned.backend);
     }
 }
