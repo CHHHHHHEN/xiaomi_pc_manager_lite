@@ -8,8 +8,10 @@ pub enum EcError {
     WmiConnect(String),
     #[error("WMI MICommonInterface 未找到")]
     WmiInterfaceNotFound,
-    #[error("WMI MiInterface 调用失败 (状态={0})")]
+    #[error("WMI MiInterface 调用失败 (状态={0:#x})")]
     WmiCallFailed(u16),
+    #[error("WMI 调用返回错误 (hr=0x{0:08X})")]
+    WmiCallHResult(u32),
     #[error("EC 读取失败 (地址: {0:#x})")]
     ReadFailed(u16),
     #[error("EC 写入失败 (地址: {0:#x})")]
@@ -51,7 +53,13 @@ mod tests {
     #[test]
     fn test_display_wmi_call_failed() {
         let err = EcError::WmiCallFailed(0x0001);
-        assert_eq!(err.to_string(), "WMI MiInterface 调用失败 (状态=1)");
+        assert_eq!(err.to_string(), "WMI MiInterface 调用失败 (状态=0x1)");
+    }
+
+    #[test]
+    fn test_display_wmi_call_hrresult() {
+        let err = EcError::WmiCallHResult(0x8004102F);
+        assert_eq!(err.to_string(), "WMI 调用返回错误 (hr=0x8004102F)");
     }
 
     #[test]

@@ -11,8 +11,11 @@ use windows::Win32::System::Com::{
     COINIT_MULTITHREADED, EOAC_NONE, RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE,
 };
 use windows::Win32::System::Ole::SafeArrayCreateVector;
-use windows::Win32::System::Ole::{SafeArrayAccessData, SafeArrayUnaccessData, SafeArrayDestroy};
-use windows::Win32::System::Variant::{VARIANT, VARENUM, VT_ARRAY, VT_UI1};
+use windows::Win32::System::Ole::{
+    SafeArrayAccessData, SafeArrayDestroy, SafeArrayGetElement,
+    SafeArrayGetLBound, SafeArrayGetUBound, SafeArrayUnaccessData,
+};
+use windows::Win32::System::Variant::{VARIANT, VARENUM, VT_ARRAY, VT_UI1, VariantClear};
 use windows::Win32::System::Wmi::*;
 use windows::core::{BSTR, GUID, PCWSTR};
 use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
@@ -57,6 +60,13 @@ fn ensure_com() -> Result<(), EcError> {
 fn to_le16(buf: &mut [u8; 32], offset: usize, val: u16) {
     buf[offset] = (val & 0xFF) as u8;
     buf[offset + 1] = ((val >> 8) & 0xFF) as u8;
+}
+
+/// 将百分比换算为 WMI 充电上限 raw code：精确匹配优先，否则取最近的预设值。
+fn wmi_rawcode_for_percent(percent: u8) -> u8 {
+    battery::percent_to_wmi_rawcode(percent)
+        .or_else(|| battery::percent_to_wmi_rawcode(battery::nearest_wmi_percent(percent)))
+        .unwrap_or(0)
 }
 
 pub struct WmiBackend {
@@ -106,6 +116,67 @@ impl WmiBackend {
         }
     }
 
+    /// Discover the first user-defined property name from a WMI class/instance
+    /// object.  Xiaomi EC firmware revisions use different parameter names
+    /// across models (e.g. InData/OutData, InParam/OutParam).  Reading the
+    /// actual name from the schema avoids hardcoded assumptions.
+    ///
+    /// GetNames() with no qualifier returns ALL properties including system
+    /// properties (__GENUS, __CLASS, ...), which always come first, and the
+    /// output parameter class additionally carries the method return value
+    /// (ReturnValue / ReturnCode).  Both kinds must be skipped so the first
+    /// user parameter (InData / OutData) is picked.
+    unsafe fn param_name_from_schema(obj: &IWbemClassObject, fallback: &str) -> String {
+        let is_return_value_prop = |name: &str| {
+            name.eq_ignore_ascii_case("ReturnValue") || name.eq_ignore_ascii_case("ReturnCode")
+        };
+        let sa = match obj.GetNames(
+            None::<&PCWSTR>,
+            WBEM_CONDITION_FLAG_TYPE(0),
+            std::ptr::null(),
+        ) {
+            Ok(sa) => sa,
+            Err(_) => return fallback.to_string(),
+        };
+        if sa.is_null() {
+            return fallback.to_string();
+        }
+        let lbound = SafeArrayGetLBound(sa, 1).unwrap_or(0);
+        let ubound = SafeArrayGetUBound(sa, 1).unwrap_or(-1);
+        for i in lbound..=ubound {
+            let indices = [i];
+            let mut bstr_ptr: *const u16 = std::ptr::null();
+            if SafeArrayGetElement(
+                sa,
+                indices.as_ptr(),
+                &mut bstr_ptr as *mut *const u16 as *mut core::ffi::c_void,
+            )
+            .is_err()
+                || bstr_ptr.is_null()
+            {
+                continue;
+            }
+            // SafeArrayGetElement 对 BSTR 元素返回**调用方拥有**的深拷贝
+            // （实测：返回指针与数组内元素指针不同，且 SafeArrayDestroy 后
+            // 该 BSTR 依然有效），因此 BSTR 包装器必须在其析构时释放拷贝；
+            // 数组自身元素的释放由 SafeArrayDestroy 负责，互不干扰。
+            let bstr = BSTR::from_raw(bstr_ptr);
+            let name = String::from_utf16_lossy(&bstr[..]);
+            // 系统属性（__*）与返回值属性（ReturnValue/ReturnCode）都不是
+            // 数据参数，必须整体跳过；若全是这两类则说明该 schema 没有用户
+            // 参数，回退到约定名（InData/OutData）。绝不能把 ReturnValue
+            // 当参数名返回——Get("ReturnValue") 拿到的是方法返回值，
+            // 不是 32 字节数组，必然失败。
+            if name.starts_with("__") || is_return_value_prop(&name) {
+                continue;
+            }
+            let _ = SafeArrayDestroy(sa);
+            return name;
+        }
+        let _ = SafeArrayDestroy(sa);
+        fallback.to_string()
+    }
+
     /// Send a 32-byte buffer via MiInterface and receive the 32-byte response.
     ///
     /// Command buffer layout (per F-HAL-05):
@@ -134,8 +205,11 @@ impl WmiBackend {
                 .GetMethod(method_name, 0, &mut in_sig, &mut out_sig)
                 .map_err(|e| EcError::WmiConnect(format!("GetMethod: {}", e)))?;
 
+            let in_sig = in_sig.ok_or(EcError::WmiInterfaceNotFound)?;
+            let in_param_name = Self::param_name_from_schema(&in_sig, "InData");
+            log::info!("WMI: MiInterface input parameter -> '{}'", in_param_name);
+
             let in_params = in_sig
-                .ok_or(EcError::WmiInterfaceNotFound)?
                 .SpawnInstance(0)
                 .map_err(|e| EcError::WmiConnect(format!("SpawnInstance: {}", e)))?;
 
@@ -145,13 +219,15 @@ impl WmiBackend {
             }
 
             let mut data_ptr: *mut core::ffi::c_void = std::ptr::null_mut();
-            SafeArrayAccessData(sa, &mut data_ptr)
-                .ok()
-                .ok_or(EcError::WmiConnect("SafeArrayAccessData failed".into()))?;
+            if SafeArrayAccessData(sa, &mut data_ptr).is_err() {
+                SafeArrayDestroy(sa).ok();
+                return Err(EcError::WmiConnect("SafeArrayAccessData failed".into()));
+            }
             std::ptr::copy_nonoverlapping(buffer.as_ptr(), data_ptr as *mut u8, 32);
-            SafeArrayUnaccessData(sa)
-                .ok()
-                .ok_or(EcError::WmiConnect("SafeArrayUnaccessData failed".into()))?;
+            if SafeArrayUnaccessData(sa).is_err() {
+                SafeArrayDestroy(sa).ok();
+                return Err(EcError::WmiConnect("SafeArrayUnaccessData failed".into()));
+            }
 
             let v = VARIANT {
                 Anonymous: windows::Win32::System::Variant::VARIANT_0 {
@@ -165,17 +241,19 @@ impl WmiBackend {
                 },
             };
 
-            let (_in_buf, in_name) = crate::util::to_pcwstr(IN_PARAM);
-            in_params
-                .Put(in_name, 0, &v as *const VARIANT, 0)
-                .map_err(|e| EcError::WmiConnect(format!("Put {}: {}", IN_PARAM, e)))?;
+            let (_in_buf, in_pcwstr) = crate::util::to_pcwstr(&in_param_name);
+            if let Err(e) = in_params.Put(in_pcwstr, 0, &v as *const VARIANT, 0) {
+                SafeArrayDestroy(sa).ok();
+                return Err(EcError::WmiConnect(format!("Put '{}': {}", in_param_name, e)));
+            }
+            // 关键：Put 之后**不能** SafeArrayDestroy(sa)。实测验证（含
+            // HeapValidate 逐步检测）IWbemClassObject::Put 对 SAFEARRAY 保留
+            // 引用而非深拷贝：Put 后立即释放数组，ExecMethod 内部仍会访问该
+            // 数组，造成 OLE 堆损坏（进程以 STATUS_HEAP_CORRUPTION 退出）。
+            // 数组必须存活到异步调用完成（GetResultObject 成功）且 in_params
+            // 释放之后；中途出错时宁可泄漏数组也不得提前释放（异步操作可能
+            // 仍在引用它）。
 
-            SafeArrayDestroy(sa)
-                .ok()
-                .ok_or(EcError::WmiConnect("SafeArrayDestroy failed".into()))?;
-
-            // Use RETURN_IMMEDIATELY because the WMI provider's synchronous
-            // path fails with WBEM_E_INVALID_METHOD_PARAMETERS on this build.
             let mut call_result: Option<IWbemCallResult> = None;
             self.services
                 .ExecMethod(
@@ -187,12 +265,11 @@ impl WmiBackend {
                     None,
                     Some(&mut call_result as *mut Option<IWbemCallResult>),
                 )
-                .map_err(|e| EcError::WmiCallFailed(e.code().0 as u16))?;
+                .map_err(|e| EcError::WmiCallHResult(e.code().0 as u32))?;
 
             let call_result =
                 call_result.ok_or(EcError::WmiCallFailed(0))?;
 
-            // Wait up to 10 seconds for the provider to respond
             log::info!("WMI: GetResultObject waiting...");
             let out_params = match call_result.GetResultObject(10000) {
                 Ok(p) => p,
@@ -201,38 +278,75 @@ impl WmiBackend {
                         "WMI: GetResultObject failed: hr=0x{:08X}",
                         e.code().0 as u32
                     );
-                    return Err(EcError::WmiCallFailed(e.code().0 as u16));
+                    return Err(EcError::WmiCallHResult(e.code().0 as u32));
                 }
             };
 
-            let (_out_buf, out_name) = crate::util::to_pcwstr(OUT_PARAM);
+            let out_param_name = Self::param_name_from_schema(&out_params, "OutData");
+            log::info!("WMI: MiInterface output parameter -> '{}'", out_param_name);
+
+            let (_out_buf, out_pcwstr) = crate::util::to_pcwstr(&out_param_name);
             let mut out_val = VARIANT::default();
             let mut out_type = 0i32;
             let mut out_flavor = 0i32;
-            out_params
-                .Get(out_name, 0, &mut out_val, Some(&mut out_type as *mut i32), Some(&mut out_flavor as *mut i32))
-                .map_err(|e| EcError::WmiConnect(format!("Get {}: {}", OUT_PARAM, e)))?;
+            if let Err(e) = out_params.Get(
+                out_pcwstr,
+                0,
+                &mut out_val,
+                Some(&mut out_type as *mut i32),
+                Some(&mut out_flavor as *mut i32),
+            ) {
+                return Err(EcError::WmiConnect(format!("Get '{}': {}", out_param_name, e)));
+            }
 
             let expected_vt = VARENUM(VT_ARRAY.0 | VT_UI1.0);
             if out_val.Anonymous.Anonymous.vt != expected_vt {
+                VariantClear(&mut out_val).ok();
                 return Err(EcError::WmiCallFailed(0));
             }
             let out_sa = out_val.Anonymous.Anonymous.Anonymous.parray;
             if out_sa.is_null() {
+                VariantClear(&mut out_val).ok();
+                return Err(EcError::WmiCallFailed(0));
+            }
+
+            // The response is expected to be a 32-byte array; refuse to read a
+            // shorter one instead of over-reading the buffer.
+            let lbound = SafeArrayGetLBound(out_sa, 1).unwrap_or(0);
+            let ubound = SafeArrayGetUBound(out_sa, 1).unwrap_or(-1);
+            let len = ubound.saturating_sub(lbound).saturating_add(1) as usize;
+            if len < 32 {
+                log::error!("WMI: output array too short ({} bytes)", len);
+                VariantClear(&mut out_val).ok();
                 return Err(EcError::WmiCallFailed(0));
             }
 
             let mut out_data: *mut core::ffi::c_void = std::ptr::null_mut();
-            SafeArrayAccessData(out_sa, &mut out_data)
-                .ok()
-                .ok_or(EcError::WmiConnect("SafeArrayAccessData out failed".into()))?;
+            if SafeArrayAccessData(out_sa, &mut out_data).is_err() {
+                VariantClear(&mut out_val).ok();
+                return Err(EcError::WmiConnect("SafeArrayAccessData out failed".into()));
+            }
 
             let mut result = [0u8; 32];
             std::ptr::copy_nonoverlapping(out_data as *const u8, result.as_mut_ptr(), 32);
 
-            SafeArrayUnaccessData(out_sa)
-                .ok()
-                .ok_or(EcError::WmiConnect("SafeArrayUnaccessData out failed".into()))?;
+            SafeArrayUnaccessData(out_sa).ok();
+            // Release the output VARIANT (and the SafeArray it owns).
+            VariantClear(&mut out_val).ok();
+
+            // 异步调用已完成：先释放仍引用输入数组的 in_params，再销毁数组
+            // （见上方 Put 处的说明，顺序不可颠倒）。
+            drop(in_params);
+            SafeArrayDestroy(sa).ok();
+
+            // F-HAL-08: 响应前 2 字节为 Status（小端）。非 0 表示 EC 拒绝了
+            // 该命令：读操作的数据字段无意义，写操作实际并未生效。
+            // 不校验的话，写失败会被误判为成功，读失败会返回垃圾数据。
+            let status = u16::from_le_bytes([result[0], result[1]]);
+            if status != 0 {
+                log::error!("WMI: MiInterface returned status {:#x}", status);
+                return Err(EcError::WmiCallFailed(status));
+            }
 
             Ok(result)
         }
@@ -304,7 +418,11 @@ impl EcBackend for WmiBackend {
             }
             ec_addr::CHARGE_LIMIT => {
                 let buf = self.read_battery()?;
-                Ok(buf[6]) // Data1
+                // Data1 = 充电上限 raw code（如 0=100%、1=80%）。read_byte 对
+                // 该地址的约定语义是百分比（与 write_byte(CHARGE_LIMIT) 接收
+                // 百分比、以及 WinRing0 后端该地址读写均为百分比保持一致），
+                // 必须换算后再返回，否则读写不对称。
+                Ok(battery::wmi_rawcode_to_percent(buf[6]).unwrap_or(100))
             }
             ec_addr::BATTERY_CARE => {
                 let buf = self.read_battery()?;
@@ -320,7 +438,23 @@ impl EcBackend for WmiBackend {
     fn write_byte(&self, addr: u16, value: u8) -> Result<(), EcError> {
         match addr {
             ec_addr::PERF_MODE => self.write_perf(value),
-            ec_addr::BATTERY_CARE | ec_addr::CHARGE_LIMIT => self.write_battery(value),
+            // WMI 没有独立的电池养护位（read_byte(BATTERY_CARE) 由充电上限
+            // <100% 推导，返回 0x01/0x00）。写入侧必须与 set_battery_care 保持
+            // 同一语义：0x00 = 关闭养护（上限提到 100%），非 0 = 启用养护——
+            // 上限由调用方通过 set_charge_limit 单独设置。绝不能把养护位原值
+            // 直接当作充电上限 raw code 写入，否则 write_byte(BATTERY_CARE,
+            // 0x01) 会把充电上限静默改成 80%，覆盖用户设置。
+            ec_addr::BATTERY_CARE => {
+                if value == 0 {
+                    self.set_charge_limit(100)
+                } else {
+                    Ok(())
+                }
+            }
+            // read_byte(CHARGE_LIMIT) 返回的是百分比，写入侧保持一致：
+            // 先把百分比换算成 WMI raw code 再写入，避免读写语义不一致
+            // （否则按 raw code 直接写入，读回时按百分比解析会完全错位）。
+            ec_addr::CHARGE_LIMIT => self.write_battery(wmi_rawcode_for_percent(value)),
             _ => Err(EcError::WriteFailed(addr)),
         }
     }
@@ -348,18 +482,17 @@ impl EcBackend for WmiBackend {
     fn set_battery_care(&self, enabled: bool) -> Result<(), EcError> {
         log::info!("WMI: set battery care -> {}", if enabled { "enabled" } else { "disabled" });
         if !enabled {
+            // WMI has no independent battery-care bit: care is the charge
+            // limit being below 100%.  Disabling care must therefore raise the
+            // limit to 100%; when enabling, the caller sets the desired limit.
             self.set_charge_limit(100)?;
-        } else {
-            self.set_charge_limit(80)?;
         }
         Ok(())
     }
 
     fn set_charge_limit(&self, percent: u8) -> Result<(), EcError> {
         let percent = percent.min(100);
-        let raw = battery::percent_to_wmi_rawcode(percent)
-            .or_else(|| battery::percent_to_wmi_rawcode(battery::nearest_wmi_percent(percent)))
-            .unwrap_or(0);
+        let raw = wmi_rawcode_for_percent(percent);
         log::info!("WMI: set charge limit -> {}% (raw {:#x})", percent, raw);
         self.write_battery(raw)
     }
@@ -376,6 +509,26 @@ impl EcBackend for WmiBackend {
     }
 }
 
-/// Property names on the MICommonInterface.MiInterface method signature.
-const IN_PARAM: &str = "InData";
-const OUT_PARAM: &str = "OutData";
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_wmi_rawcode_for_percent_exact() {
+        assert_eq!(wmi_rawcode_for_percent(100), 0);
+        assert_eq!(wmi_rawcode_for_percent(80), 1);
+        assert_eq!(wmi_rawcode_for_percent(90), 4);
+        assert_eq!(wmi_rawcode_for_percent(70), 5);
+        assert_eq!(wmi_rawcode_for_percent(60), 6);
+        assert_eq!(wmi_rawcode_for_percent(50), 7);
+        assert_eq!(wmi_rawcode_for_percent(40), 8);
+    }
+
+    #[test]
+    fn test_wmi_rawcode_for_percent_nearest() {
+        assert_eq!(wmi_rawcode_for_percent(85), 1); // 80%（与最近预设一致）
+        assert_eq!(wmi_rawcode_for_percent(55), 6); // 60%
+        assert_eq!(wmi_rawcode_for_percent(95), 0); // 100%
+        assert_eq!(wmi_rawcode_for_percent(45), 7); // 50%
+    }
+}

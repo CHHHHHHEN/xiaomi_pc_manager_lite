@@ -6,13 +6,13 @@ pub unsafe fn bstr_from_variant(val: &VARIANT) -> Option<String> {
     if vt != 8 {
         return None;
     }
-    let bstr = &*val.Anonymous.Anonymous.Anonymous.bstrVal;
-    let ptr = bstr.as_ptr();
-    if ptr.is_null() {
+    // Take the address of the union member instead of forming a reference to
+    // its possibly-null value; BSTR's Deref handles the null case safely.
+    let bstr = &*std::ptr::addr_of!(val.Anonymous.Anonymous.Anonymous.bstrVal);
+    if bstr.is_empty() {
         return None;
     }
-    let slice = std::slice::from_raw_parts(ptr, bstr.len());
-    Some(String::from_utf16_lossy(slice))
+    Some(String::from_utf16_lossy(bstr))
 }
 
 pub unsafe fn bool_from_variant(val: &VARIANT) -> Option<bool> {

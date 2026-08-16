@@ -30,8 +30,12 @@ pub fn create_backend(pref: BackendPreference) -> Result<Box<dyn EcBackend>, EcE
         BackendPreference::Wmi => Ok(Box::new(super::wmi::WmiBackend::new()?)),
         BackendPreference::WinRing0 => Ok(Box::new(super::winring0::WinRing0Backend::new()?)),
         BackendPreference::Auto => {
-            // WinRing0 first: more reliable EC access. Fall back to WMI when
-            // the driver can't be loaded (no admin, HVCI, etc.).
+            // WinRing0 first: 实测确认（2025 Redmi Book Pro 14 固件）WMI
+            // MiInterface 协议会被固件拒绝（0x8004102F，PowerShell CIM 与
+            // C# System.Management 均复现），且调用还会触发 wmiprov.dll
+            // 进程内堆损坏。main.rs 的 elevate() 已保证管理员权限，因此
+            // WinRing0 始终可用；WMI 仅作为 WinRing0 无法加载
+            // （无管理员/HVCI 等）时的回退。
             let wr0_err = match super::winring0::WinRing0Backend::new() {
                 Ok(b) => return Ok(Box::new(b)),
                 Err(e) => e,
