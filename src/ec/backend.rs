@@ -41,23 +41,23 @@ pub fn create_backend(pref: BackendPreference) -> Result<Box<dyn EcBackend>, EcE
         BackendPreference::Wmi => Ok(Box::new(super::wmi::WmiBackend::new()?)),
         BackendPreference::WinRing0 => Ok(Box::new(super::winring0::WinRing0Backend::new()?)),
         BackendPreference::Auto => {
-            // WinRing0 first: 实测确认（2025 Redmi Book Pro 14 固件）WMI
-            // MiInterface 协议会被固件拒绝（0x8004102F，PowerShell CIM 与
-            // C# System.Management 均复现），且调用还会触发 wmiprov.dll
-            // 进程内堆损坏。main.rs 的 elevate() 已保证管理员权限，因此
-            // WinRing0 始终可用；WMI 仅作为 WinRing0 无法加载
-            // （无管理员/HVCI 等）时的回退。
-            let wr0_err = match super::winring0::WinRing0Backend::new() {
-                Ok(b) => return Ok(Box::new(b)),
-                Err(e) => e,
-            };
+            // WMI first（符合 F-HAL-13）：WMI 通过官方 WMI-ACPI 接口访问 EC，
+            // 无需加载内核驱动；本机（2025 RedmiBook Pro 14）实例调用实测
+            // 可用（5~16ms）。历史版本曾因"对类路径调用"被拒（0x8004102F）
+            // 而误判为固件拒绝协议、改为 WinRing0 优先——修复后 WMI 为默认
+            // 与首选后端。WinRing0 作为 WMI 不可用（非小米机器/接口缺失等）
+            // 时的回退。
             let wmi_err = match super::wmi::WmiBackend::new() {
                 Ok(b) => return Ok(Box::new(b)),
                 Err(e) => e,
             };
+            let wr0_err = match super::winring0::WinRing0Backend::new() {
+                Ok(b) => return Ok(Box::new(b)),
+                Err(e) => e,
+            };
             Err(EcError::BackendUnavailable(format!(
-                "WinRing0: {}; WMI: {}",
-                wr0_err, wmi_err
+                "WMI: {}; WinRing0: {}",
+                wmi_err, wr0_err
             )))
         }
     }

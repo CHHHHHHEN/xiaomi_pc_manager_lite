@@ -30,7 +30,9 @@ impl Default for AppConfig {
             auto_apply_on_startup: true,
             auto_reapply_on_power_change: true,
             auto_start_on_boot: false,
-            backend: BackendPreference::Auto,
+            // 默认使用 WMI 后端（本机 2025 RedmiBook Pro 14 实测可用；
+            // Auto 模式同样 WMI 优先）。
+            backend: BackendPreference::Wmi,
         }
     }
 }
@@ -97,7 +99,7 @@ mod tests {
         assert!(cfg.auto_apply_on_startup);
         assert!(cfg.auto_reapply_on_power_change);
         assert!(!cfg.auto_start_on_boot);
-        assert_eq!(cfg.backend, BackendPreference::Auto);
+        assert_eq!(cfg.backend, BackendPreference::Wmi);
     }
 
     #[test]
@@ -165,7 +167,7 @@ mod tests {
         assert!(cfg.auto_apply_on_startup);
         assert!(cfg.auto_reapply_on_power_change);
         assert!(!cfg.auto_start_on_boot);
-        assert_eq!(cfg.backend, BackendPreference::Auto);
+        assert_eq!(cfg.backend, BackendPreference::Wmi);
     }
 
     #[test]
