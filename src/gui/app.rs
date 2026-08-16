@@ -47,6 +47,7 @@ impl XiaomiApp {
 
         // AC-START-03: GUI 启动后应显示硬件当前实际状态，而非仅显示
         // 持久化的配置（auto_apply 关闭时两者可能不一致）。
+        // WMI 后端为线程亲和 worker 代理，任意线程调用均安全。
         app.refresh_from_backend();
         if let Some(init) = init_error {
             app.error_msg = Some(match app.error_msg.take() {
