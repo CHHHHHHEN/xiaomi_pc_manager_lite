@@ -4,6 +4,7 @@ mod command;
 mod ec;
 mod embed;
 mod gui;
+mod platform;
 mod tray;
 mod util;
 
@@ -26,103 +27,21 @@ fn init_pause_on_panic() {
 #[cfg(not(debug_assertions))]
 fn init_pause_on_panic() {}
 
-/// If the current process is a debug build, block until the user
-/// presses Enter so the console window does not disappear.
-#[cfg(debug_assertions)]
-fn pause_on_exit() {
-    use std::io::Write;
-    let _ = std::io::stdout().write_all(b"\nPress Enter to exit...");
-    let _ = std::io::stdin().read_line(&mut String::new());
-}
-
-#[cfg(not(debug_assertions))]
-fn pause_on_exit() {}
-
-fn is_admin() -> bool {
-    unsafe {
-        let mut token = windows::Win32::Foundation::HANDLE::default();
-        if windows::Win32::System::Threading::OpenProcessToken(
-            windows::Win32::System::Threading::GetCurrentProcess(),
-            windows::Win32::Security::TOKEN_QUERY,
-            &mut token,
-        )
-        .is_err()
-        {
-            return false;
-        }
-        let mut elevation = windows::Win32::Security::TOKEN_ELEVATION::default();
-        let mut returned = 0u32;
-        let ok = windows::Win32::Security::GetTokenInformation(
-            token,
-            windows::Win32::Security::TokenElevation,
-            Some(&mut elevation as *mut _ as *mut core::ffi::c_void),
-            std::mem::size_of::<windows::Win32::Security::TOKEN_ELEVATION>() as u32,
-            &mut returned,
-        )
-        .is_ok();
-        let _ = windows::Win32::Foundation::CloseHandle(token);
-        ok && elevation.TokenIsElevated != 0
-    }
-}
-
-/// Returns `true` if a new elevated instance was launched and the
-/// caller should exit this process (instead of running the GUI).
-fn elevate() -> bool {
-    if is_admin() {
-        return false;
-    }
-    let exe = match std::env::current_exe() {
-        Ok(e) => e,
-        Err(e) => {
-            log::warn!("current_exe: {}", e);
-            return false;
-        }
-    };
-    let (_verb_buf, verb) = crate::util::to_pcwstr("runas");
-    let (_path_buf, path) = crate::util::to_pcwstr(&exe.to_string_lossy());
-    let ret = unsafe {
-        windows::Win32::UI::Shell::ShellExecuteW(
-            None,
-            verb,
-            path,
-            windows::core::PCWSTR::null(),
-            windows::core::PCWSTR::null(),
-            windows::Win32::UI::WindowsAndMessaging::SW_SHOWDEFAULT,
-        )
-    };
-    // ShellExecuteW returns a value > 32 on success (HINSTANCE cast), and an
-    // error code on failure. When the user **declines** the UAC prompt it
-    // returns ERROR_CANCELLED (1223) — an error code greater than 32 — so a
-    // bare "> 32" check would mistake the decline for a successful launch,
-    // exit this process, and the app would silently disappear without any
-    // instance running. Treat 1223 as "declined": continue without admin
-    // (WinRing0 unavailable, WMI fallback).
-    const ERROR_CANCELLED: isize = 1223;
-    let ret_val = ret.0 as isize;
-    if ret_val > 32 && ret_val != ERROR_CANCELLED {
-        log::info!("Elevated instance launched; exiting non-admin process.");
-        true
-    } else if ret_val == ERROR_CANCELLED {
-        log::warn!("Elevation declined by the user; continuing without admin. WinRing0 will be unavailable.");
-        false
-    } else {
-        log::warn!("Elevation failed (ret={}); continuing without admin. WinRing0 will be unavailable.", ret_val);
-        false
-    }
-}
-
 fn main() {
     env_logger::init();
     init_pause_on_panic();
 
-    // Relaunch as admin if not already elevated — WinRing0 requires
-    // administrative rights for port I/O access.
-    if elevate() {
-        pause_on_exit();
+    let config = AppConfig::load();
+
+    // 提权策略：**仅当配置使用 WinRing0 时才自动提权**。WMI 后端与
+    // Auto（非管理员下自动回退 WMI）都不需要管理员权限，不应弹 UAC。
+    // 用户在 GUI 中选择 WinRing0 时同样需要管理员——非管理员下
+    // create_backend 会失败并回退 Auto/WMI（见下方回退逻辑）。
+    if config.backend == ec::config::BackendPreference::WinRing0
+        && crate::platform::privilege::elevate_self()
+    {
         return;
     }
-
-    let config = AppConfig::load();
 
     // 后端创建与启动应用在后台线程执行：WMI 后端会在此线程调用
     // CoInitializeEx(MTA) 初始化 COM。GUI 主线程因此不携带任何 COM 初始化
@@ -131,6 +50,16 @@ fn main() {
     // RPC_E_CHANGED_MODE 崩溃；保持主线程"未初始化 COM"可让 eframe/winit
     // 及任何后续组件按需安全初始化。
     let thread_config = config.clone();
+    // F-AUTO-06: 开机自启动任务一致性校验（后台线程，不阻塞 GUI；
+    // 该线程的 COM 状态由 create_backend 或 autostart 自行初始化）。
+    {
+        let cfg = thread_config.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = platform::autostart::sync(cfg.auto_start_on_boot) {
+                log::warn!("autostart sync: {}", e);
+            }
+        });
+    }
     // 返回修改后的 config：启动同步（量化读回、矛盾兜底）发生在该线程的
     // config 副本上并已落盘；若不把该副本交还给 GUI，GUI 的 save_state()
     // 会把未同步的旧值（如 care=true+limit=100、85% 非预设值）重新写回
@@ -204,8 +133,9 @@ fn main() {
     .join()
     .expect("EC backend init thread panicked");
 
-    gui::run_app(backend, config, init_error);
-    pause_on_exit();
+    // F-AUTO-07: --autostart 启动时驻留托盘（首帧最小化）。
+    let autostart = std::env::args().any(|a| a == "--autostart");
+    gui::run_app(backend, config, init_error, autostart);
 }
 
 /// 启动应用的结果：逐项记录是否成功写入硬件。
