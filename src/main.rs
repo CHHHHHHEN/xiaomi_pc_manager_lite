@@ -31,17 +31,16 @@ fn main() {
     env_logger::init();
     init_pause_on_panic();
 
-    let config = AppConfig::load();
-
-    // 提权策略：**仅当配置使用 WinRing0 时才自动提权**。WMI 后端与
-    // Auto（非管理员下自动回退 WMI）都不需要管理员权限，不应弹 UAC。
-    // 用户在 GUI 中选择 WinRing0 时同样需要管理员——非管理员下
-    // create_backend 会失败并回退 Auto/WMI（见下方回退逻辑）。
-    if config.backend == ec::config::BackendPreference::WinRing0
-        && crate::platform::privilege::elevate_self()
-    {
+    // 启动即提权：**WMI 与 WinRing0 都需要管理员权限**。本机实测
+    // （受限令牌对照实验）：非管理员下 `SELECT * FROM MICommonInterface`
+    // 直接返回拒绝访问（Access denied），WMI 后端完全不可用；WinRing0
+    // 驱动加载同样需要管理员。用户拒绝 UAC 时继续以非管理员运行，
+    // create_backend 会失败并回退，GUI 显示错误（见下方回退逻辑）。
+    if crate::platform::privilege::elevate_self() {
         return;
     }
+
+    let config = AppConfig::load();
 
     // 后端创建与启动应用在后台线程执行：WMI 后端会在此线程调用
     // CoInitializeEx(MTA) 初始化 COM。GUI 主线程因此不携带任何 COM 初始化

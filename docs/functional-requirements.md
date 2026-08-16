@@ -2,7 +2,7 @@
 
 ## Xiaomi PC Manager Lite
 
-| 文档版本 | 1.5 |
+| 文档版本 | 1.6 |
 |---------|-----|
 | 产品版本 | 0.2.0 |
 | 制定日期 | 2026-06-15 |
@@ -20,6 +20,7 @@
 | 1.3 | 2026-08-16 | WMI 后端本机实证修复：MiInterface 改为实例调用（F-HAL-08c/d）、Status 成功值修正为 0x8000（F-HAL-08a）、响应下限 18 字节（F-HAL-08b）、输入数组永不释放（F-HAL-08e） | opencode |
 | 1.4 | 2026-08-16 | WMI 后端重构为线程亲和 worker 模式（F-HAL-08f）：根治本机 exe 环境跨线程 COM 调用必崩（STATUS_ACCESS_VIOLATION），同时消除 GUI 冻结 | opencode |
 | 1.5 | 2026-08-16 | 提权策略调整（仅使用 WinRing0 时自动提权，WMI/Auto 无需管理员）；开机自启动实现（3.12 F-AUTO：设置复选框 + 计划任务 + `--autostart` 驻留托盘）；标题栏显示应用图标；移除正常退出阻塞 | opencode |
+| 1.6 | 2026-08-16 | WMI 权限实测（受限令牌对照实验）：非管理员下 `SELECT * FROM MICommonInterface` 返回拒绝访问，**WMI 后端同样需要管理员权限**；恢复"启动即提权"策略 | opencode |
 
 ---
 
