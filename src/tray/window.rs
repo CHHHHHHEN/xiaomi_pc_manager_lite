@@ -41,8 +41,19 @@ pub fn create_message_window() -> Result<HWND, String> {
     Ok(hwnd)
 }
 
-pub fn set_wndproc(hwnd: HWND, wndproc: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT) {
-    unsafe { SetWindowLongPtrW(hwnd, GWLP_WNDPROC, wndproc as *const () as isize); }
+/// 替换消息窗口的窗口过程。失败（返回 0 且带错误码）时必须上报：否则窗口
+/// 仍使用 STATIC 类默认过程，托盘点击 / 热键 / 电源广播全部静默失效。
+pub fn set_wndproc(
+    hwnd: HWND,
+    wndproc: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
+) -> Result<(), String> {
+    let ret = unsafe { SetWindowLongPtrW(hwnd, GWLP_WNDPROC, wndproc as *const () as isize) };
+    if ret == 0 {
+        // STATIC 类的原窗口过程永不为空，ret == 0 即失败。
+        let err = unsafe { GetLastError() };
+        return Err(format!("SetWindowLongPtrW: {:#x}", err.0));
+    }
+    Ok(())
 }
 
 pub fn message_loop(hwnd: HWND) {
