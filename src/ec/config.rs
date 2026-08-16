@@ -34,9 +34,14 @@ impl Default for AppConfig {
 }
 
 fn config_dir() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("XiaomiPcManagerLite")
+    // Overridable for tests so saving state never touches the real config.
+    std::env::var_os("XIAOMI_PC_MANAGER_CONFIG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            dirs::config_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("XiaomiPcManagerLite")
+        })
 }
 
 fn config_path() -> PathBuf {

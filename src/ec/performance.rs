@@ -36,6 +36,27 @@ impl PerfMode {
     }
 }
 
+/// 当前是否接入交流电源（AC）。
+pub fn ac_power_status() -> bool {
+    let mut status = unsafe { std::mem::zeroed() };
+    if unsafe { windows::Win32::System::Power::GetSystemPowerStatus(&mut status).is_ok() } {
+        status.ACLineStatus == 1
+    } else {
+        false
+    }
+}
+
+/// 根据电源状态返回实际应写入 EC 的 raw code：
+/// 狂暴模式（Extreme）仅在接入交流电源时生效，电池供电时降级为极速模式（Fast）；
+/// 其余模式原样返回。
+pub fn effective_ec_value(mode: u8, on_ac: bool) -> u8 {
+    if mode == PerfMode::Extreme as u8 && !on_ac {
+        PerfMode::Fast as u8
+    } else {
+        mode
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,5 +131,29 @@ mod tests {
         assert_eq!(format!("{:?}", PerfMode::Smart), "Smart");
         assert_eq!(format!("{:?}", PerfMode::Fast), "Fast");
         assert_eq!(format!("{:?}", PerfMode::Extreme), "Extreme");
+    }
+
+    #[test]
+    fn test_effective_ec_value_guard() {
+        assert_eq!(
+            effective_ec_value(PerfMode::Extreme as u8, false),
+            PerfMode::Fast as u8
+        );
+        assert_eq!(
+            effective_ec_value(PerfMode::Extreme as u8, true),
+            PerfMode::Extreme as u8
+        );
+        assert_eq!(
+            effective_ec_value(PerfMode::Smart as u8, false),
+            PerfMode::Smart as u8
+        );
+        assert_eq!(
+            effective_ec_value(PerfMode::Quiet as u8, true),
+            PerfMode::Quiet as u8
+        );
+        assert_eq!(
+            effective_ec_value(PerfMode::Fast as u8, false),
+            PerfMode::Fast as u8
+        );
     }
 }
