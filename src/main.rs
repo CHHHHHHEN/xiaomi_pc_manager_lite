@@ -27,8 +27,32 @@ fn init_pause_on_panic() {
 #[cfg(not(debug_assertions))]
 fn init_pause_on_panic() {}
 
+/// 初始化日志：默认写入 `%TEMP%\XiaomiPcManagerLite\app.log`（每次启动覆盖），
+/// 可用 `XIAOMI_LOG_FILE` 覆盖路径。GUI 程序无控制台，文件日志便于排查
+/// 托盘/后台运行场景的问题。
+fn init_logging() {
+    let mut builder = env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("info"),
+    );
+    let log_path = std::env::var_os("XIAOMI_LOG_FILE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("XiaomiPcManagerLite").join("app.log"));
+    if let Some(parent) = log_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match std::fs::File::create(&log_path) {
+        Ok(file) => {
+            builder.target(env_logger::Target::Pipe(Box::new(file)));
+        }
+        Err(e) => {
+            eprintln!("log file {}: {}", log_path.to_string_lossy(), e);
+        }
+    }
+    let _ = builder.try_init();
+}
+
 fn main() {
-    env_logger::init();
+    init_logging();
     init_pause_on_panic();
 
     // 启动即提权：**WMI 与 WinRing0 都需要管理员权限**。本机实测

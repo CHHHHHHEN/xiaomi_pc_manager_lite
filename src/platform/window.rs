@@ -30,6 +30,12 @@ fn find_main_window() -> Option<HWND> {
     }
 }
 
+/// 供托盘层直接操作主窗口（窗口隐藏后 GUI update 循环停止，
+/// 托盘必须自给自足地隐藏/显示/退出窗口）。
+pub(crate) fn find_main_window_handle() -> Option<HWND> {
+    find_main_window()
+}
+
 /// 主窗口当前是否可见（任务栏图标随可见性出现/消失）。
 pub fn main_window_visible() -> bool {
     find_main_window()

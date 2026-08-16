@@ -19,9 +19,7 @@ pub struct XiaomiApp {
     pub(crate) charge_limit: u8,
     pub(crate) performance_mode: u8,
     pub(crate) error_msg: Option<String>,
-    /// 用户已通过托盘菜单请求退出；为 true 时窗口关闭不再拦截为驻留托盘。
-    pub(crate) quitting: bool,
-    /// `--autostart` 启动（F-AUTO-07）：首帧最小化驻留托盘，不打扰用户。
+    /// `--autostart` 启动（F-AUTO-07）：首帧隐藏驻留托盘，不打扰用户。
     pub(crate) start_minimized: bool,
     /// 标题栏应用图标纹理（首帧由 icon.png 创建）。
     pub(crate) icon_tex: Option<egui::TextureHandle>,
@@ -45,7 +43,6 @@ impl XiaomiApp {
             battery_care_enabled,
             charge_limit,
             performance_mode,
-            quitting: false,
             error_msg: None,
             start_minimized,
             icon_tex: None,
@@ -144,7 +141,7 @@ impl eframe::App for XiaomiApp {
         // 窗口被隐藏，仍持续投递重绘事件，托盘/热键命令可以正常消费；
         // 而 ViewportCommand::Visible(false) 会停掉整个重绘循环，应用变成
         // 无法恢复的僵尸进程（已实测验证）。
-        if ctx.input(|i| i.viewport().close_requested()) && !self.quitting {
+        if ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             crate::platform::window::hide_main_window();
         }
@@ -302,8 +299,6 @@ mod tests {
 
     #[test]
     fn test_ui_command_debug() {
-        assert_eq!(format!("{:?}", UiCommand::ToggleWindow), "ToggleWindow");
-        assert_eq!(format!("{:?}", UiCommand::Quit), "Quit");
         assert_eq!(format!("{:?}", UiCommand::ToggleBatteryCare), "ToggleBatteryCare");
         assert_eq!(format!("{:?}", UiCommand::CyclePerfMode), "CyclePerfMode");
         assert_eq!(format!("{:?}", UiCommand::ReapplyConfig), "ReapplyConfig");
@@ -319,7 +314,6 @@ mod tests {
         assert!(!app.battery_care_enabled);
         assert_eq!(app.charge_limit, 80);
         assert_eq!(app.performance_mode, 0x09);
-        assert!(!app.quitting);
         // NullBackend 所有读取均失败，启动刷新后应呈现错误信息。
         assert!(app.error_msg.is_some());
     }

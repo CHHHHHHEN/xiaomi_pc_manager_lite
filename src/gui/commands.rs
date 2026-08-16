@@ -15,18 +15,6 @@ impl XiaomiApp {
         while let Ok(cmd) = self.cmd_rx.try_recv() {
             needs_repaint = true;
             match cmd {
-                UiCommand::ToggleWindow => {
-                    // 可见 → 隐藏到托盘（任务栏图标消失）；隐藏 → 显示并激活。
-                    if crate::platform::window::main_window_visible() {
-                        crate::platform::window::hide_main_window();
-                    } else {
-                        crate::platform::window::show_main_window();
-                    }
-                }
-                UiCommand::Quit => {
-                    self.quitting = true;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
                 UiCommand::ToggleBatteryCare => {
                     self.set_battery_care_internal(!self.battery_care_enabled);
                 }
@@ -464,33 +452,7 @@ mod tests {
     }
 
     /// 回归测试：ToggleWindow 改为基于真实窗口可见性的隐藏/显示
-    /// （ShowWindow SW_HIDE/SW_SHOW，任务栏图标随可见性消失）。
-    /// 测试进程没有同名窗口：应安全 no-op，不崩溃并请求重绘。
-    #[test]
-    fn test_toggle_window_hide_show_is_noop_without_window() {
-        let ctx = egui::Context::default();
-        let mut app = test_app();
-
-        app.cmd_tx.send(UiCommand::ToggleWindow).unwrap();
-        app.process_commands(&ctx);
-        app.cmd_tx.send(UiCommand::ToggleWindow).unwrap();
-        app.process_commands(&ctx);
-        assert!(!app.quitting);
-    }
-
-    #[test]
-    fn test_quit_marks_quitting_and_requests_close() {
-        let ctx = egui::Context::default();
-        let mut app = test_app();
-        assert!(!app.quitting);
-
-        app.cmd_tx.send(UiCommand::Quit).unwrap();
-        app.process_commands(&ctx);
-        assert!(app.quitting);
-        let cmds = ctx.viewport(|v| v.commands.clone());
-        assert!(cmds.contains(&egui::ViewportCommand::Close));
-    }
-
+    /// 回归测试：SetAutostart 命令在无窗口环境下安全处理。
     #[test]
     fn test_battery_care_toggle_preserves_desired_limit() {
         let mut app = test_app();
@@ -708,19 +670,6 @@ mod tests {
         assert_eq!(mock.charge_limit.load(std::sync::atomic::Ordering::Relaxed), 80);
         assert!(mock.battery_care.load(std::sync::atomic::Ordering::Relaxed));
         assert!(app.error_msg.is_none());
-    }
-
-    /// 回归测试：ToggleWindow 在无窗口环境（测试进程）下安全 no-op。
-    #[test]
-    fn test_toggle_window_restores_when_hidden() {
-        let ctx = egui::Context::default();
-        let mut app = test_app();
-
-        // 隐藏状态（main_window_visible()==false）下点击托盘：应调用显示
-        // 路径（无窗口时为 no-op），不崩溃、不请求退出。
-        app.cmd_tx.send(UiCommand::ToggleWindow).unwrap();
-        app.process_commands(&ctx);
-        assert!(!app.quitting);
     }
 
     #[test]

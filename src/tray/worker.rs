@@ -81,6 +81,7 @@ fn worker_thread() {
         log::error!("Set message window wndproc: {}", e);
         return;
     }
+    log::info!("Message window hwnd=0x{:X}", hwnd.0 as usize);
 
     // 热键注册不依赖托盘是否注册成功：托盘注册失败（任务栏未就绪）时
     // 热键仍须可用，图标稍后由重试定时器或 TaskbarCreated 广播补建。
@@ -135,16 +136,50 @@ unsafe extern "system" fn wndproc(
 
 fn handle_menu_command(wparam: WPARAM, _lparam: LPARAM) -> LRESULT {
     let id = (wparam.0 as u32) & 0xFFFF;
-    if let Some(tx) = CMD_TX.get() {
-        match id {
-            MID_SHOW => { let _ = tx.send(UiCommand::ToggleWindow); }
-            MID_QUIT => {
-                let _ = tx.send(UiCommand::Quit);
-            }
-            _ => {}
+    match id {
+        MID_SHOW => {
+            // 直接操作窗口：窗口隐藏后 GUI update 循环停止，经命令通道
+            // 的命令无人消费，托盘必须自给自足。
+            toggle_main_window();
         }
+        MID_QUIT => {
+            quit_app();
+        }
+        _ => {}
     }
     LRESULT(0)
+}
+
+/// 托盘直接切换主窗口可见性（不依赖 GUI update 循环）。
+fn toggle_main_window() {
+    log::info!(
+        "Tray toggle: visible={}",
+        crate::platform::window::main_window_visible()
+    );
+    if crate::platform::window::main_window_visible() {
+        crate::platform::window::hide_main_window();
+    } else {
+        crate::platform::window::show_main_window();
+    }
+}
+
+/// 托盘直接退出：向主窗口投递 WM_QUIT，winit 消息循环收到后退出，
+/// eframe run_native 返回、进程正常结束（窗口隐藏时同样有效，
+/// 不依赖 GUI update 循环）。兜底：WM_QUIT 未生效时 500ms 后强制退出。
+fn quit_app() {
+    if let Some(hwnd) = crate::platform::window::find_main_window_handle() {
+        log::info!("Tray quit: posting WM_QUIT to main window");
+        let _ = unsafe {
+            windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                Some(hwnd),
+                windows::Win32::UI::WindowsAndMessaging::WM_QUIT,
+                WPARAM(0),
+                LPARAM(0),
+            )
+        };
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    std::process::exit(0);
 }
 
 fn handle_hotkey(wparam: WPARAM) -> LRESULT {
@@ -172,9 +207,8 @@ fn handle_power_broadcast(wparam: WPARAM, _lparam: LPARAM) -> LRESULT {
 fn handle_tray_event(hwnd: HWND, lparam: LPARAM) -> LRESULT {
     match lparam.0 as u32 {
         WM_LBUTTONUP => {
-            if let Some(tx) = CMD_TX.get() {
-                let _ = tx.send(UiCommand::ToggleWindow);
-            }
+            // 直接操作窗口（原因见 toggle_main_window）。
+            toggle_main_window();
             LRESULT(0)
         }
         WM_RBUTTONUP => {
