@@ -2,7 +2,7 @@
 
 ## Xiaomi PC Manager Lite
 
-| 文档版本 | 1.9 |
+| 文档版本 | 1.10 |
 |---------|-----|
 | 产品版本 | 0.2.0 |
 | 制定日期 | 2026-06-15 |
@@ -24,6 +24,7 @@
 | 1.7 | 2026-08-16 | 默认使用 WMI 后端（`AppConfig.backend` 默认 `Wmi`）；`Auto` 模式修正为 WMI 优先、失败回退 WinRing0（与 F-HAL-13 一致，历史实现曾因误判固件拒绝而反序） | opencode |
 | 1.8 | 2026-08-16 | 最小化到托盘改为**隐藏窗口**（`ShowWindow SW_HIDE`）：任务栏不再显示程序图标；托盘点击/热键可恢复显示。隐藏而非最小化是为了保持 winit 重绘循环（`Visible(false)` 会停掉 update，应用变僵尸） | opencode |
 | 1.9 | 2026-08-16 | 修复隐藏后托盘失效（打不开/退不出）：窗口隐藏后 egui update 循环停止，托盘命令无人消费——托盘层改为**直接操作窗口**（隐藏/显示/退出不依赖 GUI update）；日志默认写入 `%TEMP%\XiaomiPcManagerLite\app.log` | opencode |
+| 1.10 | 2026-08-16 | 修复 WinRing0 首次切换失败（反复切换多次才成功）：`DeleteService` 是异步的，服务删除后立即重建同名服务会因名称冲突失败——`cleanup_service` 改为轮询等待服务真正消失，`InitializeOls` 失败后延时重试 3 次 | opencode |
 
 ---
 

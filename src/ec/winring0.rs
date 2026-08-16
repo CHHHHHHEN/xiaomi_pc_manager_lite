@@ -88,12 +88,29 @@ fn try_load(dll_path: &str) -> Result<(Library, ReadPort, WritePort), EcError> {
         *unsafe { lib.get(b"InitializeOls") }
             .map_err(|e| EcError::DllLoad(e.to_string()))?;
 
-    // Let InitializeOls handle driver installation (like the C version)
-    log::info!("WinRing0: calling InitializeOls...");
-    if unsafe { init() } == 0 {
-        let err = unsafe { GetLastError() };
-        log::warn!("WinRing0: InitializeOls returned 0 (failed, last_error={})", err.0);
-        return Err(EcError::InitFailed(format!("错误码: {:#x}", err.0)));
+    // Let InitializeOls handle driver installation (like the C version).
+    // 失败重试：驱动的安装/加载可能因时序问题首次失败（例如刚解压的文件
+    // 被 Defender 实时扫描锁定、服务清理尚未完成、驱动卸载未结束），
+    // 稍作延时重试即可成功——历史实现只尝试一次，导致"首次切换 WinRing0
+    // 显示失败、反复切换多次后才成功"。
+    let mut init_error = 0u32;
+    let mut init_ok = false;
+    for attempt in 0..3 {
+        log::info!("WinRing0: calling InitializeOls (attempt {})...", attempt + 1);
+        if unsafe { init() } != 0 {
+            init_ok = true;
+            break;
+        }
+        init_error = unsafe { GetLastError().0 };
+        log::warn!(
+            "WinRing0: InitializeOls returned 0 (attempt {}, last_error={:#x}); retrying",
+            attempt + 1,
+            init_error
+        );
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    if !init_ok {
+        return Err(EcError::InitFailed(format!("错误码: {:#x}", init_error)));
     }
     log::info!("WinRing0: InitializeOls succeeded");
 
@@ -107,6 +124,11 @@ fn try_load(dll_path: &str) -> Result<(Library, ReadPort, WritePort), EcError> {
 }
 
 /// Remove any stale WinRing0 service from previous runs.
+///
+/// `DeleteService` 是**异步**的：服务停止后驱动卸载需要时间，句柄/服务记录
+/// 短暂残留。若立即调用 InitializeOls 重建**同名**服务，会因名称冲突失败
+/// （CreateService/StartService 报错）——这正是"首次切换 WinRing0 失败、
+/// 反复切换多次才成功"的根因。因此删除后必须**轮询等待服务真正消失**。
 fn cleanup_service() {
     unsafe {
         let scm = match OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_ALL_ACCESS) {
@@ -118,6 +140,16 @@ fn cleanup_service() {
             let _ = ControlService(svc, SERVICE_CONTROL_STOP, std::ptr::null_mut());
             let _ = DeleteService(svc);
             let _ = CloseServiceHandle(svc);
+            // 最多等待 3 秒：服务从 SCM 数据库中消失即认为清理完成。
+            for _ in 0..30 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                match OpenServiceW(scm, id, SERVICE_ALL_ACCESS) {
+                    Ok(h) => {
+                        let _ = CloseServiceHandle(h);
+                    }
+                    Err(_) => break,
+                }
+            }
         }
         let _ = CloseServiceHandle(scm);
     }
