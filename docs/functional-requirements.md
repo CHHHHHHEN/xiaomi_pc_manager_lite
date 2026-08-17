@@ -2,7 +2,7 @@
 
 ## Xiaomi PC Manager Lite
 
-| 文档版本 | 1.11 |
+| 文档版本 | 1.19 |
 |---------|-----|
 | 产品版本 | 0.2.0 |
 | 制定日期 | 2026-06-15 |
@@ -26,6 +26,22 @@
 | 1.9 | 2026-08-16 | 修复隐藏后托盘失效（打不开/退不出）：窗口隐藏后 egui update 循环停止，托盘命令无人消费——托盘层改为**直接操作窗口**（隐藏/显示/退出不依赖 GUI update）；日志默认写入 `%TEMP%\XiaomiPcManagerLite\app.log` | opencode |
 | 1.10 | 2026-08-16 | 修复 WinRing0 首次切换失败（反复切换多次才成功）：`DeleteService` 是异步的，服务删除后立即重建同名服务会因名称冲突失败——`cleanup_service` 改为轮询等待服务真正消失，`InitializeOls` 失败后延时重试 3 次 | opencode |
 | 1.11 | 2026-08-16 | 任务栏图标修复：eframe `with_icon` 对 512×512 PNG 的任务栏缩小渲染糊成纯色块——改为程序内构建多尺寸 ICO（16/32/48/256）经 `WM_SETICON` 设置窗口图标，Windows 原生按目标尺寸选用最清晰帧 | opencode |
+| 1.12 | 2026-08-17 | Fn 功能键自定义绑定（3.11 F-FNK 扩展）：从"仅 Fn+K"推广为可配置绑定表 `fn_key_bindings`（事件类 + 报告前缀 → 动作），GUI"Fn 功能键"设置支持添加/修改/删除绑定与"捕获功能键事件"模式；配置保存即时生效（共享绑定表），无需重启 | opencode |
+| 1.13 | 2026-08-17 | 托盘增强与发布体积优化：右键菜单新增"切换电池养护/切换性能模式"快捷操作；tooltip 实时展示性能模式与电池养护状态（共享 `TrayStatus`，托盘定时器 2s 周期刷新，窗口隐藏到托盘后依然实时）；release 体积 7.4MB→4.6MB（LTO + 单 codegen 单元 + `opt-level=z` + strip + `panic=abort`），达成 NFR-PERF-04（≤5MB） | opencode |
+| 1.14 | 2026-08-17 | 托盘性能模式子菜单与电量展示：托盘"性能模式"子菜单列出全部 5 种模式并勾选当前模式、点击直接切换；Tooltip 与 GUI 状态栏新增电源（交流/电池）与电量百分比展示（`GetSystemPowerStatus`） | opencode |
+| 1.15 | 2026-08-17 | 休眠唤醒自动重设 + 电池供电自动切节能：`PBT_APMRESUMEAUTOMATIC`/`PBT_APMRESUMESUSPEND` 唤醒后发送 `ReapplyConfig`（休眠期间 EC/固件可能重置寄存器）；新增配置 `auto_switch_to_quiet_on_battery`（默认关闭），开启后电池供电自动切换为节能模式、插电恢复原模式 | opencode |
+| 1.16 | 2026-08-17 | 双后端真机验证与 UI 细化：WinRing0 后端在本机（2025 RedmiBook Pro 14）实测驱动加载/EC 读写回环成功；GUI 状态区新增电池电量进度条（<20% 红色警示、交流供电绿色、其余品牌蓝），未知电量灰色占位 | opencode |
+| 1.17 | 2026-08-17 | Fn 捕获直接绑定：捕获模式收到功能键事件后可"绑定为指定动作 → 使用此键"直接添加绑定，无需从预设挑选；捕获事件取前 6 个 hex（如 012801=3 字节）作前缀 | opencode |
+| 1.18 | 2026-08-17 | 日志可用性：日志改为**追加**写入（历史覆盖丢上一次运行日志），并按 4MB 阈值轮转保留上一份（app.log.1）；日志路径收敛到 `util::log_file_path`；GUI 设置区新增"打开日志"按钮（explorer 定位） | opencode |
+| 1.19 | 2026-08-17 | **修复隐藏态命令积压（架构级缺陷）**：窗口隐藏（托盘驻留）期间 egui `update()` 永不执行（winit 只有收到 `WM_PAINT` 才派发 `RedrawRequested`，隐藏窗口无 `WM_PAINT`），托盘/热键/Fn+K/电源事件全部积压到窗口恢复才生效（实测回归：隐藏态切换命令延迟 ~40s）。修复：隐藏改为**窗口保持可见但移到屏幕外**（`SetWindowPos(-32000,-32000)`，`WS_VISIBLE` 位仍在 → `WM_PAINT` 照常 → update 循环不断）；同时把扩展样式从 `WS_EX_APPWINDOW`（任务栏显示按钮）换成 `WS_EX_TOOLWINDOW`（任务栏不显示），仅移屏外+保留 WS_VISIBLE 时任务栏仍会显示按钮（实测验证）。显示时恢复 APPWINDOW 样式并居中。`main_window_visible()` 改为按窗口位置判定 | opencode |
+| 1.20 | 2026-08-17 | 性能模式循环改为 **Fn+K** 单一入口：移除全局热键 `Ctrl+Alt+P`（F-HOTKEY-02 / AC-HOTKEY-02 / AC-PERF-04 / AC-TRAY-09 同步更新；`HK_CYCLE_PERF` 注册与处理器移除），避免占用全局热键槽位、与其他软件冲突；`Ctrl+Alt+B` 电池养护切换热键保留 | opencode |
+| 1.21 | 2026-08-17 | 托盘通知对称化：窗口隐藏时电池养护状态变化也弹气泡（原只有性能模式变化弹）。`refresh_tray_tooltip` 拆分为通用 `show_tray_notification`（性能/养护共用），新增 `LAST_BATTERY_CARE` 跟踪与 `should_notify_care_change` 纯函数（+测试）；F-TRAY-13 / AC-TRAY-10 | opencode |
+| 1.22 | 2026-08-17 | **修复托盘"退出"依赖强杀（架构级缺陷）**：`quit_app` 原直接 `PostMessage(WM_QUIT)` 给主窗口——winit 事件循环不消费外部 WM_QUIT，`run_native` 永不返回，进程只能靠托盘 worker 的 15s 兜底 `process::exit(0)` 强杀（实测：日志出现"app did not exit within 15000ms; forcing exit"），**跳过所有 Drop 清理**（WinRing0 驱动 DeinitializeOls 不执行、服务残留）。修复：新增 `UiCommand::Quit`，托盘经命令通道发送；GUI 置 `quitting` 标志后 `ViewportCommand::Close` 放行 close_requested（不再取消/隐藏），`run_native` 正常返回 → 各组件 Drop 执行。实测：WMI 与 WinRing0 后端均正常退出（日志见 `deinitializing driver (DeinitializeOls)`，驱动服务删除）；移除已无用的 `find_main_window_handle`。**Fn 捕获修复**：捕获模式订阅类 = 绑定类 ∪ 已知事件类（`capture_classes`），删除全部绑定后仍能捕获/发现新键。**WinRing0 测试覆盖**：新增 `ec_wait_status` 掩码匹配/超时（mock ReadPort）、`arch_file_names`/`dll_name` 一致性单测。**窗口尺寸保留**：`show_main_window` 恢复时保留用户调整过的窗口尺寸（隐藏用 SWP_NOSIZE 移走、尺寸未变），仅尺寸非法/超大时回退默认 520×680 | opencode |
+| 1.23 | 2026-08-17 | Windows 版本信息（`winres` 构建脚本嵌入）：可执行文件属性页显示文件描述/产品名/版本（此前为空字段，属发布质量缺口）；版本号与 Cargo.toml 同步。**AppUserModelID 注册**：启动时 `SetCurrentProcessExplicitAppUserModelID("XiaomiPcManagerLite")`——Windows 8+ 托盘气泡通知依赖显式 AUMID 才能可靠展示，未设置时通知可能被静默丢弃（实测确认注册成功且通知正常弹泡）。**UI 悬停提示**：电池养护开关/充电上限/性能模式按钮新增 `on_hover_text` 说明（`PerfMode::description()`，含去重/非空测试）。**WMI 小端写入测试**：`put_le16`/`put_le32` 直接字节布局断言（字节序错误曾在本机实证造成限值解析错乱）。**配置同步规则测试**：`sync_config_after_apply` 新增养护关闭时保留期望上限、开启时记录硬件量化生效值的单测（此前该持久化权威函数无直接测试） | opencode |
+| 1.24 | 2026-08-17 | **应用图标替换（chi.png）**：任务栏/窗口/标题栏/托盘/exe 四类图标统一为用户提供的 `chi.png`（透明背景）。任务栏图标（`icons/icon.png`）改为从 chi.png 512×512 重采样；托盘图标（`icons/tray_icon.ico`）重建为 16/32/48/256 四帧 PNG 压缩 ICO。**HICON 构建路径修复（架构级缺陷）**：实测 `CreateIconFromResourceEx` 传**整份**多帧 ICO 恒返回 `0x80070006`（INVALID_HANDLE），只有单帧 PNG 块才能创建——历史实现（window.rs 与 tray/worker.rs 各自）把整份 ICO 直接传入，窗口/托盘图标静默失败并回退 eframe 的 512 PNG（任务栏糊成色块，见修订 1.11）。新增共享 helper `platform::window::create_hicon_from_ico`：解析 ICONDIR 各帧、取最接近目标尺寸的单帧创建 HICON，window.rs（16px 小图标/32px 大图标两档）与托盘 worker 统一收敛；托盘/窗口各增真机创建断言测试。**exe 图标嵌入**：build.rs 增加 `winres set_icon("icons/tray_icon.ico")`——资源管理器/UAC 弹窗显示同源图标（此前 exe 无图标资源） | opencode |
+| 1.25 | 2026-08-17 | **多缺陷修复（双代理评审 + 真机回归）**：① 性能模式显示与硬件背离（H1）：电池供电下写狂暴、硬件实跑极速，但 GUI/托盘仍显示狂暴直到刷新——`set_perf_mode_internal` 的 runtime 改存**实际写入** raw code（config 仍存用户选择），GUI/托盘/状态栏与硬件一致。② 开机自启动请求与配置背离（M3+M1）：`SetAutostart` 请求时**即时持久化**期望值（不再等 worker 回传），中途退出不再出现"任务已注册而配置为关"的永久背离；复选框即时反映新值不再闪烁；enable 失败按 F-AUTO-10 回滚。③ 电池养护位钳制后未重推导（M5）：读回 care=true + limit>100 垃圾值钳到 100 后，以上限重新推导养护位，杜绝"养护:开启·上限:100%"矛盾展示。④ WMI 应答无界阻塞（T1）：worker 调用改为 seq 配对 + `recv_timeout`（6s）熔断（wedged 后快速失败），过期应答按 seq 丢弃不污染后续调用——WMI 服务卡死不再永久冻结 GUI。⑤ EC 超时排查粒度（真机偶发 `EC 操作超时 0x66`）：`ec_wait_status` 增加语义化步骤名 + 实测端口值 + 耗时日志；读写各加一次瞬态重试（`retry_transient`）；最终 OBF 超时后清空数据端口防陈旧字节（R1）；寄存器地址 ≥0x100 显式报错防静默回绕（R2）。⑥ `wmi_util` 重复清理（H1b）：windows-rs 0.62 的 VARIANT 已实现 Drop，`OwnedVariant` 不再二次 VariantClear（注释与实现一致）。⑦ 后端初始化线程 panic 兜底（M4）：`catch_unwind` 捕获 init_backend 线程 panic，降级 NullBackend + 错误提示，GUI 照常启动。⑧ Fn 添加绑定下拉失效（L3）：egui 每帧重建 UI，局部选择变量被重置回默认——预设键码/动作选择持久到 `self`；捕获"使用此键"前缀按**完整字节**截断（奇数 hex 前缀匹配不到任何事件）。⑨ 托盘隐藏后窗口位置恢复（L1）：隐藏前记录在屏位置，显示时优先恢复（虚拟屏幕判定），副屏拔出等越界时回退居中。⑩ 配置保存竞态与即时落盘测试、`persist_autostart_request`/`retry_transient`/`ec_addr_u8`/`saved_pos_on_screen` 单测 | opencode |
+| 1.26 | 2026-08-17 | Fn 动作自定义内容暂缓规划：绑定动作目前仅 4 种内置，规划扩展为"运行脚本 / 打开程序 / 最小化或切换某程序"等用户自定义命令（`FnAction` 增加携带参数变体、配置向后兼容、异步线程执行不阻塞事件循环），见 3.11 范围说明 | opencode |
+| 1.27 | 2026-08-17 | **二轮评审回归（真机验证 + 双代理复查）**：① 开机自启动**过期失败回滚**：串行 worker 中先发请求的失败结果可能晚于更新请求落盘后到达（快速连点），无条件回滚会把配置覆盖成旧值、重新制造"任务在而配置关"背离——失败回滚仅当"当前配置仍等于该失败请求的期望值"时执行。② WMI 熔断后**同实例恢复**：超时熔断（wedged）后 `try_switch_backend` 的"同种后端 no-op"优化会跳过重建，WMI-only 机器上后端永久卡死到重启——新增 `EcBackend::needs_rebuild()`（WMI 熔断返回 true），切换逻辑在熔断态强制 `create_backend` 重建全新 worker。③ 熔断错误可读性：`battery()`/`perf()` 对熔断快速失败（`Unit(Err)`）如实透传"无响应（超时熔断，请切换后端重试）"，不再退化成笼统"响应异常"。④ 真机复验：本机实测双后端初始化/切换、Fn 监听订阅 HID_EVENT20、托盘/热键注册、Ctrl+Alt+B 实时切换养护（WMI 100%→80%）全部正常 | opencode |
 
 ---
 
@@ -81,7 +97,7 @@
 
 Xiaomi PC Manager Lite 是一款轻量级 Windows 桌面工具，为小米（含 Redmi）品牌笔记本电脑提供硬件管理功能。本系统覆盖的功能范围包括：
 
-- **范围内**：电池养护管理、性能模式切换、用户配置持久化、系统托盘驻留、全局快捷键、Fn+K 性能模式切换监控（WMI ACPI 事件）、开机自启动（计划任务）
+- **范围内**：电池养护管理、性能模式切换、用户配置持久化、系统托盘驻留、全局快捷键、Fn 功能键监控与自定义绑定（WMI ACPI 事件）、开机自启动（计划任务）
 - **范围外**：驱动安装/更新、BIOS 设置管理、硬件健康诊断、非小米笔记本支持、移动端版本
 
 系统通过两种备选技术路线实现与硬件 Embedded Controller 的通信：WinRing0 通过 I/O 端口直接读写 EC 内存；WMI 通过调用小米官方驱动提供的 `MICommonInterface` 接口实现。用户可在界面中切换后端。
@@ -235,7 +251,7 @@ graph TD
 | F-PERF-05 | 系统应提供函数 `PerfMode::from_ec_value(u8) -> Option<Self>`，输入不支持的 EC 值时返回 None | Should |
 | F-PERF-06 | 系统应提供函数 `PerfMode::name(&self) -> &'static str`，返回模式中文名称 | Should |
 | F-PERF-07 | 系统应提供函数 `PerfMode::all() -> &'static [Self]`，返回所有模式的枚举列表 | Should |
-| F-PERF-08 | 性能模式循环快捷键（Fn+K/Ctrl+Alt+P）的默认顺序应为：Smart → Quiet → Extreme → Smart ...（3 模式循环；Extreme 模式下自动根据电源状态选择实际 raw code：插电时用 Beast=`0x04`，电池时用 Fast=`0x03`） | Must |
+| F-PERF-08 | 性能模式循环快捷键（Fn+K，见 3.11 F-FNK）的默认顺序应为：Smart → Quiet → Extreme → Smart ...（3 模式循环；Extreme 模式下自动根据电源状态选择实际 raw code：插电时用 Beast=`0x04`，电池时用 Fast=`0x03`） | Must |
 | F-PERF-09 | 性能模式变更后，系统应立即将配置持久化到磁盘 | Must |
 
 #### 验收标准
@@ -243,7 +259,7 @@ graph TD
 - **AC-PERF-01**：在 GUI 中分别点击五种模式，风扇/散热策略响应变化
 - **AC-PERF-02**：GUI 中当前激活的模式按钮呈现蓝色高亮状态
 - **AC-PERF-03**：App 重启后，性能模式恢复为上次选中的模式
-- **AC-PERF-04**：通过 Fn+K 或全局快捷键 Ctrl+Alt+P 循环切换三种模式（Smart→Quiet→Extreme），Extreme 模式下插电为 Beast、电池为 Fast
+- **AC-PERF-04**：通过 Fn+K 循环切换三种模式（Smart→Quiet→Extreme），Extreme 模式下插电为 Beast、电池为 Fast
 
 ---
 
@@ -317,8 +333,10 @@ graph TD
 | | - `performance_mode: u8`（默认 `0x09`） | |
 | | - `auto_apply_on_startup: bool`（默认 `true`） | |
 | | - `auto_reapply_on_power_change: bool`（默认 `true`） | |
-| | - `backend: BackendPreference`（默认 `Auto`） | |
+| | - `auto_switch_to_quiet_on_battery: bool`（默认 `false`） | |
+| | - `backend: BackendPreference`（默认 `Wmi`） | |
 | | - `auto_start_on_boot: bool`（默认 `false`，用户主动勾选开启） | |
+| | - `fn_key_bindings: Vec<FnKeyBinding>`（默认 Fn+K → 循环切换性能模式） | |
 | F-CFG-04 | 系统应提供 `AppConfig::load() -> Self` 方法，文件不存在时返回全默认配置，文件损坏时不崩溃 | Must |
 | F-CFG-05 | 系统应提供 `AppConfig::save(&self) -> Result<(), String>` 方法，保存失败时不阻塞主流程 | Must |
 | F-CFG-06 | 任何用户通过 GUI 或快捷键更改设置后，系统应自动调用保存 | Must |
@@ -369,6 +387,8 @@ graph TD
 | F-GUI-24 | 命令 `ReapplyConfig`：将当前配置全部写入硬件 | Should |
 | F-GUI-25 | 窗口图标应使用嵌入式 `icon.png`，通过 `image` crate 解码 | Should |
 | F-GUI-26 | 设置区域应包含"开机自启动"复选框，状态与配置 `auto_start_on_boot` 同步，切换后立即生效并持久化 | Must |
+| F-GUI-27 | 状态区域应显示电源状态（交流/电池）与电池电量百分比 | Should |
+| F-GUI-28 | 状态区域应以进度条形式展示电池电量（<20% 红色警示、交流供电绿色、其余品牌蓝），电量未知时灰色占位 | Should |
 
 #### 验收标准
 
@@ -398,10 +418,15 @@ graph TD
 | F-TRAY-03 | 托盘图标应包含 Tooltip 文字提示 | Should |
 | F-TRAY-04 | 用户左键单击托盘图标应切换主窗口可见性 | Must |
 | F-TRAY-05 | 用户右键单击托盘图标应显示上下文菜单 | Must |
-| F-TRAY-06 | 右键菜单至少包含"显示/隐藏窗口"和"退出"两个菜单项，以分隔线隔开 | Must |
+| F-TRAY-06 | 右键菜单应包含"切换电池养护"和"切换性能模式"两个快捷操作项，以及"显示/隐藏窗口"和"退出"两个菜单项，以分隔线隔开 | Must |
 | F-TRAY-07 | 点击"退出"菜单项应触发完整应用退出 | Must |
 | F-TRAY-08 | 系统应创建一个**不可见的隐藏顶层窗口**（非 `HWND_MESSAGE` 消息专用窗口）用于接收 Windows 消息。消息专用窗口不参与桌面窗口层级，无法接收广播消息（如 `WM_POWERBROADCAST`），会导致 F-TRAY-09 中的电源事件监听失效 | Must |
+| F-TRAY-08a | 主窗口"隐藏到托盘"应通过**移到屏幕外**实现（`SetWindowPos(-32000,-32000)`，保持 `WS_VISIBLE`），而非 `ShowWindow(SW_HIDE)`：隐藏窗口不接收 `WM_PAINT` → winit 不派发 `RedrawRequested` → eframe `update()` 停止，托盘/热键/Fn+K/电源命令全部积压到窗口恢复才执行（实测回归，修订 1.19） | Must |
 | F-TRAY-09 | 消息窗口应能注册并接收以下消息：`WM_TRAY_NOTIFY`, `WM_HOTKEY`, `WM_POWERBROADCAST` | Must |
+| F-TRAY-10 | Tooltip 应实时展示当前性能模式与电池养护状态（共享 `TrayStatus` 状态，窗口隐藏到托盘后仍由托盘定时器周期刷新） | Should |
+| F-TRAY-11 | Tooltip 应展示电源状态（交流/电池）与电量百分比（`GetSystemPowerStatus`） | Should |
+| F-TRAY-12 | 右键菜单应提供"性能模式"子菜单：列出全部 5 种模式、当前模式勾选、点击直接切换 | Should |
+| F-TRAY-13 | 主窗口隐藏到托盘后，性能模式或电池养护状态变化时应弹托盘气泡通知（`NIF_INFO`）反馈；窗口可见时不弹（用户可直接看到 GUI 变化） | Should |
 
 #### 验收标准
 
@@ -409,6 +434,12 @@ graph TD
 - **AC-TRAY-02**：关闭窗口后 App 仍然在托盘运行
 - **AC-TRAY-03**：左键点击托盘图标交替显示/隐藏窗口
 - **AC-TRAY-04**：右键菜单显示正确，点击"退出"后进程完全退出
+- **AC-TRAY-05**：托盘右键"切换电池养护"与"切换性能模式"快捷项生效，窗口隐藏时同样可操作
+- **AC-TRAY-06**：窗口隐藏后悬停托盘图标，Tooltip 显示的性能模式/养护状态与硬件实际状态一致
+- **AC-TRAY-07**：托盘右键"性能模式"子菜单列出 5 种模式并勾选当前模式，点击直接切换
+- **AC-TRAY-08**：Tooltip 显示交流/电池与电量百分比，与系统电池信息一致
+- **AC-TRAY-09**：窗口隐藏到托盘后，Ctrl+Alt+B / Fn+K / 托盘菜单命令即时生效（≤500ms），无需先恢复窗口
+- **AC-TRAY-10**：窗口隐藏时通过 Ctrl+Alt+B 或托盘菜单切换电池养护，托盘气泡显示"电池养护: 已启用/已停用"；Fn+K 切换性能模式显示"性能模式: xxx"
 
 ---
 
@@ -425,7 +456,7 @@ graph TD
 | 编号 | 需求描述 | 优先级 |
 |------|---------|--------|
 | F-HOTKEY-01 | 系统应注册全局快捷键 `Ctrl+Alt+B`，用于切换电池养护启用状态 | Must |
-| F-HOTKEY-02 | 系统应注册全局快捷键 `Ctrl+Alt+P`，用于循环切换性能模式 | Must |
+| F-HOTKEY-02 | 循环切换性能模式应优先通过 **Fn 功能键绑定**（默认 Fn+K → `CyclePerfMode`，见 3.11 F-FNK）触发，无需注册额外的全局快捷键 | Must |
 | F-HOTKEY-03 | 快捷键应通过 Windows API `RegisterHotKey` 注册到消息窗口 | Must |
 | F-HOTKEY-04 | 消息窗口收到 `WM_HOTKEY` 后应通过 `mpsc` 发送 `UiCommand::ToggleBatteryCare` 或 `UiCommand::CyclePerfMode` | Must |
 | F-HOTKEY-05 | 快捷键触发的命令执行结果应在可视化状态中即时反馈 | Should |
@@ -433,7 +464,7 @@ graph TD
 #### 验收标准
 
 - **AC-HOTKEY-01**：App 后台运行时（窗口隐藏），按下 Ctrl+Alt+B 切换电池养护，再次按下恢复
-- **AC-HOTKEY-02**：按下 Ctrl+Alt+P 在五种模式间循环，每次切换后如果 GUI 窗口可见，状态立即更新
+- **AC-HOTKEY-02**：按下 Fn+K 在五种模式间循环，每次切换后如果 GUI 窗口可见，状态立即更新
 
 ---
 
@@ -454,11 +485,15 @@ graph TD
 | F-PWR-03 | 收到电源状态变更事件时，如果配置中 `auto_reapply_on_power_change` 为 `true`，应发送 `UiCommand::ReapplyConfig` 命令 | Must |
 | F-PWR-04 | 重新应用操作不应重置用户修改中的滑块或按钮状态 | Should |
 | F-PWR-05 | GUI 设置中应包含控制此功能的复选框，默认启用 | Should |
+| F-PWR-06 | 系统应识别休眠唤醒事件（`PBT_APMRESUMEAUTOMATIC`/`PBT_APMRESUMESUSPEND`）并重新应用配置（休眠期间 EC/固件可能重置寄存器） | Should |
+| F-PWR-07 | GUI 设置应提供"电池供电时自动切换节能"复选框：开启后拔电自动切到节能模式，插回电源恢复用户所选模式（`auto_switch_to_quiet_on_battery`，默认关闭） | Should |
 
 #### 验收标准
 
 - **AC-PWR-01**：插拔 AC 电源适配器时，电池护理和性能模式被重新写入硬件
 - **AC-PWR-02**：GUI 中"电源变更时重新应用"复选框取消后，插拔电源不触发重写
+- **AC-PWR-03**：休眠唤醒后设置被重新应用（唤醒后硬件状态与配置一致）
+- **AC-PWR-04**：开启"电池供电时自动切换节能"并拔电后，性能模式自动切换为节能；插回电源恢复原模式
 
 ---
 
@@ -525,41 +560,48 @@ graph TD
 
 ---
 
-### 3.11 Fn+K 性能模式切换监控
+### 3.11 Fn 功能键监控与自定义绑定
 
 **标识符**：F-FNK
 
-**描述**：系统应监控笔记本厂商自定义的 Fn+K 组合键，按下时循环切换性能模式。
+**描述**：系统应监控笔记本厂商自定义的 Fn 功能键事件（WMI ACPI 事件），并将按键事件与可配置的绑定表做前缀匹配，命中后派发用户绑定的动作。
 
-**触发条件**：用户按下笔记本上的 Fn+K 组合键。
+**触发条件**：用户按下笔记本上的 Fn 组合键或其他功能键。
 
 **优先级**：Could
 
-> **范围说明**：早期版本曾规划监控全部功能键（Fn 锁、麦克风静音、键盘背光等）并支持自定义映射与 OSD，现已收缩为**仅 Fn+K 性能模式切换**（见修订记录 1.2）。其余功能键事件到达时不得产生任何动作，仅记录日志。
+> **范围说明**：早期版本曾规划监控全部功能键并支持 OSD，后收缩为仅 Fn+K（修订 1.2），现于修订 1.12 扩展为**可自定义绑定表**：默认仍是 Fn+K → 循环切换性能模式，用户可在 GUI"Fn 功能键"设置中添加/修改/删除绑定（动作：循环切换性能模式 / 切换电池养护 / 重新应用设置 / 无动作），并可开启"捕获功能键事件"实时观察真实键码。其余功能键事件到达时若未绑定，不产生任何动作，仅记录日志。
+>
+> **规划中（暂缓实现，修订 1.26 记录）**：绑定动作目前仅有 4 种内置选项，计划扩展为**用户自定义动作**——绑定到"运行脚本 / 打开程序 / 最小化或切换某程序"等任意命令。实现时 `FnAction` 需增加携带参数的外部命令变体（如 `RunCommand(String)`），配置格式向后兼容（新增字段带默认值），并在 fnkey 监听线程派发时以独立进程方式启动外部命令（`std::process::Command`），确保不阻塞 WMI 事件循环。暂缓原因：涉及动作参数化设计、配置兼容与进程启动的安全边界，待核心功能稳定后实现。
 
 #### 实现原理
 
-系统应通过 **WMI 事件订阅** 方式监听固件发出的 ACPI WMI 事件，从事件参数中提取按键信息，匹配 Fn+K 键码后循环切换性能模式。具体数据流如下：
+系统应通过 **WMI 事件订阅** 方式监听固件发出的 ACPI WMI 事件，从事件参数中提取按键信息，与**配置的绑定表**（`fn_key_bindings`，每条 = 事件类 + 报告前缀 + 动作）做前缀匹配，命中后派发对应动作。具体数据流如下：
 
-1. 系统在 WMI 命名空间 `root\WMI` 上创建事件订阅，监听 OEM ACPI 事件类 `HID_EVENT20` 的事件
-2. 固件在用户按下 Fn+K 时触发 WMI 事件，传递包含按键信息的 `EventDetail` 字节数组
+1. 系统在 WMI 命名空间 `root\WMI` 上为**绑定表中出现的事件类**创建事件订阅（默认 Fn+K 所在类 `HID_EVENT20`；类不存在时跳过，由重试逻辑等待 OEM 提供程序就绪）
+2. 固件在用户按下功能键时触发 WMI 事件，传递包含按键信息的 `EventDetail` 字节数组
 3. 系统将 `EventDetail` 转换为大写十六进制字符串；若 `EventDetail` 不存在，回退读取 `ReportHex` 字符串属性
-4. 系统将十六进制字符串统一归一化（剔除分隔符等非字母数字字符、转大写），与 Fn+K 按下键码 `012801`（原始格式 `01-28-01`，含按下状态字节 `01`）做前缀匹配
-5. 匹配成功后，系统发送 `UiCommand::CyclePerfMode` 命令循环切换性能模式；释放事件（`012800`）不命中按下前缀，一次物理按键恰好触发一次切换
+4. 系统将十六进制字符串统一归一化（剔除分隔符等非十六进制字符、转大写），与每条绑定的 `prefix` 做**前缀匹配**；命中第一条即消费并派发该绑定的动作（与 Meow-Box 的 first-matching 语义一致）
+5. 绑定动作 → `UiCommand` 映射：`CyclePerfMode`→循环切换性能模式、`ToggleBatteryCare`→切换电池养护、`ReapplyConfig`→重新应用设置、`None`→只消费不派发
+6. Fn+K 默认绑定前缀为 `012801`（含按下状态字节 `01`）：释放事件（`012800`）不命中此前缀，一次物理按键恰好触发一次动作
 
 #### 功能需求
 
 | 编号 | 需求描述 | 优先级 |
 |------|---------|--------|
-| F-FNK-01 | 系统应在 WMI 命名空间 `root\WMI` 上订阅 OEM ACPI 事件类 `HID_EVENT20`（Fn+K 所在的事件类） | Must |
-| F-FNK-02 | 系统应使用 WQL 查询 `SELECT * FROM HID_EVENT20` 注册事件监听 | Must |
+| F-FNK-01 | 系统应在 WMI 命名空间 `root\WMI` 上订阅**绑定表中出现的事件类**（默认 `HID_EVENT20`） | Must |
+| F-FNK-02 | 系统应使用 WQL 查询 `SELECT * FROM <事件类>` 注册事件监听 | Must |
 | F-FNK-03 | 系统应从 WMI 事件中提取 `EventDetail`（字节数组）并转换为大写十六进制字符串；若 `EventDetail` 不存在，应回退读取 `ReportHex` 字符串属性 | Must |
-| F-FNK-04 | 事件匹配应采用**前缀匹配**：将事件十六进制字符串统一归一化（剔除分隔符等非字母数字字符并转大写）后，检查是否以 Fn+K 按下键码 `012801`（`01-28-01`）开头 | Must |
-| F-FNK-05 | 匹配成功后，系统应发送 `UiCommand::CyclePerfMode` 循环切换性能模式 | Must |
+| F-FNK-04 | 事件匹配应采用**前缀匹配**：将事件十六进制字符串统一归一化（剔除分隔符等非十六进制字符并转大写）后，与绑定 `prefix` 比较 | Must |
+| F-FNK-05 | 绑定表 `fn_key_bindings` 应持久化在配置中，默认含一条 Fn+K → `CyclePerfMode`（`012801`） | Must |
 | F-FNK-06 | Fn+K 释放事件（`012800`）不得触发切换，保证一次物理按键恰好触发一次动作 | Must |
 | F-FNK-07 | 事件监听应具备自恢复能力：订阅失败（WMI 服务未就绪/OEM 驱动加载较晚）时应低频重试（不得忙循环）；运行期连接失效（枚举器失败、休眠唤醒、WMI 服务重启）时应重建连接后重新订阅 | Must |
 | F-FNK-08 | 系统应记录收到的所有未匹配 WMI 按键事件到调试日志 | Should |
-| F-FNK-09 | 除 Fn+K 外的其他功能键（Fn 锁、大写锁定、麦克风静音、键盘背光、投影、设置、小爱同学、PC Manager 等）事件即使到达，也不得产生任何动作，仅记录日志 | Must |
+| F-FNK-09 | 未绑定的功能键（Fn 锁、大写锁定、麦克风静音、键盘背光、投影、设置、小爱同学、PC Manager 等）事件到达时不得产生任何动作，仅记录日志 | Must |
+| F-FNK-10 | 系统应在 GUI 设置区提供"Fn 功能键"绑定编辑：列表显示绑定（类/前缀/动作），可修改动作、删除绑定、按预设键码添加 | Should |
+| F-FNK-11 | 绑定修改后应立即持久化并同步到监听线程（共享绑定表），无需重启应用生效 | Must |
+| F-FNK-12 | 系统应提供"捕获功能键事件"模式：开启后收到的每条事件实时回传 GUI 展示（类 + 归一化 hex），并可"绑定为指定动作 → 使用此键"直接添加绑定。**捕获期间应订阅绑定表中的类 ∪ 全部已知功能键事件类**（`capture_classes`），保证删除全部绑定后仍能捕获/发现新键（修订 1.22） | Should |
+| F-FNK-13 | 绑定表加载时应消毒：丢弃空类/空前缀条目（空前缀匹配一切，属危险配置），避免手改配置把监听变成全匹配 | Must |
 
 #### ReportHex 格式说明
 
@@ -574,7 +616,10 @@ Fn+K 的键码 `ReportHex` 格式为 `01-28-YY`，其中：
 - **AC-FNK-02**：按下/释放一次 Fn+K 恰好触发一次切换（释放事件不重复触发）
 - **AC-FNK-03**：系统开机 24 小时连续运行，WMI 事件订阅不丢失、不崩溃
 - **AC-FNK-04**：调试日志中记录了所有收到的 WMI 功能键事件
-- **AC-FNK-05**：按下 Fn 锁等其他功能键不产生任何动作，仅记录日志
+- **AC-FNK-05**：未绑定的其他功能键不产生任何动作，仅记录日志
+- **AC-FNK-06**：在 GUI 中把某键绑定改为"切换电池养护"并保存，随后按下该键养护状态翻转，重启应用后绑定保持
+- **AC-FNK-07**：开启"捕获功能键事件"后按下任意功能键，GUI 实时显示事件类与归一化 hex，可据此添加新绑定
+- **AC-FNK-08**：手改配置文件加入空前缀/空类绑定时，应用启动自动丢弃并记录日志，监听不进入全匹配
 
 ---
 
