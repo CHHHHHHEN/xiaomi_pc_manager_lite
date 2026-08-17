@@ -1,47 +1,280 @@
-use std::sync::mpsc;
+//! Fn 功能键 WMI 事件监听（可自定义绑定）。
+//!
+//! 监听 OEM ACPI 事件类（`HID_EVENT20` 等），把固件报告（`EventDetail` /
+//! `ReportHex`）与配置中的绑定表（`FnKeyBinding`）做**前缀匹配**，命中后
+//! 派发对应的 `UiCommand`。
+//!
+//! 默认只有 Fn+K（`012801` → 循环切换性能模式），与历史硬编码行为一致；
+//! 用户可在 GUI"Fn 功能键"设置中添加/修改/删除绑定，绑定表通过
+//! `SharedBindings`（`Arc<RwLock<Vec<FnKeyBinding>>>`）与 GUI 线程共享——
+//! 保存即即时生效，无需重启应用或重连监听。
+//!
+//! 事件类参考（Meow-Box / 本机 2025 RedmiBook Pro 14 实证）：HID_EVENT20
+//! 承载 Fn+K 等按键报告；其余类（HID_EVENT21-23、WMIEvent）在不同机型/固件
+//! 上承载不同的功能键事件。本实现只订阅绑定表中出现的事件类（绑定为空且
+//! 未捕获时监听闲置，不浪费连接）。
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::sync::{Arc, RwLock};
+
+use serde::{Deserialize, Serialize};
+use windows::core::BSTR;
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
-use windows::Win32::System::Wmi::*;
-use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::System::Ole::{
     SafeArrayAccessData, SafeArrayGetLBound, SafeArrayGetUBound, SafeArrayUnaccessData,
 };
-use windows::core::BSTR;
+use windows::Win32::System::Wmi::*;
 
-use windows::Win32::System::Variant::{VARENUM, VT_ARRAY, VT_UI1, VariantClear};
+use windows::Win32::System::Variant::{VARENUM, VT_ARRAY, VT_UI1};
 
 use crate::command::UiCommand;
 
 /// Fn+K 所在的 OEM ACPI 事件类（F-FNK-01）。
-const FN_K_WMI_CLASS: &str = "HID_EVENT20";
-
-/// 订阅的事件类：不存在的类会被 ExecNotificationQuery 拒绝并跳过，
-/// 由订阅重试逻辑低频重试等待 OEM 提供程序就绪。
-const WMI_CLASSES: &[&str] = &[FN_K_WMI_CLASS];
+pub const FN_K_WMI_CLASS: &str = "HID_EVENT20";
 
 /// Fn+K 按下事件的 ReportHex 前缀：`01-28-01`（固定前缀 `01` + 键码
 /// `28` + 按下状态 `01`，见 F-FNK-04）。释放事件（`012800`）不命中
 /// 此前缀，一次物理按键恰好派发一次切换（F-FNK-06）。
-const FN_K_PRESS_PREFIX: &str = "012801";
+pub const FN_K_PRESS_PREFIX: &str = "012801";
+
+/// Fn 键可绑定的动作（枚举名即配置文本，不得破坏性改名）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FnAction {
+    /// 循环切换性能模式（Smart → Quiet → Extreme → Smart）。
+    CyclePerfMode,
+    /// 切换电池养护启用状态。
+    ToggleBatteryCare,
+    /// 把持久化配置整份重新应用到硬件（与"电源切换时自动重设"同一路径）。
+    ReapplyConfig,
+    /// 绑定保留但禁用（事件命中时被消费、不派发命令）。
+    None,
+}
+
+impl FnAction {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::CyclePerfMode => "循环切换性能模式",
+            Self::ToggleBatteryCare => "切换电池养护",
+            Self::ReapplyConfig => "重新应用设置",
+            Self::None => "无动作",
+        }
+    }
+
+    pub fn all() -> &'static [FnAction] {
+        &[
+            Self::CyclePerfMode,
+            Self::ToggleBatteryCare,
+            Self::ReapplyConfig,
+            Self::None,
+        ]
+    }
+
+    /// 动作对应的 UI 命令；`None` 时返回 None（绑定仅消费事件，不派发）。
+    /// 按 Rust 惯例命名：`as_*` 表示"便宜的借用读取"（`&self`），而 `to_*`
+    /// 保留给消耗型转换——这里返回轻量 `Option<UiCommand>`，用 `as_` 前缀
+    /// 顺带消除 clippy 的 `wrong_self_convention` 告警。
+    pub fn as_ui_command(&self) -> Option<UiCommand> {
+        match self {
+            Self::CyclePerfMode => Some(UiCommand::CyclePerfMode),
+            Self::ToggleBatteryCare => Some(UiCommand::ToggleBatteryCare),
+            Self::ReapplyConfig => Some(UiCommand::ReapplyConfig),
+            Self::None => None,
+        }
+    }
+}
+
+/// 一条 Fn 功能键绑定：事件类 + 报告前缀 → 动作。
+///
+/// 前缀匹配（`normalize_hex` 后 starts_with）：绑定的 `prefix` 是归一化
+/// 十六进制（如 `012801`），事件报告归一化后以此为前缀即命中。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FnKeyBinding {
+    /// OEM ACPI 事件类（如 `HID_EVENT20`）。
+    pub class: String,
+    /// 归一化事件前缀（如 `012801`）。
+    pub prefix: String,
+    /// 命中后派发的动作。
+    pub action: FnAction,
+}
+
+impl FnKeyBinding {
+    /// 默认的 Fn+K 绑定（与历史硬编码行为完全一致）。
+    pub fn fn_k() -> Self {
+        Self {
+            class: FN_K_WMI_CLASS.to_string(),
+            prefix: FN_K_PRESS_PREFIX.to_string(),
+            action: FnAction::CyclePerfMode,
+        }
+    }
+
+    /// GUI 展示标签，如 `HID_EVENT20 / 01-28-01`。
+    pub fn label(&self) -> String {
+        format!("{} / {}", self.class, Self::display_prefix(&self.prefix))
+    }
+
+    /// 归一化 hex → 带分隔符可读形式（`012801` → `01-28-01`），便于与
+    /// 用户观察到的按键编码对照。
+    pub fn display_prefix(prefix: &str) -> String {
+        let p = normalize_hex(prefix);
+        p.as_bytes()
+            .chunks(2)
+            .map(|c| std::str::from_utf8(c).unwrap_or("??"))
+            .collect::<Vec<_>>()
+            .join("-")
+    }
+}
+
+/// 默认的功能键绑定（Fn+K → 循环切换性能）。
+pub fn default_bindings() -> Vec<FnKeyBinding> {
+    vec![FnKeyBinding::fn_k()]
+}
+
+/// 共享绑定表：GUI 线程写（保存配置时同步更新）、监听线程读。
+pub type SharedBindings = std::sync::Arc<RwLock<Vec<FnKeyBinding>>>;
+
+/// 已知的 Fn 键目录（用于 GUI"添加绑定"预设与捕获提示）。
+///
+/// 键码来自 Meow-Box 项目（Xiaomi Book Pro 14）与 F-FNK 文档（2025
+/// RedmiBook Pro 14 实测）。同一事件类内不同键的编码；前缀取"按下"事件
+/// 的最短可区分字节（含按下状态字节），避免释放/状态变化事件重复命中。
+#[derive(Debug, Clone, Copy)]
+pub struct KnownFnKey {
+    /// 事件类名（`HID_EVENT20` 等）。
+    pub class: &'static str,
+    /// 归一化前缀。
+    pub prefix: &'static str,
+    /// 中文名。
+    pub name: &'static str,
+}
+
+pub const KNOWN_FN_KEYS: &[KnownFnKey] = &[
+    // Fn+K：用按下状态字节完整前缀（012801），避免释放事件（012800）
+    // 也命中造成一次按键派发两次动作。
+    KnownFnKey {
+        class: "HID_EVENT20",
+        prefix: "012801",
+        name: "Fn+K 性能模式",
+    },
+    KnownFnKey {
+        class: "HID_EVENT20",
+        prefix: "0125",
+        name: "PC Manager 键",
+    },
+    KnownFnKey {
+        class: "HID_EVENT20",
+        prefix: "0123",
+        name: "小爱同学 (F7)",
+    },
+    KnownFnKey {
+        class: "HID_EVENT20",
+        prefix: "011B",
+        name: "设置 (F9)",
+    },
+    KnownFnKey {
+        class: "HID_EVENT20",
+        prefix: "0101",
+        name: "投影 (F8)",
+    },
+    KnownFnKey {
+        class: "HID_EVENT20",
+        prefix: "0121",
+        name: "麦克风静音 (F4)",
+    },
+    KnownFnKey {
+        class: "HID_EVENT20",
+        prefix: "0107",
+        name: "Fn 锁 (Fn+Esc)",
+    },
+    KnownFnKey {
+        class: "HID_EVENT20",
+        prefix: "0109",
+        name: "大写锁定",
+    },
+];
 
 struct SafeEnumerator(IEnumWbemClassObject);
-// SAFETY: SafeEnumerator is only used on the dedicated Fn+K watcher thread.
+// SAFETY: SafeEnumerator is only used on the dedicated Fn watcher thread.
 // COM is initialized in MTA on that thread, and the enumerator is never
 // accessed from any other thread.
 unsafe impl Send for SafeEnumerator {}
 
-pub fn spawn(cmd_tx: mpsc::Sender<UiCommand>) {
+/// 启动 Fn 功能键监听线程。
+///
+/// - `bindings`：共享绑定表（GUI 保存配置时同步更新，即时生效）；
+/// - `capture`：捕获开关。开启后，收到的**每条**事件都以
+///   `UiCommand::FnEventSeen { class, hex }` 发送给 GUI 展示，方便用户
+///   观察真实键码、配置新绑定。
+pub fn spawn(
+    cmd_tx: mpsc::Sender<UiCommand>,
+    bindings: SharedBindings,
+    capture: Arc<AtomicBool>,
+    ctx: egui::Context,
+) {
     std::thread::spawn(move || {
-        if let Err(e) = run_watcher(&cmd_tx) {
-            log::error!("Fn+K watcher: {}", e);
+        // 注入 egui Context 到本线程线程局部存储：dispatch 发送命令后用它
+        // 唤醒隐藏的 GUI 事件循环（与托盘 send_command 同理）。
+        WATCHER_CTX.with(|c| *c.borrow_mut() = Some(ctx));
+        // Fn 监听线程生命周期日志：该线程本应无限运行（内部是无限重试
+        // 循环），正常情况下只有进程退出才结束。记录 start/end 两端的
+        // 时间点，"Fn 静默失效"时能确认线程是否还活着。
+        log::info!("Fn watcher thread started");
+        if let Err(e) = run_watcher(&cmd_tx, &bindings, &capture) {
+            log::error!("Fn watcher: {}", e);
+        }
+        log::info!("Fn watcher thread exited");
+    });
+}
+
+// 发送命令并立即唤醒 GUI 事件循环：把命令延迟压到最小（egui 的 mpsc 不
+// 唤醒事件循环，500ms 定时帧是兜底；发送后 request_repaint 即时消费，
+// 托盘/Fn 交互响应更快）。窗口离屏隐藏时 update 循环仍运行，命令同样
+// 会被消费（见 platform::window 的修订 1.19）。
+thread_local! {
+    static WATCHER_CTX: std::cell::RefCell<Option<egui::Context>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn send_watcher_command(cmd_tx: &mpsc::Sender<UiCommand>, cmd: UiCommand) {
+    if let Err(e) = cmd_tx.send(cmd) {
+        log::warn!("Fn watcher: command send failed: {}", e);
+    }
+    WATCHER_CTX.with(|c| {
+        if let Some(ctx) = c.borrow().as_ref() {
+            ctx.request_repaint();
         }
     });
 }
 
-/// 订阅 WMI 事件类；不存在的类会被 ExecNotificationQuery 拒绝并跳过。
+/// 从绑定表提取需要订阅的事件类集合（去重、稳定排序）。
+fn binding_classes(bindings: &[FnKeyBinding]) -> Vec<String> {
+    let mut v: Vec<String> = bindings.iter().map(|b| b.class.clone()).collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// 捕获模式下需要订阅的事件类集合：绑定表中的类 ∪ 全部已知类的并集
+/// （KNOWN_FN_KEYS 的 class 去重、稳定排序）。
+///
+/// 捕获的目的正是"发现未绑定的新键"（F-FNK-12）：若只订阅绑定表中的类，
+/// 用户删除全部绑定后捕获将收不到任何事件（实测修正，修订 1.22）。
+fn capture_classes(bindings: &[FnKeyBinding]) -> Vec<String> {
+    let mut v = binding_classes(bindings);
+    for k in KNOWN_FN_KEYS {
+        if !v.contains(&k.class.to_string()) {
+            v.push(k.class.to_string());
+        }
+    }
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// 订阅给定的事件类；不存在的类会被 ExecNotificationQuery 拒绝并跳过。
 /// 返回成功订阅的 (类名, 枚举器) 列表。
-fn subscribe(services: &IWbemServices) -> Vec<(&'static str, SafeEnumerator)> {
-    WMI_CLASSES
+fn subscribe(services: &IWbemServices, classes: &[String]) -> Vec<(String, SafeEnumerator)> {
+    classes
         .iter()
         .filter_map(|class_name| {
             let query = format!("SELECT * FROM {}", class_name);
@@ -54,11 +287,11 @@ fn subscribe(services: &IWbemServices) -> Vec<(&'static str, SafeEnumerator)> {
                 )
             } {
                 Ok(e) => {
-                    log::info!("Fn+K: subscribed to {}", class_name);
-                    Some((*class_name, SafeEnumerator(e)))
+                    log::info!("Fn: subscribed to {}", class_name);
+                    Some((class_name.clone(), SafeEnumerator(e)))
                 }
                 Err(_) => {
-                    log::warn!("Fn+K: cannot subscribe to {} (not available)", class_name);
+                    log::warn!("Fn: cannot subscribe to {} (not available)", class_name);
                     None
                 }
             }
@@ -69,7 +302,7 @@ fn subscribe(services: &IWbemServices) -> Vec<(&'static str, SafeEnumerator)> {
 /// run_watcher_once 的退出原因（供外层 run_watcher 决定重试节奏）。
 enum WatcherError {
     /// 本周期内从未订阅到任何事件类（连续 30s 空订阅）：最可能是本机
-    /// 根本没有该 OEM 事件类（如非小米机型），重建连接也无法改变——
+    /// 根本没有这些 OEM 事件类（如非小米机型），重建连接也无法改变——
     /// 需要退避，避免无限高频重建连接并刷屏日志。
     NoEventClasses,
     /// 连接/订阅阶段失败，或订阅后连接失效（Next 失败后重订阅仍为空）：
@@ -78,58 +311,73 @@ enum WatcherError {
     Reconnect(String),
 }
 
-/// Fn+K 监听主循环（可重入）：COM 初始化、连接 root\wmi、订阅事件类都在
-/// 这里完成。连接阶段的任何失败（如 WMI 服务尚未就绪、OEM 提供程序加载
-/// 较晚）以及运行期连接失效（Next 失败后重订阅仍无结果、空订阅持续 30s）
-/// 都会返回 Err 由外层 run_watcher 延时重试，监听不会因启动时的瞬时故障
-/// 或 WMI 服务重启而永久失效（F-FNK-07 的自恢复设计）。
-fn run_watcher_once(cmd_tx: &mpsc::Sender<UiCommand>) -> Result<(), WatcherError> {
-    // COM 公寓初始化与每次退出的 CoUninitialize 严格配对：run_watcher 的
-    // 重试循环会在同一条线程上反复进入本函数，若只 init 不 uninit，公寓
-    // 引用计数随重试周期无限增长。虽然对同一 MTA 的重复 init 返回 S_FALSE
-    // 且无实际资源泄漏，但正确模式是在每次周期结束时把引用计数归零，
-    // 使下一周期从干净的公寓状态开始（F-FNK-07 高频重试下的资源卫生）。
+/// Fn 监听主循环（可重入）：COM 初始化、连接 root\wmi、订阅事件类都在
+/// 这里完成。连接阶段的任何失败以及运行期连接失效（Next 失败后重订阅仍
+/// 无结果、空订阅持续 30s）都会返回 Err 由外层 run_watcher 延时重试。
+fn run_watcher_once(
+    cmd_tx: &mpsc::Sender<UiCommand>,
+    bindings: &SharedBindings,
+    capture: &AtomicBool,
+) -> Result<(), WatcherError> {
+    // COM 公寓初始化与每次退出的 CoUninitialize 严格配对（见历史注释：
+    // 高频重试周期内重复 init/uninit 不泄漏，但配对是正确模式）。
     unsafe {
         CoInitializeEx(None, COINIT_MULTITHREADED)
             .ok()
             .map_err(|e| WatcherError::Reconnect(format!("COM init: {}", e)))?;
     }
-    let result = run_watcher_loop(cmd_tx);
+    let result = run_watcher_loop(cmd_tx, bindings, capture);
     unsafe {
         CoUninitialize();
     }
     result
 }
 
-/// run_watcher_once 的 COM 已初始化部分：从创建 WbemLocator 到事件循环
-/// 结束。退出时 COM 引用计数由外层 run_watcher_once 统一归零。
-fn run_watcher_loop(cmd_tx: &mpsc::Sender<UiCommand>) -> Result<(), WatcherError> {
+fn run_watcher_loop(
+    cmd_tx: &mpsc::Sender<UiCommand>,
+    bindings: &SharedBindings,
+    capture: &AtomicBool,
+) -> Result<(), WatcherError> {
     let services = crate::ec::wmi_util::connect_root_wmi().map_err(WatcherError::Reconnect)?;
 
-    log::info!("Fn+K watcher connected to root\\wmi");
+    log::info!("Fn watcher connected to root\\wmi");
 
-    let mut enumerators: Vec<(&'static str, SafeEnumerator)> = subscribe(&services);
-    // 空订阅连续失败计数：提供程序可能只是加载较晚（值得同连接重试几轮），
-    // 但若连接本身已死（winmgmt 重启、休眠唤醒后旧会话失效），在同一个
-    // services 上重订阅将永远失败——必须返回 Err 由外层 run_watcher 重建
-    // 连接（见下方两处返回点，F-FNK-07 的自恢复要求）。
+    let mut enumerators: Vec<(String, SafeEnumerator)> = Vec::new();
+    // 当前已订阅的类集合（用于检测绑定变化后重订阅）。
+    let mut subscribed_classes: Vec<String> = Vec::new();
     let mut empty_streak: u32 = 0;
 
     loop {
+        // 绑定表变化（GUI 添加/删除绑定 → 事件类集合可能变化）时重订阅。
+        // 捕获模式下额外订阅全部已知类（见 capture_classes 注释）。
+        let capturing = capture.load(Ordering::Relaxed);
+        let classes = if capturing {
+            capture_classes(&lock_or_recover_bindings(bindings))
+        } else {
+            binding_classes(&lock_or_recover_bindings(bindings))
+        };
+        if classes != subscribed_classes {
+            subscribed_classes = classes.clone();
+            enumerators = subscribe(&services, &classes);
+            empty_streak = 0;
+        }
+
         if enumerators.is_empty() {
             empty_streak += 1;
-            // 连续约 30 秒（6 次 × 5s）没有任何事件类可用：连接极可能已失效，
-            // 继续同连接重试没有意义，返回 Err 让外层重建 locator/services
-            // 连接后重新订阅，而不是让监听永久失效。
+            // 没有绑定且未捕获时，没有订阅任何类是正常状态：空转等待
+            // 新绑定（GUI 添加绑定后下一轮即订阅），不刷屏日志。
+            if subscribed_classes.is_empty() && !capturing {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                continue;
+            }
             if empty_streak >= 6 {
                 return Err(WatcherError::NoEventClasses);
             }
-            // 没有任何事件类订阅成功：WMI 提供程序可能只是尚未就绪（如开机
-            // 时 OEM 驱动加载较晚、WMI 服务重启）。低频休眠后重试订阅，既不
-            // 烧 CPU 也能在提供程序就绪后自动恢复 Fn+K 事件（F-FNK-07）。
-            log::warn!("Fn+K: no WMI event classes available; retrying in 5s");
+            log::warn!(
+                "Fn: no event classes available; retrying in 5s (capture={})",
+                capturing
+            );
             std::thread::sleep(std::time::Duration::from_secs(5));
-            enumerators = subscribe(&services);
             continue;
         }
         empty_streak = 0;
@@ -142,16 +390,10 @@ fn run_watcher_loop(cmd_tx: &mpsc::Sender<UiCommand>) -> Result<(), WatcherError
             let hr = unsafe { enumerator.Next(100, &mut objects, &mut returned as *mut u32) };
 
             if hr.is_err() {
-                // Next() 失败时（如 WMI 提供程序连接断开、服务重启、休眠唤醒
-                // 后枚举器失效）会立即返回错误码。若不做延迟，该循环将零休眠
-                // 地重复调用失败接口，造成 100% CPU 忙循环。
                 log::warn!(
-                    "Fn+K: IEnumWbemClassObject::Next failed (hr=0x{:08X}); resubscribing in 1s",
+                    "Fn: IEnumWbemClassObject::Next failed (hr=0x{:08X}); resubscribing in 1s",
                     hr.0 as u32
                 );
-                // 失败后原地重试 Next 无法恢复：前向枚举器在提供程序断开后
-                // 会永久返回错误（如 WBEM_E_INVALID_ENUMERATION）。必须重新
-                // 订阅，否则 Fn+K 事件静默失效直到应用重启。
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 resubscribe = true;
                 break;
@@ -162,16 +404,11 @@ fn run_watcher_loop(cmd_tx: &mpsc::Sender<UiCommand>) -> Result<(), WatcherError
             }
 
             if let Some(ref obj) = objects[0] {
-                process_event(obj, class_name, cmd_tx);
+                process_event(obj, class_name, bindings, capture, cmd_tx);
             }
         }
         if resubscribe {
-            // Next 失败可能只是单个枚举器/提供程序故障，也可能是整个连接
-            // 断开（winmgmt 重启、休眠唤醒后旧会话失效）。先用现有连接
-            // 重订阅一次；若仍无任何类可用，说明连接本身已死——必须返回
-            // Err 让外层 run_watcher 重建连接，否则在失效连接上反复重订阅
-            // 会永远失败，Fn+K 监听静默失效直到应用重启。
-            enumerators = subscribe(&services);
+            enumerators = subscribe(&services, &subscribed_classes);
             if enumerators.is_empty() {
                 return Err(WatcherError::Reconnect(
                     "WMI enumerator failed and resubscribe returned nothing; rebuilding connection"
@@ -182,34 +419,27 @@ fn run_watcher_loop(cmd_tx: &mpsc::Sender<UiCommand>) -> Result<(), WatcherError
     }
 }
 
-fn run_watcher(cmd_tx: &mpsc::Sender<UiCommand>) -> Result<(), String> {
+fn run_watcher(
+    cmd_tx: &mpsc::Sender<UiCommand>,
+    bindings: &SharedBindings,
+    capture: &AtomicBool,
+) -> Result<(), String> {
     let mut stale_cycles: u32 = 0;
     loop {
-        match run_watcher_once(cmd_tx) {
-            // run_watcher_once 内部是无限事件循环，正常返回理论上不发生；
-            // 收到 Err 说明连接阶段失败，延时重试而不是让监听线程退出。
+        match run_watcher_once(cmd_tx, bindings, capture) {
             Err(WatcherError::NoEventClasses) => {
-                // 本周期从未订阅到事件类：最可能是本机没有该 OEM 事件类
-                // （如非小米机型），而不仅是驱动加载慢——重建连接也无法
-                // 改变，但为覆盖"开机时 OEM 提供程序加载较晚"的瞬态，
-                // 前几轮仍按 5s 快速重试（最坏约 2 分钟内的加载都能赶上），
-                // 之后拉长到 30s 兜底轮询，避免无限高频重建 WMI 连接并
-                // 每周期刷 7 条日志。事件类稍后出现时最坏一个周期内自动
-                // 恢复（F-FNK-07）。
                 stale_cycles += 1;
                 let delay = if stale_cycles <= 3 { 5u64 } else { 30u64 };
                 log::warn!(
-                    "Fn+K: no event classes for {} consecutive cycle(s); retrying in {}s",
+                    "Fn: no event classes for {} consecutive cycle(s); retrying in {}s",
                     stale_cycles,
                     delay
                 );
                 std::thread::sleep(std::time::Duration::from_secs(delay));
             }
             Err(WatcherError::Reconnect(e)) => {
-                // 连接阶段失败或订阅后连接失效：多为瞬态，保持 5s 快速
-                // 重试；一旦恢复正常订阅，stale_cycles 归零重新计算。
                 stale_cycles = 0;
-                log::warn!("Fn+K watcher startup failed: {}; retrying in 5s", e);
+                log::warn!("Fn watcher startup failed: {}; retrying in 5s", e);
                 std::thread::sleep(std::time::Duration::from_secs(5));
             }
             Ok(()) => return Ok(()),
@@ -217,67 +447,97 @@ fn run_watcher(cmd_tx: &mpsc::Sender<UiCommand>) -> Result<(), String> {
     }
 }
 
-fn process_event(obj: &IWbemClassObject, class_name: &str, cmd_tx: &mpsc::Sender<UiCommand>) {
-    let report_hex = get_detail_hex(obj).or_else(|| get_string_prop(obj, "ReportHex"));
-    let report_hex = match report_hex {
-        Some(h) => h,
-        None => {
-            log::debug!("Fn+K [{}]: no EventDetail/ReportHex", class_name);
-            return;
-        }
-    };
-    log::debug!("Fn+K [{}]: EventDetail={}", class_name, report_hex);
-
-    if handle_report(class_name, &report_hex, cmd_tx) {
-        return;
-    }
-    // 其余功能键（Fn 锁、麦克风静音等，F-FNK-09）与未知事件不产生任何
-    // 动作，仅记录日志。
-    log::debug!("Fn+K [{}]: unmatched event {}", class_name, report_hex);
+/// 读共享绑定表；毒锁（GUI 线程在临界区内 panic）时恢复并告警。
+/// 恢复为"解出原始数据"而非空列表：panic 后数据可能不一致，但对
+/// "绑定表"这类配置场景，恢复现有数据比丢配置更可取（与 util.rs 的
+/// lock_or_recover 语义一致）。
+fn lock_or_recover_bindings(
+    bindings: &SharedBindings,
+) -> std::sync::RwLockReadGuard<'_, Vec<FnKeyBinding>> {
+    bindings.read().unwrap_or_else(|e| {
+        log::warn!("fn bindings lock poisoned, recovering");
+        e.into_inner()
+    })
 }
 
-/// 匹配并派发：事件类为 HID_EVENT20 且归一化后的报告以 `012801` 开头时，
-/// 发送 UiCommand::CyclePerfMode 循环切换性能模式。返回是否已派发
-/// （F-FNK-04 / F-FNK-05）。
-fn handle_report(class_name: &str, report_hex: &str, cmd_tx: &mpsc::Sender<UiCommand>) -> bool {
-    if !is_fn_k_press(class_name, report_hex) {
-        return false;
+fn process_event(
+    obj: &IWbemClassObject,
+    class_name: &str,
+    bindings: &SharedBindings,
+    capture: &AtomicBool,
+    cmd_tx: &mpsc::Sender<UiCommand>,
+) {
+    let Some(report_hex) = get_detail_hex(obj).or_else(|| get_string_prop(obj, "ReportHex")) else {
+        log::debug!("Fn [{}]: no EventDetail/ReportHex", class_name);
+        return;
+    };
+    let normalized = normalize_hex(&report_hex);
+    log::debug!(
+        "Fn [{}]: EventDetail={} (normalized {})",
+        class_name,
+        report_hex,
+        normalized
+    );
+
+    // 捕获模式：每条事件转发给 GUI（用于发现键码、配置绑定）。
+    if capture.load(Ordering::Relaxed) {
+        send_watcher_command(
+            cmd_tx,
+            UiCommand::FnEventSeen {
+                class: class_name.to_string(),
+                hex: normalized.clone(),
+            },
+        );
     }
-    log::info!("Fn+K: matched ({})", report_hex);
-    let _ = cmd_tx.send(UiCommand::CyclePerfMode);
-    true
+
+    if dispatch_bindings(class_name, &normalized, bindings, cmd_tx) {
+        return;
+    }
+    // 其余事件（未绑定或 Fn 锁等，见 F-FNK-09）不产生任何动作，仅记录日志。
+    log::debug!("Fn [{}]: unmatched event {}", class_name, normalized);
+}
+
+/// 与绑定表做前缀匹配并派发动作。命中第一条绑定即消费（与 Meow-Box 的
+/// "first matching binding" 语义一致），`None` 动作的绑定同样消费（禁用）。
+fn dispatch_bindings(
+    class_name: &str,
+    normalized: &str,
+    bindings: &SharedBindings,
+    cmd_tx: &mpsc::Sender<UiCommand>,
+) -> bool {
+    for binding in lock_or_recover_bindings(bindings).iter() {
+        if binding.class != class_name {
+            continue;
+        }
+        let prefix = normalize_hex(&binding.prefix);
+        if prefix.is_empty() || !normalized.starts_with(&prefix) {
+            continue;
+        }
+        log::info!("Fn: matched {} -> {}", binding.label(), normalized);
+        if let Some(cmd) = binding.action.as_ui_command() {
+            send_watcher_command(cmd_tx, cmd);
+        } else {
+            log::debug!("Fn: binding {} has no action; consumed", binding.label());
+        }
+        return true;
+    }
+    false
 }
 
 /// 事件 hex 统一归一化：剔除所有非字母数字字符（如 "01-28-01" 的分隔符）
 /// 并转大写。EventDetail 字节路径生成的是大写十六进制，但 ReportHex 字符串
 /// 回退路径的字母大小写由固件决定，可能是小写——不归一化会导致小写报告
 /// 永远匹配不上（F-FNK-04）。
-fn normalize_hex(report_hex: &str) -> String {
+/// 归一化 hex 到大写无分隔形式：剔除分隔符等非十六进制字符并转大写。
+/// 只保留 `[0-9A-F]`——事件报告与绑定前缀都是 hex，混入其它字母
+/// （如 G-Z）既不可能匹配真实事件，也会让"非 hex 输入"检测失效。
+/// 不含任何十六进制字符时返回空串（调用方据此拒绝非法输入）。
+pub fn normalize_hex(report_hex: &str) -> String {
     report_hex
         .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
+        .filter(|c| c.is_ascii_hexdigit())
         .collect::<String>()
         .to_ascii_uppercase()
-}
-
-/// Fn+K 按下判定：类名一致 + 归一化报告以前缀 `012801` 开头。
-/// 释放事件（`012800`）不命中此前缀，不会触发切换（F-FNK-06）。
-fn is_fn_k_press(class_name: &str, report_hex: &str) -> bool {
-    class_name == FN_K_WMI_CLASS && normalize_hex(report_hex).starts_with(FN_K_PRESS_PREFIX)
-}
-
-/// Shared helper: get a VARIANT property from a WMI object by name.
-fn get_variant(obj: &IWbemClassObject, name: &str) -> Option<VARIANT> {
-    let (_wide, prop_name) = crate::util::to_pcwstr(name);
-    let mut val = VARIANT::default();
-    let mut _type = 0i32;
-    let mut _flavor = 0i32;
-    unsafe {
-        obj
-            .Get(prop_name, 0, &mut val, Some(&mut _type as *mut i32), Some(&mut _flavor as *mut i32))
-            .ok()?;
-    }
-    Some(val)
 }
 
 /// 将 VT_UI1 SAFEARRAY 的数据缓冲转为大写十六进制字符串。
@@ -294,95 +554,185 @@ fn bytes_to_hex(data: *const u8, len: usize) -> Option<String> {
 }
 
 fn get_detail_hex(obj: &IWbemClassObject) -> Option<String> {
-    let mut val = get_variant(obj, "EventDetail")?;
+    // 属性值由 OwnedVariant 在 Drop 时自动释放（VARIANT 及它持有的
+    // SAFEARRAY/BSTR），无需手动 VariantClear。
+    let val = crate::ec::wmi_util::get_property(obj, "EventDetail")?;
     let vt = unsafe { val.Anonymous.Anonymous.vt };
 
-    let result = if vt == VARENUM(VT_ARRAY.0 | VT_UI1.0) {
+    if vt == VARENUM(VT_ARRAY.0 | VT_UI1.0) {
         let sa = unsafe { val.Anonymous.Anonymous.Anonymous.parray };
-        if !sa.is_null() {
-            let mut data: *mut std::ffi::c_void = std::ptr::null_mut();
-            if unsafe { SafeArrayAccessData(sa, &mut data) }.is_ok() {
-                let lbound = unsafe { SafeArrayGetLBound(sa, 1) }.unwrap_or(0);
-                let ubound = unsafe { SafeArrayGetUBound(sa, 1) }.unwrap_or(-1);
-                let len = ubound.saturating_sub(lbound).saturating_add(1) as usize;
-                let hex_str = bytes_to_hex(data as *const u8, len);
-                unsafe { SafeArrayUnaccessData(sa).ok() };
-                hex_str
-            } else {
-                None
-            }
-        } else {
-            None
+        if sa.is_null() {
+            return None;
         }
+        let mut data: *mut std::ffi::c_void = std::ptr::null_mut();
+        if unsafe { SafeArrayAccessData(sa, &mut data) }.is_err() {
+            return None;
+        }
+        let lbound = unsafe { SafeArrayGetLBound(sa, 1) }.unwrap_or(0);
+        let ubound = unsafe { SafeArrayGetUBound(sa, 1) }.unwrap_or(-1);
+        let len = ubound.saturating_sub(lbound).saturating_add(1) as usize;
+        let hex_str = bytes_to_hex(data as *const u8, len);
+        unsafe { SafeArrayUnaccessData(sa).ok() };
+        hex_str
     } else {
         unsafe { crate::ec::wmi_util::bstr_from_variant(&val) }
-    };
-
-    // Release the VARIANT (and the SafeArray / BSTR it owns) before returning.
-    unsafe { VariantClear(&mut val).ok() };
-    result
+    }
 }
 
 fn get_string_prop(obj: &IWbemClassObject, name: &str) -> Option<String> {
-    let mut val = get_variant(obj, name)?;
-    let result = unsafe { crate::ec::wmi_util::bstr_from_variant(&val) };
-    unsafe { VariantClear(&mut val).ok() };
-    result
+    let val = crate::ec::wmi_util::get_property(obj, name)?;
+    unsafe { crate::ec::wmi_util::bstr_from_variant(&val) }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_fn_k_press_matches() {
-        assert!(is_fn_k_press("HID_EVENT20", "012801FFFF"));
+    fn test_bindings() -> SharedBindings {
+        std::sync::Arc::new(RwLock::new(default_bindings()))
     }
 
+    /// 默认绑定表必须包含 Fn+K → 循环切换性能（与历史行为一致）。
     #[test]
-    fn test_fn_k_matches_with_separators() {
-        // 报告带分隔符（"01-28-01" 形式，见文档 F-FNK-04）时同样能匹配。
-        assert!(is_fn_k_press("HID_EVENT20", "01-28-01 00 00"));
+    fn test_default_bindings_has_fn_k() {
+        let b = default_bindings();
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].class, "HID_EVENT20");
+        assert_eq!(b[0].prefix, "012801");
+        assert_eq!(b[0].action, FnAction::CyclePerfMode);
     }
 
+    /// 归一化必须能匹配带分隔符/大小写的报告。
     #[test]
-    fn test_fn_k_lowercase_report_normalized() {
-        // 固件以小写提供 ReportHex（如 "012801ffff..."）时，归一化大写后必须能匹配。
-        assert!(is_fn_k_press("HID_EVENT20", "012801ffff"));
+    fn test_normalize_hex() {
+        assert_eq!(normalize_hex("01-28-01 00 00"), "0128010000");
+        assert_eq!(normalize_hex("012801ffff"), "012801FFFF");
+        assert_eq!(normalize_hex(""), "");
     }
 
+    /// 绑定前缀匹配：按下命中、释放不命中（F-FNK-06）、类不匹配不命中。
     #[test]
-    fn test_fn_k_release_not_matched() {
-        // 释放事件 012800 不命中按下前缀 012801，一次按键只触发一次切换（F-FNK-06）。
-        assert!(!is_fn_k_press("HID_EVENT20", "012800"));
+    fn test_dispatch_binding_match_semantics() {
+        let bindings = test_bindings();
+        let (tx, _rx) = mpsc::channel();
+
+        // Fn+K 按下（012801）命中。
+        assert!(dispatch_bindings(
+            "HID_EVENT20",
+            "012801FFFF",
+            &bindings,
+            &tx
+        ));
+        // 释放（012800）不命中按下前缀。
+        assert!(!dispatch_bindings("HID_EVENT20", "012800", &bindings, &tx));
+        // 类不匹配不命中。
+        assert!(!dispatch_bindings("HID_EVENT21", "012801", &bindings, &tx));
+        // 其它键（如 Fn+Esc 0107）不命中。
+        assert!(!dispatch_bindings("HID_EVENT20", "010701", &bindings, &tx));
     }
 
+    /// 命中绑定必须派发对应的 UiCommand。
     #[test]
-    fn test_wrong_class_rejected() {
-        assert!(!is_fn_k_press("HID_EVENT21", "012801"));
-    }
-
-    #[test]
-    fn test_unmatched_prefix_rejected() {
-        assert!(!is_fn_k_press("HID_EVENT20", "0120"));
-        assert!(!is_fn_k_press("HID_EVENT20", "010701"));
-    }
-
-    #[test]
-    fn test_handle_report_dispatches_cycle_perf_mode() {
-        let (tx, rx) = std::sync::mpsc::channel();
-        assert!(handle_report("HID_EVENT20", "012801", &tx));
+    fn test_dispatch_sends_ui_command() {
+        let bindings = test_bindings();
+        let (tx, rx) = mpsc::channel();
+        assert!(dispatch_bindings("HID_EVENT20", "012801", &bindings, &tx));
         match rx.try_recv() {
             Ok(UiCommand::CyclePerfMode) => {}
             other => panic!("Expected CyclePerfMode, got {:?}", other),
         }
     }
 
+    /// 绑定消费但无动作：命中返回 true 但不派发命令。
     #[test]
-    fn test_handle_report_unmatched_sends_nothing() {
-        let (tx, rx) = std::sync::mpsc::channel();
-        assert!(!handle_report("HID_EVENT20", "010701", &tx));
+    fn test_dispatch_none_action_consumes_without_sending() {
+        let bindings: SharedBindings = std::sync::Arc::new(RwLock::new(vec![FnKeyBinding {
+            class: "HID_EVENT20".into(),
+            prefix: "0107".into(),
+            action: FnAction::None,
+        }]));
+        let (tx, rx) = mpsc::channel();
+        assert!(dispatch_bindings("HID_EVENT20", "010701", &bindings, &tx));
         assert!(rx.try_recv().is_err());
+    }
+
+    /// 自定义绑定：任意类/前缀 → 任意动作。
+    #[test]
+    fn test_dispatch_custom_binding() {
+        let bindings = Arc::new(RwLock::new(vec![FnKeyBinding {
+            class: "HID_EVENT20".into(),
+            prefix: "0123".into(),
+            action: FnAction::ToggleBatteryCare,
+        }]));
+        let (tx, rx) = mpsc::channel();
+        assert!(dispatch_bindings("HID_EVENT20", "012301", &bindings, &tx));
+        match rx.try_recv() {
+            Ok(UiCommand::ToggleBatteryCare) => {}
+            other => panic!("Expected ToggleBatteryCare, got {:?}", other),
+        }
+    }
+
+    /// 绑定事件类型去重。
+    #[test]
+    fn test_binding_classes_deduplicated() {
+        let bindings = vec![
+            FnKeyBinding::fn_k(),
+            FnKeyBinding {
+                class: "HID_EVENT20".into(),
+                prefix: "0107".into(),
+                action: FnAction::None,
+            },
+            FnKeyBinding {
+                class: "HID_EVENT21".into(),
+                prefix: "FF".into(),
+                action: FnAction::ReapplyConfig,
+            },
+        ];
+        assert_eq!(
+            binding_classes(&bindings),
+            vec!["HID_EVENT20", "HID_EVENT21"]
+        );
+    }
+
+    /// 捕获模式的订阅类 = 绑定类 ∪ 已知类（去重、排序）：
+    /// 删除全部绑定后捕获仍订阅已知类，否则无法"发现新键"（修订 1.22）。
+    #[test]
+    fn test_capture_classes_include_known_when_bindings_empty() {
+        // 空绑定表：捕获模式必须仍覆盖全部已知类。
+        let empty: Vec<FnKeyBinding> = Vec::new();
+        let cap = capture_classes(&empty);
+        assert!(
+            cap.contains(&"HID_EVENT20".to_string()),
+            "capture with empty bindings must still subscribe to known classes"
+        );
+        // 已知类去重且排序稳定。
+        assert_eq!(cap, {
+            let mut c = cap.clone();
+            c.sort();
+            c.dedup();
+            c
+        });
+    }
+
+    #[test]
+    fn test_capture_classes_merge_bindings_and_known() {
+        let bindings = vec![FnKeyBinding {
+            class: "HID_EVENT21".into(),
+            prefix: "FF".into(),
+            action: FnAction::ReapplyConfig,
+        }];
+        let cap = capture_classes(&bindings);
+        // 绑定中的类 + 已知类的类（HID_EVENT20）都被覆盖。
+        assert!(cap.contains(&"HID_EVENT21".to_string()));
+        assert!(cap.contains(&"HID_EVENT20".to_string()));
+    }
+
+    /// 非捕获模式（capture 关闭）的订阅类只来自绑定表：不额外订阅已知类，
+    /// 避免未绑定的键也触发 WMI 事件流量。
+    #[test]
+    fn test_non_capture_bindings_only() {
+        let bindings = vec![FnKeyBinding::fn_k()];
+        assert_eq!(binding_classes(&bindings), vec!["HID_EVENT20"]);
     }
 
     /// 空 SAFEARRAY（长度为 0、指针可能为空）不得构造 0 长度切片（UB），
@@ -390,7 +740,7 @@ mod tests {
     #[test]
     fn test_bytes_to_hex_empty_buffer_is_none() {
         assert_eq!(bytes_to_hex(std::ptr::null(), 0), None);
-        assert_eq!(bytes_to_hex(1usize as *const u8, 0), None);
+        assert_eq!(bytes_to_hex(std::ptr::dangling::<u8>(), 0), None);
     }
 
     #[test]
@@ -402,7 +752,24 @@ mod tests {
 
     #[test]
     fn test_bytes_to_hex_null_nonzero_len_is_none() {
-        // 防御性断言：即使长度 >0，null 指针也不构造切片。
         assert_eq!(bytes_to_hex(std::ptr::null(), 4), None);
+    }
+
+    /// 展示形式：归一化前缀 → 带分隔符。
+    #[test]
+    fn test_display_prefix() {
+        assert_eq!(FnKeyBinding::display_prefix("012801"), "01-28-01");
+        assert_eq!(FnKeyBinding::display_prefix("0107"), "01-07");
+    }
+
+    /// 已知功能键目录：编码来自 Meow-Box（HID_EVENT20 类），不得为空。
+    #[test]
+    fn test_known_fn_keys_non_empty_and_distinct() {
+        assert!(!KNOWN_FN_KEYS.is_empty());
+        let mut set = std::collections::HashSet::new();
+        for k in KNOWN_FN_KEYS {
+            assert!(!k.prefix.is_empty());
+            assert!(set.insert((k.class, k.prefix)));
+        }
     }
 }
