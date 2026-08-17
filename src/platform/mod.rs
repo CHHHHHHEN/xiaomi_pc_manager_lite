@@ -2,4 +2,5 @@
 
 pub mod autostart;
 pub mod privilege;
+pub mod single_instance;
 pub mod window;
