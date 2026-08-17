@@ -14,6 +14,8 @@ pub enum EcError {
     WmiCallHResult(u32),
     #[error("EC 操作超时 (地址: {0:#x})")]
     Timeout(u16),
+    #[error("硬件返回无效数据: {0}")]
+    InvalidData(String),
     #[error("后端不可用: {0}")]
     BackendUnavailable(String),
 }
@@ -62,6 +64,15 @@ mod tests {
     fn test_display_timeout() {
         let err = EcError::Timeout(0x66);
         assert_eq!(err.to_string(), "EC 操作超时 (地址: 0x66)");
+    }
+
+    #[test]
+    fn test_display_invalid_data() {
+        let err = EcError::InvalidData("充电上限寄存器值 0xff 非法".into());
+        assert_eq!(
+            err.to_string(),
+            "硬件返回无效数据: 充电上限寄存器值 0xff 非法"
+        );
     }
 
     #[test]

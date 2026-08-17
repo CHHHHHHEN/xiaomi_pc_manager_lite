@@ -3,11 +3,16 @@ pub mod battery;
 pub mod config;
 pub mod error;
 pub mod fnkey;
+pub mod limits;
 pub mod performance;
 pub mod wmi_util;
 
 pub mod winring0;
 pub mod wmi;
+
+/// 共享的内存测试后端（仅测试编译时存在）。
+#[cfg(test)]
+pub mod mock;
 
 /// EC register addresses used across backends
 pub mod addr {

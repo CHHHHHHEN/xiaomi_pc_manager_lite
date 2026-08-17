@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::ec::fnkey::{default_bindings, FnKeyBinding};
+use crate::ec::limits::{coherent_charge_limit, DEFAULT_CHARGE_LIMIT, FALLBACK_CARE_LIMIT};
 use crate::ec::performance::PerfMode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
@@ -20,114 +22,203 @@ pub struct AppConfig {
     pub auto_apply_on_startup: bool,
     pub auto_reapply_on_power_change: bool,
     pub auto_start_on_boot: bool,
+    /// 电池供电时自动切换到指定性能模式（节能）。`false` 保持用户所选模式
+    /// （狂暴在电池下仍按既有规则降级为极速）。
+    pub auto_switch_to_quiet_on_battery: bool,
     pub backend: BackendPreference,
+    /// Fn 功能键绑定表（默认 Fn+K → 循环切换性能模式）。
+    #[serde(default = "default_bindings")]
+    pub fn_key_bindings: Vec<FnKeyBinding>,
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
             battery_care_enabled: false,
-            battery_charge_limit: 80,
-            performance_mode: 0x09,
+            battery_charge_limit: DEFAULT_CHARGE_LIMIT,
+            performance_mode: PerfMode::Smart.ec_value(),
             auto_apply_on_startup: true,
             auto_reapply_on_power_change: true,
             auto_start_on_boot: false,
+            // 电池自动切换节能：默认关闭（保持用户所选模式）。
+            auto_switch_to_quiet_on_battery: false,
             // 默认使用 WMI 后端（本机 2025 RedmiBook Pro 14 实测可用；
             // Auto 模式同样 WMI 优先）。
             backend: BackendPreference::Wmi,
+            fn_key_bindings: default_bindings(),
         }
     }
 }
 
-fn config_dir() -> PathBuf {
-    // Overridable for tests so saving state never touches the real config.
-    std::env::var_os("XIAOMI_PC_MANAGER_CONFIG_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            dirs::config_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("XiaomiPcManagerLite")
-        })
+/// 配置文件的目录与读写。路径在**构造时解析一次**，load/save 不再读取
+/// 全局状态——历史实现每次 I/O 都重读 `XIAOMI_PC_MANAGER_CONFIG_DIR`
+/// 环境变量，测试不得不用全局互斥锁串行化对该变量的 `set_var`，生产代码
+/// 也被测试需求污染。`from_dir` 让测试直接用独立临时目录，无需环境变量。
+#[derive(Debug, Clone)]
+pub struct ConfigStore {
+    dir: PathBuf,
 }
 
-fn config_path() -> PathBuf {
-    config_dir().join("config.toml")
-}
+impl ConfigStore {
+    /// 默认目录：`XIAOMI_PC_MANAGER_CONFIG_DIR`（可覆盖），否则系统配置目录
+    /// 下的 `XiaomiPcManagerLite`。
+    ///
+    /// `dirs::config_dir()` 返回 `None`（Windows 上 Roaming AppData 查询失败）
+    /// 时回退到当前目录——该回退是**不得已**的降级：配置会写到进程 CWD 下，
+    /// 持久性与路径都不理想，因此必须记录告警而非静默落盘，否则用户会看到
+    /// "设置不生效"却无法从日志排查。
+    pub fn new() -> Self {
+        let dir = std::env::var_os("XIAOMI_PC_MANAGER_CONFIG_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| match dirs::config_dir() {
+                Some(dir) => dir.join("XiaomiPcManagerLite"),
+                None => {
+                    log::warn!(
+                        "config_dir() unavailable; falling back to current directory for config"
+                    );
+                    PathBuf::from(".").join("XiaomiPcManagerLite")
+                }
+            });
+        Self { dir }
+    }
 
-/// 清理 `save()` 崩溃后残留的临时文件（形如 `config.toml.<pid>.<seq>.tmp`）。
-///
-/// 原子保存先写唯一临时文件再 rename；若进程在两步之间崩溃（断电/强杀），
-/// 临时文件会永久残留在配置目录。每次加载时清理由本进程在**启动阶段**执行：
-/// 此时尚无并发保存者，唯一命名的临时文件不可能属于一个正在进行中的写入，
-/// 删除是安全的。测试用目录同样受益（崩溃残留不会跨启动累积）。
-fn cleanup_stale_tmp_files() {
-    let dir = config_dir();
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.starts_with("config.toml.") && name.ends_with(".tmp") {
-            log::debug!("Config: removing stale temp file {}", name);
-            let _ = std::fs::remove_file(entry.path());
+    /// 显式指定配置目录（仅测试用），不依赖任何全局状态。
+    #[cfg(test)]
+    pub fn from_dir(dir: PathBuf) -> Self {
+        Self { dir }
+    }
+
+    pub fn path(&self) -> PathBuf {
+        self.dir.join("config.toml")
+    }
+
+    /// 清理 `save()` 崩溃后残留的临时文件（形如 `config.toml.<pid>.<seq>.tmp`）。
+    ///
+    /// 原子保存先写唯一临时文件再 rename；若进程在两步之间崩溃（断电/强杀），
+    /// 临时文件会永久残留在配置目录。每次加载时清理由本进程在**启动阶段**执行：
+    /// 此时尚无并发保存者，唯一命名的临时文件不可能属于一个正在进行中的写入，
+    /// 删除是安全的。测试用目录同样可覆盖（崩溃残留不会跨启动累积）。
+    fn cleanup_stale_tmp_files(&self) {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("config.toml.") && name.ends_with(".tmp") {
+                log::debug!("Config: removing stale temp file {}", name);
+                let _ = std::fs::remove_file(entry.path());
+            }
         }
     }
-}
 
-/// 测试专用：串行化所有读写全局 `XIAOMI_PC_MANAGER_CONFIG_DIR` 的用例。
-/// cargo test 并行运行多个用例时，各用例对同一环境变量的 `set_var` 会互相
-/// 覆盖——读取配置路径的用例（如 test_load_regenerates_missing_config_file、
-/// test_concurrent_saves_are_atomic）可能在 `set_var` 之后、读取磁盘之前
-/// 被其它用例改写环境变量，读到错误的目录而失败（flaky）。读取者须在
-/// 整个用例生命周期持有此锁；仅设置环境变量的写入者（gui::commands 的
-/// redirect_config_dir）在 set_var 时短暂持有即可。
-#[cfg(test)]
-pub(crate) static CONFIG_DIR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-impl AppConfig {
-    pub fn load() -> Self {
-        // 清理上次崩溃留下的临时文件（见 cleanup_stale_tmp_files）。
-        cleanup_stale_tmp_files();
-        let path = config_path();
+    pub fn load(&self) -> AppConfig {
+        // 清理上次崩溃的残留临时文件（见 cleanup_stale_tmp_files）。
+        self.cleanup_stale_tmp_files();
+        let path = self.path();
         match std::fs::read_to_string(&path) {
             Ok(s) => match toml::from_str::<AppConfig>(&s) {
                 Ok(mut cfg) => {
                     let before = cfg.clone();
                     cfg.sanitize();
                     // 消毒修改了配置（损坏/手改值被修正）时立即落盘：否则
-                    // auto_apply_on_startup=false 时 main.rs 不会保存，磁盘上
-                    // 的损坏值会每次启动重复告警、永不修复（仅在内存中被纠正）。
+                    // auto_apply_on_startup 关闭时不会重新保存，磁盘上的
+                    // 损坏值会每次启动重复告警、永不修复（仅在内存中被纠正）。
                     if cfg != before {
-                        if let Err(e) = cfg.save() {
+                        log::debug!("Config sanitize corrected values; persisting");
+                        if let Err(e) = self.save(&cfg) {
                             log::warn!("Persist sanitized config: {}", e);
                         }
                     }
+                    log::info!("Config loaded from {}", self.path().display());
                     cfg
                 }
                 Err(e) => {
-                    log::warn!("Config parse error at {:?}: {}; using defaults", path, e);
-                    AppConfig::default()
+                    log::warn!(
+                        "Config parse error at {:?}: {}; using degraded defaults",
+                        path,
+                        e
+                    );
+                    degraded_defaults()
                 }
             },
             // AC-CFG-02：配置文件缺失（首次运行/被删除）时返回默认值，并
-            // 立即落盘重建——否则用户删除 config.toml 后重启应用文件不会
+            // 立即落盘重建——避免用户删除 config.toml 后重启应用文件不会
             // 重新生成，直到下一次 GUI 修改设置才被创建。
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                log::debug!(
+                    "Config file missing; creating defaults at {}",
+                    path.display()
+                );
                 let cfg = AppConfig::default();
-                if let Err(e) = cfg.save() {
+                if let Err(e) = self.save(&cfg) {
                     log::warn!("Persist default config: {}", e);
                 }
                 cfg
             }
             Err(e) => {
-                log::warn!("Config load error at {:?}: {}; using defaults", path, e);
-                AppConfig::default()
+                log::warn!(
+                    "Config load error at {:?}: {}; using degraded defaults",
+                    path,
+                    e
+                );
+                degraded_defaults()
             }
         }
     }
 
-    /// 规范化从磁盘读入的配置，防止手改/损坏的配置把垃圾值写入 EC 硬件：
+    pub fn save(&self, cfg: &AppConfig) -> Result<(), String> {
+        std::fs::create_dir_all(&self.dir).map_err(|e| e.to_string())?;
+        let s = toml::to_string_pretty(cfg).map_err(|e| e.to_string())?;
+
+        // Atomic write: write to a temporary file, then rename (NFR-REL-04)。
+        // 临时文件名必须**唯一**（pid + 进程内自增序号）：固定名（如
+        // config.toml.tmp）在并发保存时存在撕裂重命名风险——写入者 A 完成
+        // write 后、rename 前，写入者 B 对同一 tmp 文件重新 truncate+write，
+        // A 的 rename 会把 B 尚未写完的 tmp 改名成 config，最终配置文件内容
+        // 被撕裂（下轮启动解析失败回退默认）。唯一名 + 原子 rename 保证目标
+        // 文件永远是某一次完整写入的产物。清理：write/rename 失败时删除
+        // 本次残留的临时文件。
+        let path = self.path();
+        static SAVE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SAVE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp_path = path.with_extension(format!("toml.{}.{}.tmp", std::process::id(), seq));
+        if let Err(e) = std::fs::write(&tmp_path, &s) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e.to_string());
+        }
+        if let Err(e) = std::fs::rename(&tmp_path, &path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e.to_string());
+        }
+
+        log::debug!("Config saved to {}", path.display());
+        Ok(())
+    }
+}
+
+impl Default for ConfigStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 配置损坏/不可读时的降级默认值。
+///
+/// 与 `AppConfig::default()` 的唯一区别：`auto_apply_on_startup = false`。
+/// 历史实现在这两条路径直接返回默认配置（auto_apply 默认 true），损坏的
+/// 配置文件会让启动同步把**默认值**（养护关、上限 100%、智能模式）写入硬件，
+/// 静默覆盖用户原有的硬件设置。降级模式只读不改硬件；用户后续任一次保存
+/// 都会重建一个有效配置文件。
+fn degraded_defaults() -> AppConfig {
+    AppConfig {
+        auto_apply_on_startup: false,
+        ..AppConfig::default()
+    }
+}
+
+impl AppConfig {
+    /// 规范化并读入的配置，防止手改/损坏的配置把垃圾值写入 EC 硬件：
     /// - `performance_mode` 必须是已知模式，否则回退默认（智能 0x09）。
     ///   历史版本曾把配置里的任意字节（如 0xFF）直接 `set_performance_mode`
     ///   写到 EC 寄存器 0x68，向硬件写入未定义代码。
@@ -143,11 +234,11 @@ impl AppConfig {
                 self.performance_mode,
                 PerfMode::Smart.name()
             );
-            self.performance_mode = PerfMode::Smart as u8;
+            self.performance_mode = PerfMode::Smart.ec_value();
         }
         if self.battery_charge_limit == 0 {
             log::warn!("Config: charge limit 0 is invalid; using default 80%");
-            self.battery_charge_limit = 80;
+            self.battery_charge_limit = DEFAULT_CHARGE_LIMIT;
         } else if self.battery_charge_limit > 100 {
             log::warn!(
                 "Config: charge limit {}% out of range; clamping to 100%",
@@ -157,43 +248,28 @@ impl AppConfig {
         }
         if self.battery_care_enabled && self.battery_charge_limit >= 100 {
             log::warn!(
-                "Config: battery care on with limit {}% (incoherent); using 80%",
-                self.battery_charge_limit
+                "Config: battery care on with limit {}% (incoherent); using {}%",
+                self.battery_charge_limit,
+                FALLBACK_CARE_LIMIT
             );
         }
-        self.battery_charge_limit = crate::ec::battery::coherent_charge_limit(
-            self.battery_care_enabled,
-            self.battery_charge_limit,
-        );
-    }
+        self.battery_charge_limit =
+            coherent_charge_limit(self.battery_care_enabled, self.battery_charge_limit);
 
-    pub fn save(&self) -> Result<(), String> {
-        let dir = config_dir();
-        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        let s = toml::to_string_pretty(self).map_err(|e| e.to_string())?;
-
-        // Atomic write: write to a temporary file, then rename (NFR-REL-04)。
-        // 临时文件名必须**唯一**（pid + 进程内自增序号）：固定名（如
-        // config.toml.tmp）在并发保存时存在撕裂重命名风险——写入者 A 完成
-        // write 后、rename 前，写入者 B 对同一 tmp 文件重新 truncate+write，
-        // A 的 rename 会把 B 尚未写完的 tmp 改名成 config，最终配置文件内容
-        // 被撕裂（下轮启动解析失败回退默认）。唯一名 + 原子 rename 保证目标
-        // 文件永远是某一次完整写入的产物。清理：write/rename 失败时删除
-        // 本次残留的临时文件。
-        let path = config_path();
-        static SAVE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let seq = SAVE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tmp_path = path.with_extension(format!("toml.{}.{}.tmp", std::process::id(), seq));
-        if let Err(e) = std::fs::write(&tmp_path, &s) {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(e.to_string());
-        }
-        if let Err(e) = std::fs::rename(&tmp_path, &path) {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(e.to_string());
-        }
-
-        Ok(())
+        // Fn 绑定消毒：丢弃空类/空前缀的条目（手改配置可能留下残缺绑定；
+        // 前缀为空时匹配一切事件，属于危险配置，宁可丢弃）。绑定动作由
+        // serde 枚举保证合法（未知枚举名直接解析失败走降级配置）。
+        let before = std::mem::take(&mut self.fn_key_bindings);
+        self.fn_key_bindings = before
+            .into_iter()
+            .filter(|b| {
+                let valid = !b.class.trim().is_empty() && !b.prefix.trim().is_empty();
+                if !valid {
+                    log::warn!("Config: dropping invalid fn key binding {:?}", b);
+                }
+                valid
+            })
+            .collect();
     }
 }
 
@@ -210,6 +286,7 @@ mod tests {
         assert!(cfg.auto_apply_on_startup);
         assert!(cfg.auto_reapply_on_power_change);
         assert!(!cfg.auto_start_on_boot);
+        assert!(!cfg.auto_switch_to_quiet_on_battery);
         assert_eq!(cfg.backend, BackendPreference::Wmi);
     }
 
@@ -227,17 +304,29 @@ mod tests {
             auto_apply_on_startup: false,
             auto_reapply_on_power_change: false,
             auto_start_on_boot: true,
+            auto_switch_to_quiet_on_battery: true,
             backend: BackendPreference::Wmi,
+            fn_key_bindings: crate::ec::fnkey::default_bindings(),
         };
         let s = toml::to_string_pretty(&cfg).expect("serialize");
         let deserialized: AppConfig = toml::from_str(&s).expect("deserialize");
         assert_eq!(cfg.battery_care_enabled, deserialized.battery_care_enabled);
         assert_eq!(cfg.battery_charge_limit, deserialized.battery_charge_limit);
         assert_eq!(cfg.performance_mode, deserialized.performance_mode);
-        assert_eq!(cfg.auto_apply_on_startup, deserialized.auto_apply_on_startup);
-        assert_eq!(cfg.auto_reapply_on_power_change, deserialized.auto_reapply_on_power_change);
+        assert_eq!(
+            cfg.auto_apply_on_startup,
+            deserialized.auto_apply_on_startup
+        );
+        assert_eq!(
+            cfg.auto_reapply_on_power_change,
+            deserialized.auto_reapply_on_power_change
+        );
         assert_eq!(cfg.auto_start_on_boot, deserialized.auto_start_on_boot);
         assert_eq!(cfg.backend, deserialized.backend);
+        assert_eq!(
+            cfg.fn_key_bindings, deserialized.fn_key_bindings,
+            "fn key bindings must round-trip"
+        );
     }
 
     #[test]
@@ -310,7 +399,10 @@ mod tests {
         assert_eq!(cfg.battery_charge_limit, cloned.battery_charge_limit);
         assert_eq!(cfg.performance_mode, cloned.performance_mode);
         assert_eq!(cfg.auto_apply_on_startup, cloned.auto_apply_on_startup);
-        assert_eq!(cfg.auto_reapply_on_power_change, cloned.auto_reapply_on_power_change);
+        assert_eq!(
+            cfg.auto_reapply_on_power_change,
+            cloned.auto_reapply_on_power_change
+        );
         assert_eq!(cfg.auto_start_on_boot, cloned.auto_start_on_boot);
         assert_eq!(cfg.backend, cloned.backend);
     }
@@ -390,19 +482,18 @@ mod tests {
     /// 应用文件不会重新生成，直到下一次修改设置才被创建。
     #[test]
     fn test_load_regenerates_missing_config_file() {
-        let _config_lock = CONFIG_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("xmpl-cfg-test-{}", std::process::id()));
-        let path = dir.join("config.toml");
+        let store = ConfigStore::from_dir(dir.clone());
+        let path = store.path();
         let _ = std::fs::remove_dir_all(&dir);
-        std::env::set_var("XIAOMI_PC_MANAGER_CONFIG_DIR", &dir);
 
         // 文件不存在：load 返回默认值并重新生成文件。
-        let cfg = AppConfig::load();
+        let cfg = store.load();
         assert_eq!(cfg.battery_charge_limit, 80);
         assert!(path.exists(), "missing config file must be regenerated");
 
         // 重建的文件可被重新加载。
-        let reloaded = AppConfig::load();
+        let reloaded = store.load();
         assert_eq!(reloaded, cfg);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -419,14 +510,14 @@ mod tests {
     /// 保存使用唯一 tmp 名（pid+自增序号），该竞态从根上消失。
     #[test]
     fn test_concurrent_saves_are_atomic() {
-        let _config_lock = CONFIG_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("xmpl-save-test-{}", std::process::id()));
+        let store = ConfigStore::from_dir(dir.clone());
         let _ = std::fs::remove_dir_all(&dir);
-        std::env::set_var("XIAOMI_PC_MANAGER_CONFIG_DIR", &dir);
 
         const THREADS: usize = 8;
         std::thread::scope(|s| {
             for i in 0..THREADS {
+                let store = store.clone();
                 s.spawn(move || {
                     let cfg = AppConfig {
                         battery_care_enabled: i % 2 == 0,
@@ -435,14 +526,14 @@ mod tests {
                     };
                     // 多轮写：放大并发窗口。
                     for _ in 0..20 {
-                        cfg.save().expect("save must succeed");
+                        store.save(&cfg).expect("save must succeed");
                     }
                 });
             }
         });
 
         // 目标文件必须可解析（未撕裂）。
-        let path = config_path();
+        let path = store.path();
         let content = std::fs::read_to_string(&path).expect("config must exist");
         let parsed: AppConfig = toml::from_str(&content).expect("config must parse");
         assert!(
@@ -471,10 +562,9 @@ mod tests {
     /// 崩溃都留下一个文件，永久累积在配置目录。
     #[test]
     fn test_load_cleans_stale_tmp_files() {
-        let _config_lock = CONFIG_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("xmpl-tmp-clean-{}", std::process::id()));
+        let store = ConfigStore::from_dir(dir.clone());
         let _ = std::fs::remove_dir_all(&dir);
-        std::env::set_var("XIAOMI_PC_MANAGER_CONFIG_DIR", &dir);
         std::fs::create_dir_all(&dir).expect("create config dir");
 
         // 模拟两次崩溃残留 + 一个正常运行遗留的临时文件。
@@ -484,7 +574,7 @@ mod tests {
         // 不在清理范围内的其它文件不得被误删。
         std::fs::write(dir.join("config.toml"), "should survive").expect("write config");
 
-        AppConfig::load();
+        store.load();
 
         assert!(
             !dir.join("config.toml.1234.0.tmp").exists(),
@@ -500,6 +590,51 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 消毒丢弃残缺的 Fn 绑定（空类/空前缀会被前缀匹配"匹配一切"，属于
+    /// 危险配置），合法的绑定保持原样。
+    #[test]
+    fn test_sanitize_drops_invalid_fn_bindings() {
+        let mut cfg = AppConfig {
+            fn_key_bindings: vec![
+                crate::ec::fnkey::FnKeyBinding {
+                    class: "".into(),
+                    prefix: "012801".into(),
+                    action: crate::ec::fnkey::FnAction::CyclePerfMode,
+                },
+                crate::ec::fnkey::FnKeyBinding {
+                    class: "HID_EVENT20".into(),
+                    prefix: "   ".into(),
+                    action: crate::ec::fnkey::FnAction::None,
+                },
+                crate::ec::fnkey::FnKeyBinding {
+                    class: "HID_EVENT20".into(),
+                    prefix: "0107".into(),
+                    action: crate::ec::fnkey::FnAction::ReapplyConfig,
+                },
+            ],
+            ..Default::default()
+        };
+        cfg.sanitize();
+        assert_eq!(cfg.fn_key_bindings.len(), 1);
+        assert_eq!(cfg.fn_key_bindings[0].class, "HID_EVENT20");
+        assert_eq!(cfg.fn_key_bindings[0].prefix, "0107");
+    }
+
+    /// 旧版本配置文件（无 fn_key_bindings 字段）反序列化时，必须回退到
+    /// 默认的 Fn+K 绑定（`#[serde(default = "default_bindings")]`）。
+    #[test]
+    fn test_deserialize_legacy_config_keeps_default_fn_bindings() {
+        let s = r#"battery_care_enabled = true
+battery_charge_limit = 80
+performance_mode = 9
+auto_apply_on_startup = true
+auto_reapply_on_power_change = true
+auto_start_on_boot = false
+backend = "Wmi""#;
+        let cfg: AppConfig = toml::from_str(s).expect("legacy config must parse");
+        assert_eq!(cfg.fn_key_bindings, default_bindings());
     }
 
     /// 消毒对合法配置必须是幂等且无副作用的。
@@ -519,5 +654,46 @@ mod tests {
         assert_eq!(once.performance_mode, twice.performance_mode);
         assert_eq!(cfg.battery_charge_limit, once.battery_charge_limit);
         assert_eq!(cfg.performance_mode, once.performance_mode);
+    }
+
+    /// 降级默认值只改动 auto_apply_on_startup，其余字段与默认值一致。
+    #[test]
+    fn test_degraded_defaults_disables_auto_apply() {
+        let cfg = degraded_defaults();
+        assert!(
+            !cfg.auto_apply_on_startup,
+            "degraded config must not auto-apply to hardware"
+        );
+        assert_eq!(cfg.battery_charge_limit, 80);
+        assert!(!cfg.battery_care_enabled);
+        assert_eq!(cfg.performance_mode, 0x09);
+        assert_eq!(
+            cfg.fn_key_bindings,
+            default_bindings(),
+            "degraded defaults keep default fn bindings"
+        );
+    }
+
+    /// 回归测试：配置文件损坏（TOML 解析失败）时，返回的配置必须禁用
+    /// 启动自动应用——历史实现返回默认配置（auto_apply=true），启动同步
+    /// 会把默认值（养护关、上限 100%）写入硬件，静默覆盖用户设置。
+    #[test]
+    fn test_load_parse_error_returns_degraded_config() {
+        let dir = std::env::temp_dir().join(format!("xmpl-degraded-{}", std::process::id()));
+        let store = ConfigStore::from_dir(dir.clone());
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create config dir");
+        std::fs::write(store.path(), "this is not valid toml {{{").expect("write broken config");
+
+        let cfg = store.load();
+        assert!(
+            !cfg.auto_apply_on_startup,
+            "broken config must not be auto-applied to hardware"
+        );
+        // 损坏的文件原样保留，不落盘覆盖（避免丢失用户数据）。
+        let content = std::fs::read_to_string(store.path()).expect("read config");
+        assert_eq!(content, "this is not valid toml {{{");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

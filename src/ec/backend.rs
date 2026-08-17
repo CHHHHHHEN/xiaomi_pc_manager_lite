@@ -52,6 +52,16 @@ pub trait EcBackend: Send + Sync {
     fn is_null(&self) -> bool {
         false
     }
+
+    /// Whether this backend is in a **faulted/latched** state requiring
+    /// recreation to recover (e.g. WMI 应答超时熔断)。
+    ///
+    /// 默认返回 false（WinRing0 无此概念）；WMI 后端在应答超时后熔断返回
+    /// true。调用方（GUI 后端切换）用它绕过"同种后端 no-op"优化：熔断的
+    /// 后端即便偏好未变也必须重建才能恢复（F2）。
+    fn needs_rebuild(&self) -> bool {
+        false
+    }
 }
 
 pub fn create_backend(pref: BackendPreference) -> Result<Box<dyn EcBackend>, EcError> {
@@ -81,29 +91,44 @@ pub fn create_backend(pref: BackendPreference) -> Result<Box<dyn EcBackend>, EcE
     }
 }
 
-
-
 /// A null backend that always returns `BackendUnavailable`.
 /// Used when no real backend can be created, so the GUI still starts
 /// and displays the error instead of crashing.
 pub struct NullBackend;
 
-macro_rules! null_err {
-    () => {
-        Err(EcError::BackendUnavailable("无可用后端".into()))
-    };
+/// NullBackend 所有方法的统一失败结果。
+fn null_err<T>() -> Result<T, EcError> {
+    Err(EcError::BackendUnavailable("无可用后端".into()))
 }
 
 impl EcBackend for NullBackend {
-    fn name(&self) -> &'static str { "无后端" }
-    fn get_battery_care_enabled(&self) -> Result<bool, EcError> { null_err!() }
-    fn get_charge_limit(&self) -> Result<u8, EcError> { null_err!() }
-    fn set_battery_care(&self, _enabled: bool) -> Result<(), EcError> { null_err!() }
-    fn set_charge_limit(&self, _percent: u8) -> Result<(), EcError> { null_err!() }
-    fn get_performance_mode(&self) -> Result<u8, EcError> { null_err!() }
-    fn set_performance_mode(&self, _mode: u8) -> Result<(), EcError> { null_err!() }
-    fn supports_continuous_charge_limit(&self) -> bool { false }
-    fn is_null(&self) -> bool { true }
+    fn name(&self) -> &'static str {
+        "无后端"
+    }
+    fn get_battery_care_enabled(&self) -> Result<bool, EcError> {
+        null_err()
+    }
+    fn get_charge_limit(&self) -> Result<u8, EcError> {
+        null_err()
+    }
+    fn set_battery_care(&self, _enabled: bool) -> Result<(), EcError> {
+        null_err()
+    }
+    fn set_charge_limit(&self, _percent: u8) -> Result<(), EcError> {
+        null_err()
+    }
+    fn get_performance_mode(&self) -> Result<u8, EcError> {
+        null_err()
+    }
+    fn set_performance_mode(&self, _mode: u8) -> Result<(), EcError> {
+        null_err()
+    }
+    fn supports_continuous_charge_limit(&self) -> bool {
+        false
+    }
+    fn is_null(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
