@@ -21,8 +21,7 @@ use super::battery;
 use super::error::EcError;
 
 use windows::Win32::System::Com::{
-    CoInitializeEx, CoSetProxyBlanket, CoCreateInstance, CLSCTX_INPROC_SERVER,
-    COINIT_MULTITHREADED, EOAC_NONE, RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE,
+    CoInitializeEx, COINIT_MULTITHREADED,
 };
 use windows::Win32::System::Ole::SafeArrayCreateVector;
 use windows::Win32::System::Ole::{
@@ -31,17 +30,8 @@ use windows::Win32::System::Ole::{
 };
 use windows::Win32::System::Variant::{VARIANT, VARENUM, VT_ARRAY, VT_UI1, VariantClear};
 use windows::Win32::System::Wmi::*;
-use windows::core::{BSTR, GUID, PCWSTR};
+use windows::core::{BSTR, PCWSTR};
 use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
-
-/// CLSID_WbemAdministrativeLocator ({CB8555CC-9128-11D1-AD9B-00C04FD8FDFF}).
-/// The classic CLSID_WbemLocator ({DC12A687-...}) is missing on newer
-/// Windows Insider builds; this administrative locator is registered on
-/// all WMI-capable systems and supports IWbemLocator.
-const CLSID_WMI_LOCATOR: GUID = GUID::from_u128(0xCB8555CC_9128_11D1_AD9B_00C04FD8FDFF);
-
-const RPC_C_AUTHN_WINNT: u32 = 10u32;
-const RPC_C_AUTHZ_NONE: u32 = 0u32;
 
 /// MiInterface command constants (little-endian bytes)
 const CMD_READ: u16 = 0xFA00;
@@ -52,6 +42,29 @@ const FUN2_PERF: u16 = 0x0800;
 /// GetResultObject 等待上限。健康固件上单次调用 5~16ms 即可返回。
 /// 超时阻塞发生在 worker 线程，不影响调用线程。
 const GET_RESULT_TIMEOUT_MS: i32 = 3000;
+
+/// `WmiWorker::connect`（含 COM 初始化、ConnectServer、预探测）的握手
+/// 等待上限。WMI 服务异常时 `CoCreateInstance`/`ConnectServer`/`ExecQuery`
+/// 可能长时间无响应——若无超时，`WmiBackend::new()` 会无限期阻塞调用方
+/// （main 的后端初始化线程），GUI 永远无法启动。超时后返回错误，由调用方
+/// 走既有回退路径（FallbackPreference / NullBackend）。
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// 等待 worker 线程的握手应答（worker 完成 connect 后发送）。
+///
+/// 带超时：WMI 服务卡死时 `recv` 不能无限阻塞（见 HANDSHAKE_TIMEOUT）。
+/// 超时或通道断开时返回 Err（断开即 worker 已退出，继续等待无意义）。
+fn await_handshake(
+    res_rx: &mpsc::Receiver<WmiReply>,
+    timeout: std::time::Duration,
+) -> Result<(), EcError> {
+    match res_rx.recv_timeout(timeout) {
+        Ok(WmiReply::Unit(Ok(()))) => Ok(()),
+        Ok(WmiReply::Unit(Err(e))) => Err(e),
+        Ok(_) => Err(EcError::WmiConnect("WMI worker handshake failed".into())),
+        Err(_) => Err(EcError::WmiConnect("WMI worker handshake timed out".into())),
+    }
+}
 
 /// MiInterface 响应 Status 成功值（本机 2025 RedmiBook Pro 14 实测：
 /// 所有成功调用恒返回 0x8000；写入无效值返回 0x0000）。
@@ -171,36 +184,9 @@ struct WmiWorker {
 impl WmiWorker {
     fn connect() -> Result<Self, EcError> {
         ensure_com()?;
-        let locator: IWbemLocator = unsafe {
-            CoCreateInstance(&CLSID_WMI_LOCATOR, None, CLSCTX_INPROC_SERVER)
-                .map_err(|e| EcError::WmiConnect(format!("CoCreateInstance: {}", e)))?
-        };
-        let services = unsafe {
-            locator
-                .ConnectServer(
-                    &BSTR::from("root\\wmi"),
-                    &BSTR::new(),
-                    &BSTR::new(),
-                    &BSTR::new(),
-                    0,
-                    &BSTR::new(),
-                    None::<&IWbemContext>,
-                )
-                .map_err(|e| EcError::WmiConnect(format!("ConnectServer: {}", e)))?
-        };
-        unsafe {
-            CoSetProxyBlanket(
-                &services,
-                RPC_C_AUTHN_WINNT,
-                RPC_C_AUTHZ_NONE,
-                PCWSTR(std::ptr::null()),
-                RPC_C_AUTHN_LEVEL_CALL,
-                RPC_C_IMP_LEVEL_IMPERSONATE,
-                None,
-                EOAC_NONE,
-            )
-            .map_err(|_| EcError::WmiConnect("CoSetProxyBlanket failed".into()))?
-        };
+        // 连接样板（CoCreateInstance → ConnectServer → CoSetProxyBlanket）
+        // 与 fnkey.rs 共用，见 wmi_util::connect_root_wmi。
+        let services = super::wmi_util::connect_root_wmi().map_err(EcError::WmiConnect)?;
         let mut worker = Self {
             services,
             target: None,
@@ -773,13 +759,12 @@ impl WmiBackend {
                 }
             })
             .map_err(|e| EcError::WmiConnect(format!("spawn worker thread: {}", e)))?;
-        match res_rx.recv() {
-            Ok(WmiReply::Unit(Ok(()))) => Ok(Self {
+        match await_handshake(&res_rx, HANDSHAKE_TIMEOUT) {
+            Ok(()) => Ok(Self {
                 tx,
                 res: Mutex::new(res_rx),
             }),
-            Ok(WmiReply::Unit(Err(e))) => Err(e),
-            _ => Err(EcError::WmiConnect("WMI worker handshake failed".into())),
+            Err(e) => Err(e),
         }
     }
 
@@ -1116,5 +1101,47 @@ mod tests {
         assert_eq!(wmi_rawcode_for_percent(55), 6); // 60%
         assert_eq!(wmi_rawcode_for_percent(95), 0); // 100%
         assert_eq!(wmi_rawcode_for_percent(45), 7); // 50%
+    }
+
+    /// 回归测试（握手超时）：worker 未在时限内应答时，await_handshake 必须
+    /// 返回 Err 而非无限阻塞——WMI 服务卡死时，`WmiBackend::new()` 不能
+    /// 让 main 的后端初始化线程永久挂起、GUI 永远无法启动。
+    #[test]
+    fn test_await_handshake_times_out() {
+        let (_tx, rx) = mpsc::channel::<WmiReply>();
+        let err = await_handshake(&rx, std::time::Duration::from_millis(50)).expect_err(
+            "no handshake reply must time out",
+        );
+        assert!(
+            err.to_string().contains("timed out"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    /// 握手成功：worker 发送 Ok 后 await_handshake 立即返回 Ok。
+    #[test]
+    fn test_await_handshake_success() {
+        let (tx, rx) = mpsc::channel::<WmiReply>();
+        tx.send(WmiReply::Unit(Ok(()))).unwrap();
+        await_handshake(&rx, std::time::Duration::from_secs(5)).expect("success handshake");
+    }
+
+    /// 握手失败：worker 上报连接错误时必须原样透传，供调用方回退。
+    #[test]
+    fn test_await_handshake_propagates_error() {
+        let (tx, rx) = mpsc::channel::<WmiReply>();
+        tx.send(WmiReply::Unit(Err(EcError::WmiInterfaceNotFound))).unwrap();
+        let err = await_handshake(&rx, std::time::Duration::from_secs(5)).expect_err("must fail");
+        assert!(err.to_string().contains("MICommonInterface"), "unexpected: {}", err);
+    }
+
+    /// 握手应答类型不符（异常）：必须返回错误而不是静默成功。
+    #[test]
+    fn test_await_handshake_wrong_reply_kind() {
+        let (tx, rx) = mpsc::channel::<WmiReply>();
+        tx.send(WmiReply::PerfMode(Ok(0))).unwrap();
+        let err = await_handshake(&rx, std::time::Duration::from_secs(5)).expect_err("must fail");
+        assert!(err.to_string().contains("handshake failed"), "unexpected: {}", err);
     }
 }

@@ -1,24 +1,16 @@
 use std::sync::mpsc;
 
-use windows::Win32::System::Com::{
-    CoInitializeEx, CoSetProxyBlanket, CoCreateInstance, CLSCTX_INPROC_SERVER,
-    COINIT_MULTITHREADED, EOAC_NONE, RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE,
-};
+use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 use windows::Win32::System::Wmi::*;
 use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::System::Ole::{
     SafeArrayAccessData, SafeArrayGetLBound, SafeArrayGetUBound, SafeArrayUnaccessData,
 };
-use windows::core::{BSTR, GUID, PCWSTR};
+use windows::core::BSTR;
 
 use windows::Win32::System::Variant::{VARENUM, VT_ARRAY, VT_UI1, VariantClear};
 
 use crate::command::UiCommand;
-
-const CLSID_WMI_LOCATOR: GUID = GUID::from_u128(0xCB8555CC_9128_11D1_AD9B_00C04FD8FDFF);
-
-const RPC_C_AUTHN_WINNT: u32 = 10u32;
-const RPC_C_AUTHZ_NONE: u32 = 0u32;
 
 /// Fn+K 所在的 OEM ACPI 事件类（F-FNK-01）。
 const FN_K_WMI_CLASS: &str = "HID_EVENT20";
@@ -92,44 +84,27 @@ enum WatcherError {
 /// 都会返回 Err 由外层 run_watcher 延时重试，监听不会因启动时的瞬时故障
 /// 或 WMI 服务重启而永久失效（F-FNK-07 的自恢复设计）。
 fn run_watcher_once(cmd_tx: &mpsc::Sender<UiCommand>) -> Result<(), WatcherError> {
+    // COM 公寓初始化与每次退出的 CoUninitialize 严格配对：run_watcher 的
+    // 重试循环会在同一条线程上反复进入本函数，若只 init 不 uninit，公寓
+    // 引用计数随重试周期无限增长。虽然对同一 MTA 的重复 init 返回 S_FALSE
+    // 且无实际资源泄漏，但正确模式是在每次周期结束时把引用计数归零，
+    // 使下一周期从干净的公寓状态开始（F-FNK-07 高频重试下的资源卫生）。
     unsafe {
         CoInitializeEx(None, COINIT_MULTITHREADED)
             .ok()
-            .map_err(|e| WatcherError::Reconnect(format!("COM init: {}", e)))?
-    };
-
-    let locator: IWbemLocator = unsafe {
-        CoCreateInstance(&CLSID_WMI_LOCATOR, None, CLSCTX_INPROC_SERVER)
-            .map_err(|e| WatcherError::Reconnect(format!("CoCreateInstance: {}", e)))?
-    };
-
-    let services = unsafe {
-        locator
-            .ConnectServer(
-                &BSTR::from("root\\wmi"),
-                &BSTR::new(),
-                &BSTR::new(),
-                &BSTR::new(),
-                0,
-                &BSTR::new(),
-                None::<&IWbemContext>,
-            )
-            .map_err(|e| WatcherError::Reconnect(format!("ConnectServer root\\wmi: {}", e)))?
-    };
-
+            .map_err(|e| WatcherError::Reconnect(format!("COM init: {}", e)))?;
+    }
+    let result = run_watcher_loop(cmd_tx);
     unsafe {
-        CoSetProxyBlanket(
-            &services,
-            RPC_C_AUTHN_WINNT,
-            RPC_C_AUTHZ_NONE,
-            PCWSTR(std::ptr::null()),
-            RPC_C_AUTHN_LEVEL_CALL,
-            RPC_C_IMP_LEVEL_IMPERSONATE,
-            None,
-            EOAC_NONE,
-        )
-        .map_err(|_| WatcherError::Reconnect("CoSetProxyBlanket failed".to_string()))?
-    };
+        CoUninitialize();
+    }
+    result
+}
+
+/// run_watcher_once 的 COM 已初始化部分：从创建 WbemLocator 到事件循环
+/// 结束。退出时 COM 引用计数由外层 run_watcher_once 统一归零。
+fn run_watcher_loop(cmd_tx: &mpsc::Sender<UiCommand>) -> Result<(), WatcherError> {
+    let services = crate::ec::wmi_util::connect_root_wmi().map_err(WatcherError::Reconnect)?;
 
     log::info!("Fn+K watcher connected to root\\wmi");
 
@@ -305,6 +280,19 @@ fn get_variant(obj: &IWbemClassObject, name: &str) -> Option<VARIANT> {
     Some(val)
 }
 
+/// 将 VT_UI1 SAFEARRAY 的数据缓冲转为大写十六进制字符串。
+///
+/// `from_raw_parts` 要求指针非空且对齐，即使长度为 0 也如此：空数组时
+/// `SafeArrayAccessData` 成功返回的 `data` 可能为空指针，直接构造 0 长度
+/// 切片属于 UB。这里在长度为 0 时返回 None，由调用方按"无数据"处理。
+fn bytes_to_hex(data: *const u8, len: usize) -> Option<String> {
+    if len == 0 || data.is_null() {
+        return None;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(data, len) };
+    Some(bytes.iter().map(|b| format!("{:02X}", b)).collect())
+}
+
 fn get_detail_hex(obj: &IWbemClassObject) -> Option<String> {
     let mut val = get_variant(obj, "EventDetail")?;
     let vt = unsafe { val.Anonymous.Anonymous.vt };
@@ -317,10 +305,9 @@ fn get_detail_hex(obj: &IWbemClassObject) -> Option<String> {
                 let lbound = unsafe { SafeArrayGetLBound(sa, 1) }.unwrap_or(0);
                 let ubound = unsafe { SafeArrayGetUBound(sa, 1) }.unwrap_or(-1);
                 let len = ubound.saturating_sub(lbound).saturating_add(1) as usize;
-                let bytes = unsafe { std::slice::from_raw_parts(data as *const u8, len) };
-                let hex_str: String = bytes.iter().map(|b| format!("{:02X}", b)).collect();
+                let hex_str = bytes_to_hex(data as *const u8, len);
                 unsafe { SafeArrayUnaccessData(sa).ok() };
-                Some(hex_str)
+                hex_str
             } else {
                 None
             }
@@ -396,5 +383,26 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         assert!(!handle_report("HID_EVENT20", "010701", &tx));
         assert!(rx.try_recv().is_err());
+    }
+
+    /// 空 SAFEARRAY（长度为 0、指针可能为空）不得构造 0 长度切片（UB），
+    /// 应返回 None 而非崩溃。
+    #[test]
+    fn test_bytes_to_hex_empty_buffer_is_none() {
+        assert_eq!(bytes_to_hex(std::ptr::null(), 0), None);
+        assert_eq!(bytes_to_hex(1usize as *const u8, 0), None);
+    }
+
+    #[test]
+    fn test_bytes_to_hex_non_empty() {
+        let data = [0x01u8, 0x28, 0x01, 0x00, 0xFF];
+        let hex = bytes_to_hex(data.as_ptr(), data.len()).expect("non-empty data");
+        assert_eq!(hex, "01280100FF");
+    }
+
+    #[test]
+    fn test_bytes_to_hex_null_nonzero_len_is_none() {
+        // 防御性断言：即使长度 >0，null 指针也不构造切片。
+        assert_eq!(bytes_to_hex(std::ptr::null(), 4), None);
     }
 }
