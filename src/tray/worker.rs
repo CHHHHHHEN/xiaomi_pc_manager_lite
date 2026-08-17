@@ -165,7 +165,16 @@ fn toggle_main_window() {
 
 /// 托盘直接退出：向主窗口投递 WM_QUIT，winit 消息循环收到后退出，
 /// eframe run_native 返回、进程正常结束（窗口隐藏时同样有效，
-/// 不依赖 GUI update 循环）。兜底：WM_QUIT 未生效时 500ms 后强制退出。
+/// 不依赖 GUI update 循环）。
+///
+/// 兜底：WM_QUIT 未生效（GUI 线程被阻塞）时强制退出。宽限期必须大于
+/// WMI 后端单次调用的最坏阻塞时长（GET_RESULT_TIMEOUT_MS = 3000，见
+/// ec/wmi.rs）：否则 GUI 线程正阻塞在 `recv()` 等待 WMI worker 回复时
+/// 根本来不及处理 WM_QUIT，过早的 `process::exit` 会把进程硬杀在一次
+/// 尚未完成的硬件调用中途。正常退出路径不经过此睡眠——主线程退出后
+/// 进程随即终止，本线程的兜底睡眠由进程结束一并终结。
+const QUIT_FALLBACK_MS: u64 = 5000;
+
 fn quit_app() {
     if let Some(hwnd) = crate::platform::window::find_main_window_handle() {
         log::info!("Tray quit: posting WM_QUIT to main window");
@@ -178,7 +187,11 @@ fn quit_app() {
             )
         };
     }
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    std::thread::sleep(std::time::Duration::from_millis(QUIT_FALLBACK_MS));
+    log::warn!(
+        "Tray quit: app did not exit within {}ms; forcing exit",
+        QUIT_FALLBACK_MS
+    );
     std::process::exit(0);
 }
 
@@ -430,6 +443,21 @@ mod tests {
         // 127 个字符 + NUL，且必须 NUL 结尾。
         assert_eq!(&sz_tip[..127], vec![b'A' as u16; 127].as_slice());
         assert_eq!(sz_tip[127], 0);
+    }
+
+    /// 回归测试（BUG B）：托盘退出的兜底强制退出时长必须大于 WMI 后端单次
+    /// 调用的最坏阻塞时长（GET_RESULT_TIMEOUT_MS=3000，ec/wmi.rs）。否则
+    /// GUI 线程正阻塞在 `recv()` 等待 WMI worker 回复时（最长 3000ms）根本
+    /// 来不及处理托盘线程投递的 WM_QUIT，过早的 `process::exit` 会把进程
+    /// 硬杀在一次尚未完成的硬件调用中途。若 WMI 侧的等待上限被调高到
+    /// 超过本常量，必须同步调高 QUIT_FALLBACK_MS。
+    #[test]
+    fn test_quit_fallback_exceeds_wmi_call_timeout() {
+        // 编译期断言：QUIT_FALLBACK_MS 恒 ≥ WMI 单次调用超时（3000ms）。
+        // 若未来调高 GET_RESULT_TIMEOUT_MS，此断言会直接导致编译失败，
+        // 强制同步调高 QUIT_FALLBACK_MS（避免进程被硬杀在一次未完成的
+        // 硬件调用中途）。
+        const _: () = assert!(QUIT_FALLBACK_MS >= 3000);
     }
 
     /// 回归测试：tray_nid_snapshot 必须返回保存的 NID 副本（NOTIFYICONDATAW
