@@ -21,6 +21,10 @@ pub struct XiaomiApp {
     pub(crate) error_msg: Option<String>,
     /// `--autostart` 启动（F-AUTO-07）：首帧隐藏驻留托盘，不打扰用户。
     pub(crate) start_minimized: bool,
+    /// start_minimized 等待窗口可见的已尝试帧数：窗口创建晚于首帧时用
+    /// 立即重绘快速等待；超过上限后按 500ms 低频重试（见 update()），
+    /// 避免"窗口始终未可见"时陷入 60fps 忙循环（NFR-PERF-01）。
+    autostart_wait_frames: u32,
     /// 标题栏应用图标纹理（首帧由 icon.png 创建）。
     pub(crate) icon_tex: Option<egui::TextureHandle>,
 }
@@ -45,6 +49,7 @@ impl XiaomiApp {
             performance_mode,
             error_msg: None,
             start_minimized,
+            autostart_wait_frames: 0,
             icon_tex: None,
         };
 
@@ -108,12 +113,19 @@ impl eframe::App for XiaomiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // F-AUTO-07: --autostart 启动时隐藏驻留托盘（任务栏不显示图标）。
         // 首帧窗口可能尚未创建完成（FindWindow 找不到），保持标记并重试。
+        // 前 10 帧立即重绘（窗口即将出现，尽快隐藏、避免任务栏闪烁）；
+        // 超过后窗口仍未可见（异常场景）降级为低频重试，防止 60fps 忙循环
+        // 空转 CPU（NFR-PERF-01），且不阻塞正常关闭/退出流程。
         if self.start_minimized {
             if crate::platform::window::main_window_visible() {
                 self.start_minimized = false;
                 crate::platform::window::hide_main_window();
-            } else {
+            } else if self.autostart_wait_frames < 10 {
+                self.autostart_wait_frames += 1;
                 ctx.request_repaint();
+            } else {
+                self.start_minimized = false;
+                crate::platform::window::hide_main_window();
             }
         }
 

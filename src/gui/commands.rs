@@ -37,14 +37,36 @@ impl XiaomiApp {
                         // apply_startup_config in main.rs).
                         let mut errs: Vec<String> = Vec::new();
                         if self.config.battery_care_enabled {
-                            // 与启动路径/GUI 切换路径一致：养护开启时上限
+                            // 与启动 apply/GUI 切换路径一致：养护开启时上限
                             // 必须 < 100%，非自洽的旧配置兜底为 80%。
-                            if self.config.battery_charge_limit >= 100 {
-                                self.config.battery_charge_limit = 80;
+                            // 注意：兜底只能作用在局部变量上，**不得**提前改写
+                            // config——若写入失败，else 路径不会保存配置，内存
+                            // 中的 config 若已被改成 80 就会与未更新的 care 状态
+                            // 构成矛盾，随后任何一次 save_state 都会把"用户期望
+                            // 100% 但写入失败"的状态静默持久化为 80%（与
+                            // set_battery_care_internal 的兜底规则一致）。
+                            let mut limit = self.config.battery_charge_limit;
+                            if limit >= 100 {
+                                limit = 80;
                             }
-                            if let Err(e) = self.backend.set_charge_limit(self.config.battery_charge_limit) {
+                            if let Err(e) = self.backend.set_charge_limit(limit) {
                                 log::error!("Reapply charge limit: {}", e);
                                 errs.push(format!("重设充电上限失败: {}", e));
+                            } else {
+                                // 与 set_charge_limit_internal / 启动同步
+                                // （sync_startup_config）的读回约定一致：WMI 后端
+                                // 会把非预设值量化到最近的预设（如 85→80），成功写入
+                                // 后必须读回硬件实际生效值再持久化，否则 config 与
+                                // 硬件长期背离——每次电源切换都重复量化写入，UI
+                                // 滑块显示硬件值（80）而配置仍是 85。
+                                // 仅当应用值 <100%（养护开启）时同步；读回 100%
+                                // 意味着写入被硬件拒绝（养护未生效），保留用户
+                                // 期望值，避免 care=true + limit=100 的矛盾配置。
+                                let applied =
+                                    self.backend.get_charge_limit().unwrap_or(limit).min(100);
+                                if applied < 100 {
+                                    self.config.battery_charge_limit = applied;
+                                }
                             }
                         } else if let Err(e) = self.backend.set_charge_limit(100) {
                             log::error!("Reapply charge limit: {}", e);
@@ -97,7 +119,7 @@ impl XiaomiApp {
                         }
                         Err(e) => {
                             log::error!("Autostart operation failed: {}", e);
-                            self.error_msg = Some(format!("设置开机自启动失败: {}", e));
+                            self.push_error(format!("设置开机自启动失败: {}", e));
                         }
                     }
                 }
@@ -112,11 +134,18 @@ impl XiaomiApp {
         // When disabling, only the hardware limit is raised to 100%; the
         // persisted desired limit must be kept so it is not lost when battery
         // care is re-enabled later.
+        // 注意：兜底 80% 只能作用在局部变量上，不能提前改写 config——若随后
+        // 硬件写入失败（limit_ok=false），else 分支不会保存配置，内存中的
+        // config 若已被改成 80 就与未更新的 care=false 构成矛盾状态，后续
+        // 任何一次 save_state 都会把"用户期望 100%、改写失败"静默持久化为
+        // 80%。成功路径会在下方用读回值统一落盘，这里无需预写。
+        let desired_limit = self.config.battery_charge_limit;
         let limit = if enabled {
-            if self.config.battery_charge_limit >= 100 {
-                self.config.battery_charge_limit = 80;
+            if desired_limit >= 100 {
+                80
+            } else {
+                desired_limit
             }
-            self.config.battery_charge_limit
         } else {
             100
         };
@@ -143,10 +172,12 @@ impl XiaomiApp {
                 false
             }
         };
-        if limit_ok && care_ok {
-            // Read back the value the hardware actually applied (the WMI
-            // backend rounds to the nearest preset), so the UI matches the
-            // hardware instead of the requested value.
+        if limit_ok {
+            // 限值是两种后端判定养护状态的权威依据（WMI 养护位由限值<100%
+            // 推导，WinRing0 读回亦按限值）：set_charge_limit 成功即硬件养护
+            // 状态已按限值生效。即使 set_battery_care 失败，状态与持久化配置
+            // 也必须按限值保持自洽——否则下次启动会按旧配置（care=false）
+            // 强制写 100%，静默覆盖用户刚设置的限值。
             let applied = self.backend.get_charge_limit().unwrap_or(limit).min(100);
             self.charge_limit = applied;
             // When disabling, keep the stored limit as the desired value for
@@ -157,18 +188,21 @@ impl XiaomiApp {
             }
             self.config.battery_care_enabled = enabled;
             self.battery_care_enabled = enabled;
+            if !care_ok {
+                // 与 set_charge_limit_internal 的联动失败处理一致：限值才是
+                // 权威依据，写入失败仅告警（F-ERR-03），状态保持自洽。
+                self.push_error("设置电池养护失败".to_string());
+            }
             self.save_state();
         } else {
-            // 写入失败时不得更新状态：否则 UI 显示成功而硬件未变更，
-            // 且错误被静默吞掉（F-ERR-03 要求失败在 GUI 中展示）。
+            // 限值写入失败时不得更新状态：硬件未变更，UI 与配置保持一致，
+            // 错误在 GUI 中展示（F-ERR-03）。
             let mut errs = Vec::new();
-            if !limit_ok {
-                errs.push("设置充电上限失败".to_string());
-            }
+            errs.push("设置充电上限失败".to_string());
             if !care_ok {
                 errs.push("设置电池养护失败".to_string());
             }
-            self.error_msg = Some(errs.join("; "));
+            self.push_error(errs.join("; "));
         }
     }
 
@@ -176,7 +210,7 @@ impl XiaomiApp {
         let limit = limit.min(100);
         if let Err(e) = self.backend.set_charge_limit(limit) {
             log::error!("Failed to set charge limit: {}", e);
-            self.error_msg = Some(format!("设置充电上限失败: {}", e));
+            self.push_error(format!("设置充电上限失败: {}", e));
             return;
         }
         log::info!("Charge limit set to {}%", limit);
@@ -187,7 +221,14 @@ impl XiaomiApp {
         // (AC-BAT-04: 设置 85% 应显示并保存硬件实际生效的 80%).
         let applied = self.backend.get_charge_limit().unwrap_or(limit).min(100);
         self.charge_limit = applied;
-        self.config.battery_charge_limit = applied;
+        // 100% = 养护关闭（与 set_battery_care_internal 关闭路径/sync_startup_config
+        // 的约定一致）：此时必须**保留** config 中用户期望的上限，供重新开启养护
+        // 时恢复。若把 applied=100 写回 config，用户的期望值（如 60%）会被覆盖为
+        // 100%，重新开启养护时只能走"≥100 兜底 80%"分支，用户原设置永久丢失。
+        // 只有当应用值 <100%（养护开启）时才把硬件实际生效值同步进配置。
+        if applied < 100 {
+            self.config.battery_charge_limit = applied;
+        }
         // On both backends the charge limit is the authoritative battery-care
         // control: WMI has no separate care bit, and WinRing0 derives care
         // from the limit.  Keep the UI flag consistent with the limit.
@@ -214,7 +255,7 @@ impl XiaomiApp {
                         e
                     );
                     self.battery_care_enabled = care;
-                    self.error_msg = Some(format!("同步电池养护状态失败: {}", e));
+                    self.push_error(format!("同步电池养护状态失败: {}", e));
                 }
             }
         }
@@ -248,7 +289,7 @@ impl XiaomiApp {
             }
             Err(e) => {
                 log::error!("Failed to set performance mode: {}", e);
-                self.error_msg = Some(format!("设置性能模式失败: {}", e));
+                self.push_error(format!("设置性能模式失败: {}", e));
             }
         }
     }
@@ -258,7 +299,7 @@ impl XiaomiApp {
             Ok(new_backend) => self.apply_backend_switch(new_backend, pref),
             Err(e) => {
                 log::error!("Failed to switch EC backend: {}", e);
-                self.error_msg = Some(format!("后端切换失败: {}", e));
+                self.push_error(format!("后端切换失败: {}", e));
                 false
             }
         }
@@ -290,8 +331,11 @@ impl XiaomiApp {
         }
         match self.backend.get_battery_state() {
             Ok((care, limit)) => {
+                // 钳制到 [0,100]：损坏的 EC 读值（如 0xFF=255）不得显示为
+                // "充电上限: 255%" 或使滑块/养护位推导溢出。上限超过 100
+                // 视为垃圾值钳到 100。
                 self.battery_care_enabled = care;
-                self.charge_limit = limit;
+                self.charge_limit = limit.min(100);
             }
             Err(e) => errors.push(format!("读取电池状态: {}", e)),
         }
@@ -309,6 +353,16 @@ impl XiaomiApp {
         if let Err(e) = self.config.save() {
             log::error!("save config: {}", e);
         }
+    }
+
+    /// 合并错误信息而非覆盖：F-ERR-03 要求所有硬件操作失败都应在 GUI 中
+    /// 展示，覆盖式写入会让较早的错误（如刷新时的读取失败）被静默丢弃。
+    /// 与 refresh_from_backend 合并 init_error 的模式保持一致。
+    pub(crate) fn push_error(&mut self, msg: String) {
+        self.error_msg = Some(match self.error_msg.take() {
+            Some(existing) => format!("{}; {}", existing, msg),
+            None => msg,
+        });
     }
 }
 
@@ -498,13 +552,40 @@ mod tests {
         app.set_charge_limit_internal(100);
         assert!(!app.battery_care_enabled);
         assert_eq!(app.charge_limit, 100);
-        assert_eq!(app.config.battery_charge_limit, 100);
+        // 关闭养护时保留用户期望值（默认 80），供重新开启养护时恢复。
+        assert_eq!(app.config.battery_charge_limit, 80);
 
         // A limit below 100% turns battery care back on.
         app.set_charge_limit_internal(90);
         assert!(app.battery_care_enabled);
         assert_eq!(app.charge_limit, 90);
         assert_eq!(app.config.battery_charge_limit, 90);
+    }
+
+    /// 回归测试：把上限拖到 100%（养护关闭）不得把 config 中用户期望的上限
+    /// 覆盖为 100%。历史实现无条件写回 config.battery_charge_limit=applied，
+    /// 用户从 60% 拖到 100% 后期望值被永久改写为 100，重新开启养护时只能走
+    /// "≥100 兜底 80%"分支，60% 的原设置丢失——与 set_battery_care_internal
+    /// 关闭路径（保留期望上限）和 sync_startup_config 的约定不一致。
+    #[test]
+    fn test_charge_limit_to_100_preserves_desired_limit() {
+        let mut app = test_app();
+        // 用户养护开启、期望上限 60%。
+        app.config.battery_charge_limit = 60;
+        app.charge_limit = 60;
+        app.battery_care_enabled = true;
+
+        // 拖到 100%：硬件提升到 100（养护关闭），但 config 期望值保留 60。
+        app.set_charge_limit_internal(100);
+        assert!(!app.battery_care_enabled);
+        assert_eq!(app.charge_limit, 100);
+        assert_eq!(app.config.battery_charge_limit, 60, "desired limit must be preserved");
+
+        // 重新开启养护：恢复 60% 而不是兜底 80%。
+        app.set_battery_care_internal(true);
+        assert!(app.battery_care_enabled);
+        assert_eq!(app.charge_limit, 60);
+        assert_eq!(app.config.battery_charge_limit, 60);
     }
 
     /// 回归测试：运行时养护状态与持久化配置不一致（auto_apply 关闭且硬件
@@ -569,6 +650,28 @@ mod tests {
         // The persisted desired settings must not be overwritten.
         assert_eq!(app.config.battery_charge_limit, 60);
         assert!(!app.config.battery_care_enabled);
+    }
+
+    /// 回归测试：损坏的 EC 读值（充电上限 >100，如寄存器返回 0xFF）不得
+    /// 显示为荒谬百分比或使 UI 状态溢出——刷新时必须钳制到 100%。
+    #[test]
+    fn test_refresh_clamps_charge_limit_above_100() {
+        redirect_config_dir();
+        let mock = MockBackend::default();
+        let mut app = XiaomiApp::new(
+            Box::new(mock.clone()),
+            AppConfig::default(),
+            crate::ec::config::BackendPreference::Auto,
+            None,
+            false,
+        );
+        mock.charge_limit.store(150, std::sync::atomic::Ordering::Relaxed);
+        mock.battery_care.store(false, std::sync::atomic::Ordering::Relaxed);
+
+        app.refresh_from_backend();
+
+        assert_eq!(app.charge_limit, 100);
+        assert!(!app.battery_care_enabled);
     }
 
     /// 回归测试（B-WMI-1）：刷新必须通过 get_battery_state 单次往返获取电池
@@ -643,6 +746,44 @@ mod tests {
         assert!(err.contains("读取性能模式"), "read errors must be preserved: {}", err);
     }
 
+    /// 回归测试：开启养护时 set_charge_limit 成功、但 set_battery_care 失败
+    /// （如 EC 拒绝写入养护位）时，硬件限值已生效，UI/配置必须按限值保持
+    /// 自洽（限值是两种后端判定养护状态的权威依据）。否则下次启动会按旧的
+    /// care=false 强制写 100%，静默覆盖用户设置的限值。
+    #[test]
+    fn test_battery_care_enable_partial_failure_keeps_config_coherent() {
+        redirect_config_dir();
+        let mut app = XiaomiApp::new(
+            Box::new(PartialCareBackend),
+            AppConfig::default(),
+            crate::ec::config::BackendPreference::Auto,
+            None,
+            false,
+        );
+        // 模拟用户养护关闭、期望上限 60%。
+        app.config.battery_charge_limit = 60;
+        app.config.battery_care_enabled = false;
+        app.battery_care_enabled = false;
+        app.charge_limit = 100;
+
+        // 开启养护：limit 写入成功（60%），care 位写入失败。
+        app.set_battery_care_internal(true);
+
+        // 限值已生效：状态与持久化配置必须按限值自洽（养护开启、上限 60），
+        // 并且错误要在 GUI 展示。
+        assert!(app.battery_care_enabled);
+        assert!(app.config.battery_care_enabled);
+        assert_eq!(app.charge_limit, 60);
+        assert_eq!(app.config.battery_charge_limit, 60);
+        assert!(app.error_msg.as_deref().unwrap_or_default().contains("设置电池养护失败"));
+
+        // 模拟下次启动 apply_startup_config：care=true → set_charge_limit(60)，
+        // 用户设置的 60% 不再被覆盖为 100%。
+        let cfg = app.config.clone();
+        assert!(cfg.battery_care_enabled);
+        assert_eq!(cfg.battery_charge_limit, 60);
+    }
+
     /// 回归测试：电源切换重设时，若旧版本/手改配置残留 care=true +
     /// limit=100 的矛盾组合，必须按 GUI 切换路径的规则兜底为 80% 写入
     /// 硬件——否则 WMI 会把 100% 写进硬件使养护失效，WinRing0 则会出现
@@ -673,6 +814,59 @@ mod tests {
     }
 
     #[test]
+    fn test_reapply_config_write_failure_keeps_original_limit() {
+        redirect_config_dir();
+        let mut app = failing_app();
+        app.config.auto_reapply_on_power_change = true;
+        // 用户配置 care=true + limit=100（矛盾组合），但写入全部失败。
+        app.config.battery_care_enabled = true;
+        app.config.battery_charge_limit = 100;
+
+        let ctx = egui::Context::default();
+        app.cmd_tx.send(UiCommand::ReapplyConfig).unwrap();
+        app.process_commands(&ctx);
+
+        // 写入失败时不得把 config 静默改写为 80%（与 set_battery_care_internal
+        // 的兜底规则一致），否则用户选择被破坏。
+        assert_eq!(
+            app.config.battery_charge_limit, 100,
+            "config must not be normalized when the write failed"
+        );
+    }
+
+    /// 回归测试：电源重设成功写入时，若后端量化（WMI 85%→80%），持久化配置
+    /// 必须跟随硬件实际生效值，与 set_charge_limit_internal / 启动同步的读回
+    /// 约定保持一致。历史实现把请求值（85%）直接持久化，config 与硬件长期
+    /// 背离（每次电源切换重复量化写入，UI 滑块显示硬件值 80 而配置仍是 85）。
+    #[test]
+    fn test_reapply_config_syncs_quantized_limit() {
+        redirect_config_dir();
+        let backend = QuantizingBackend::new();
+        let hw_limit = backend.charge_limit.clone();
+        let mut app = XiaomiApp::new(
+            Box::new(backend),
+            AppConfig::default(),
+            crate::ec::config::BackendPreference::Auto,
+            None,
+            false,
+        );
+        app.config.auto_reapply_on_power_change = true;
+        app.config.battery_care_enabled = true;
+        app.config.battery_charge_limit = 85;
+
+        let ctx = egui::Context::default();
+        app.cmd_tx.send(UiCommand::ReapplyConfig).unwrap();
+        app.process_commands(&ctx);
+
+        assert_eq!(hw_limit.load(std::sync::atomic::Ordering::Relaxed), 80);
+        assert_eq!(
+            app.config.battery_charge_limit, 80,
+            "config must follow the hardware-applied value after quantization"
+        );
+        assert!(app.error_msg.is_none());
+    }
+
+    #[test]
     fn test_failed_charge_limit_write_keeps_state_and_reports_error() {
         let mut app = failing_app();
         app.set_charge_limit_internal(60);
@@ -699,6 +893,38 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("设置电池养护失败"));
+    }
+
+    /// 回归测试：开启养护时，配置上限 ≥100 触发的 80% 兜底只能作用在成功
+    /// 路径；写入失败时，config 与 UI 必须保持原样，不允许内存中被提前改写
+    /// 成 80（否则后续任何 save_state 都会把"用户期望 100% 但写入失败"的
+    /// 状态静默持久化，破坏用户设置）。
+    #[test]
+    fn test_battery_care_fallback_write_failure_keeps_original_limit() {
+        redirect_config_dir();
+        let mut app = XiaomiApp::new(
+            Box::new(FailingBackend),
+            AppConfig::default(),
+            crate::ec::config::BackendPreference::Auto,
+            None,
+            false,
+        );
+        // 用户期望 100%（触发兜底分支），写入全部失败。
+        app.config.battery_charge_limit = 100;
+        app.charge_limit = 100;
+
+        app.set_battery_care_internal(true);
+
+        // config 不得被提前改写为 80：写入失败时保持用户原值。
+        assert_eq!(app.config.battery_charge_limit, 100);
+        assert_eq!(app.charge_limit, 100);
+        assert!(!app.battery_care_enabled);
+        assert!(!app.config.battery_care_enabled);
+        assert!(app
+            .error_msg
+            .as_deref()
+            .unwrap_or_default()
+            .contains("设置充电上限失败"));
     }
 
     #[test]
