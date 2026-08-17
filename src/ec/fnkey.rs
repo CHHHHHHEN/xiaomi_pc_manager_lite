@@ -74,21 +74,33 @@ fn subscribe(services: &IWbemServices) -> Vec<(&'static str, SafeEnumerator)> {
         .collect()
 }
 
+/// run_watcher_once 的退出原因（供外层 run_watcher 决定重试节奏）。
+enum WatcherError {
+    /// 本周期内从未订阅到任何事件类（连续 30s 空订阅）：最可能是本机
+    /// 根本没有该 OEM 事件类（如非小米机型），重建连接也无法改变——
+    /// 需要退避，避免无限高频重建连接并刷屏日志。
+    NoEventClasses,
+    /// 连接/订阅阶段失败，或订阅后连接失效（Next 失败后重订阅仍为空）：
+    /// 多为瞬态（WMI 服务尚未就绪、OEM 驱动加载较晚、服务重启、休眠
+    /// 唤醒），保持快速重试等待恢复。
+    Reconnect(String),
+}
+
 /// Fn+K 监听主循环（可重入）：COM 初始化、连接 root\wmi、订阅事件类都在
 /// 这里完成。连接阶段的任何失败（如 WMI 服务尚未就绪、OEM 提供程序加载
 /// 较晚）以及运行期连接失效（Next 失败后重订阅仍无结果、空订阅持续 30s）
 /// 都会返回 Err 由外层 run_watcher 延时重试，监听不会因启动时的瞬时故障
 /// 或 WMI 服务重启而永久失效（F-FNK-07 的自恢复设计）。
-fn run_watcher_once(cmd_tx: &mpsc::Sender<UiCommand>) -> Result<(), String> {
+fn run_watcher_once(cmd_tx: &mpsc::Sender<UiCommand>) -> Result<(), WatcherError> {
     unsafe {
         CoInitializeEx(None, COINIT_MULTITHREADED)
             .ok()
-            .map_err(|e| format!("COM init: {}", e))?
+            .map_err(|e| WatcherError::Reconnect(format!("COM init: {}", e)))?
     };
 
     let locator: IWbemLocator = unsafe {
         CoCreateInstance(&CLSID_WMI_LOCATOR, None, CLSCTX_INPROC_SERVER)
-            .map_err(|e| format!("CoCreateInstance: {}", e))?
+            .map_err(|e| WatcherError::Reconnect(format!("CoCreateInstance: {}", e)))?
     };
 
     let services = unsafe {
@@ -102,7 +114,7 @@ fn run_watcher_once(cmd_tx: &mpsc::Sender<UiCommand>) -> Result<(), String> {
                 &BSTR::new(),
                 None::<&IWbemContext>,
             )
-            .map_err(|e| format!("ConnectServer root\\wmi: {}", e))?
+            .map_err(|e| WatcherError::Reconnect(format!("ConnectServer root\\wmi: {}", e)))?
     };
 
     unsafe {
@@ -116,7 +128,7 @@ fn run_watcher_once(cmd_tx: &mpsc::Sender<UiCommand>) -> Result<(), String> {
             None,
             EOAC_NONE,
         )
-        .map_err(|_| "CoSetProxyBlanket failed".to_string())?
+        .map_err(|_| WatcherError::Reconnect("CoSetProxyBlanket failed".to_string()))?
     };
 
     log::info!("Fn+K watcher connected to root\\wmi");
@@ -135,7 +147,7 @@ fn run_watcher_once(cmd_tx: &mpsc::Sender<UiCommand>) -> Result<(), String> {
             // 继续同连接重试没有意义，返回 Err 让外层重建 locator/services
             // 连接后重新订阅，而不是让监听永久失效。
             if empty_streak >= 6 {
-                return Err("no WMI event classes for 30s; rebuilding connection".to_string());
+                return Err(WatcherError::NoEventClasses);
             }
             // 没有任何事件类订阅成功：WMI 提供程序可能只是尚未就绪（如开机
             // 时 OEM 驱动加载较晚、WMI 服务重启）。低频休眠后重试订阅，既不
@@ -186,21 +198,42 @@ fn run_watcher_once(cmd_tx: &mpsc::Sender<UiCommand>) -> Result<(), String> {
             // 会永远失败，Fn+K 监听静默失效直到应用重启。
             enumerators = subscribe(&services);
             if enumerators.is_empty() {
-                return Err(
+                return Err(WatcherError::Reconnect(
                     "WMI enumerator failed and resubscribe returned nothing; rebuilding connection"
                         .to_string(),
-                );
+                ));
             }
         }
     }
 }
 
 fn run_watcher(cmd_tx: &mpsc::Sender<UiCommand>) -> Result<(), String> {
+    let mut stale_cycles: u32 = 0;
     loop {
         match run_watcher_once(cmd_tx) {
             // run_watcher_once 内部是无限事件循环，正常返回理论上不发生；
-            // 收到 Err 说明连接阶段失败，低频延时重试而不是让监听线程退出。
-            Err(e) => {
+            // 收到 Err 说明连接阶段失败，延时重试而不是让监听线程退出。
+            Err(WatcherError::NoEventClasses) => {
+                // 本周期从未订阅到事件类：最可能是本机没有该 OEM 事件类
+                // （如非小米机型），而不仅是驱动加载慢——重建连接也无法
+                // 改变，但为覆盖"开机时 OEM 提供程序加载较晚"的瞬态，
+                // 前几轮仍按 5s 快速重试（最坏约 2 分钟内的加载都能赶上），
+                // 之后拉长到 30s 兜底轮询，避免无限高频重建 WMI 连接并
+                // 每周期刷 7 条日志。事件类稍后出现时最坏一个周期内自动
+                // 恢复（F-FNK-07）。
+                stale_cycles += 1;
+                let delay = if stale_cycles <= 3 { 5u64 } else { 30u64 };
+                log::warn!(
+                    "Fn+K: no event classes for {} consecutive cycle(s); retrying in {}s",
+                    stale_cycles,
+                    delay
+                );
+                std::thread::sleep(std::time::Duration::from_secs(delay));
+            }
+            Err(WatcherError::Reconnect(e)) => {
+                // 连接阶段失败或订阅后连接失效：多为瞬态，保持 5s 快速
+                // 重试；一旦恢复正常订阅，stale_cycles 归零重新计算。
+                stale_cycles = 0;
                 log::warn!("Fn+K watcher startup failed: {}; retrying in 5s", e);
                 std::thread::sleep(std::time::Duration::from_secs(5));
             }

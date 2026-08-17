@@ -26,8 +26,11 @@ pub fn extract_winring0() -> Result<PathBuf, String> {
         .ok_or("no parent directory")?
         .to_path_buf();
 
-    // Clean up old extraction locations from previous versions
-    let _ = std::fs::remove_dir_all(std::env::temp_dir().join("XiaomiPcManagerLite"));
+    // Clean up old extraction locations from previous versions.
+    // 注意：**不能**整体删除 `%TEMP%\XiaomiPcManagerLite`——该目录正是
+    // `main::init_logging` 的日志目录（app.log 由本进程持有打开句柄，删除
+    // 必然失败且永远静默失败），而且会误删同目录下其它应用/实例的文件。
+    // 只删除按文件名精确匹配的遗留副本，绝不整目录删除。
     let old_sys_dir = std::path::PathBuf::from(
         std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into()),
     )

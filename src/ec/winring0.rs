@@ -198,22 +198,38 @@ impl WinRing0Backend {
     pub fn new() -> Result<Self, EcError> {
         let name = dll_name();
 
-        // 1. Try current working directory (like the C version)
-        if let Some(backend) = try_load_all(name) {
+        // 安全要求：本进程是提权（管理员）进程，**绝不能用裸模块名加载**。
+        // 裸名会走 Windows 标准 DLL 搜索顺序（exe 目录 → System32 → CWD →
+        // PATH），任何位于 CWD 或 System32 中同名 DLL 都会在提权上下文内被
+        // 加载——攻击者只需在启动目录放一个恶意的 WinRing0x64.dll 即可提权。
+        // 因此全部改为**绝对路径**加载：优先 EXE 同级目录，否则提取嵌入式
+        // 副本到同一目录再加载。
+        let exe_dir = std::env::current_exe()
+            .map_err(|e| EcError::DllLoad(format!("current_exe: {}", e)))?
+            .parent()
+            .ok_or_else(|| EcError::DllLoad("executable has no parent directory".into()))?
+            .to_path_buf();
+
+        // 兼容性提示：历史版本支持用户把自定义 DLL 放到当前工作目录。
+        // 出于安全考虑已不再加载该路径，检测到存在时给出明确日志以免
+        // 用户困惑"为什么我的驱动没生效"。
+        if std::path::Path::new(name).exists() {
+            log::warn!(
+                "WinRing0: ignoring '{}' in the current working directory: \
+                 loading DLLs by bare name from CWD is disabled for security (caller must use the EXE directory)",
+                name
+            );
+        }
+
+        // 1. Try alongside the EXE (absolute path)
+        let exe_dll = exe_dir.join(name);
+        if let Some(backend) = try_load_all(&exe_dll.to_string_lossy()) {
             return Ok(backend);
         }
 
-        // 2. Try alongside the EXE
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(exe_dir) = exe.parent() {
-                let path = exe_dir.join(name);
-                if let Some(backend) = try_load_all(&path.to_string_lossy()) {
-                    return Ok(backend);
-                }
-            }
-        }
-
-        // 3. Fall back to extracting embedded binaries
+        // 2. Fall back to extracting the embedded binaries into the EXE
+        //    directory and loading that copy (initialize behind it, so it
+        //    finds the freshly written .sys next to it).
         match crate::embed::extract_winring0() {
             Ok(extracted_path) => {
                 let path_str = extracted_path.to_string_lossy().to_string();
@@ -226,7 +242,7 @@ impl WinRing0Backend {
         }
 
         Err(EcError::DllLoad(format!(
-            "{} not found. Tried CWD and embedded extraction",
+            "{} not found. Tried EXE directory and embedded extraction",
             name
         )))
     }
@@ -277,6 +293,13 @@ impl EcBackend for WinRing0Backend {
 
     fn get_charge_limit(&self) -> Result<u8, EcError> {
         let limit = self.read_byte(ec_addr::CHARGE_LIMIT)?;
+        // 寄存器直读可能返回损坏/未初始化的值：0xFF（255）或 0x00（未写入）
+        // 都是垃圾值。>100 钳到 100；0 视为"未设置限制"，同样按 100（充满）
+        // 处理——避免 GUI 显示 "0%/255%" 之类的荒谬数据、滑块溢出，以及
+        // 养护位被错误推导（limit<100 的判定把垃圾值当成"养护开启"）。
+        // 合法语义下 0 不可能出现：GUI 滑块下限 40，WMI 预设下限 40，
+        // 配置消毒也会把 0 归一化为 80。
+        let limit = if limit == 0 || limit > 100 { 100 } else { limit };
         log::info!("WinRing0: read charge limit -> {}%", limit);
         Ok(limit)
     }

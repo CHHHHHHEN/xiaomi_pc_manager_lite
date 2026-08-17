@@ -205,11 +205,17 @@ impl WmiWorker {
             )
             .map_err(|_| EcError::WmiConnect("CoSetProxyBlanket failed".into()))?
         };
-        Ok(Self {
+        let mut worker = Self {
             services,
             target: None,
             fatal: None,
-        })
+        };
+        // 预探测 MICommonInterface 目标实例：本机没有该接口（如非小米机型）
+        // 时在**创建阶段**就返回 WmiInterfaceNotFound，使 create_backend(Wmi)
+        // 失败并触发自动回退（WinRing0 或错误提示），而不是创建一个"连接成功
+        // 但每次调用都报错"的后端让 GUI 一直显示读取失败。
+        worker.resolve_target()?;
+        Ok(worker)
     }
 
     fn run(mut self, rx: mpsc::Receiver<WmiCmd>, tx: mpsc::Sender<WmiReply>) {
@@ -832,14 +838,19 @@ impl WmiBackend {
     }
 
     fn call(&self, cmd: WmiCmd) -> WmiReply {
+        // 命令发送与应答接收必须在同一把锁内串行完成：应答通道是单一的，
+        // 若只锁 recv，两个并发调用线程的发送可能交错（A/B 先后 send，
+        // worker 按命令 FIFO 产生应答），而锁只保护接收端——B 抢到锁后
+        // 可能收到 A 的命令的应答，错误被静默错配到另一个调用方
+        // （WmiReply 不带请求关联标识）。当前 GUI 是唯一后端调用方，
+        // 该问题潜伏；把锁覆盖 send+recv 即从架构上根除错配可能。
+        let guard = self.res.lock().unwrap_or_else(|e| e.into_inner());
         if self.tx.send(cmd).is_err() {
             return WmiReply::Unit(Err(EcError::BackendUnavailable(
                 "WMI worker 已退出".into(),
             )));
         }
-        self.res
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        guard
             .recv()
             .unwrap_or(WmiReply::Unit(Err(EcError::BackendUnavailable(
                 "WMI worker 无响应".into(),
@@ -954,11 +965,12 @@ mod tests {
     /// 有效字段 18 字节；历史实现要求 ≥32 字节导致成功响应全被误判。
     #[test]
     fn test_output_min_length_is_18() {
-        assert_eq!(MIN_OUTPUT_LEN, 18);
-        // 实测 30 字节响应必须通过长度校验。
-        assert!(30 >= MIN_OUTPUT_LEN);
-        // 响应前 18 字节内的字段偏移（F-HAL-08）。
-        assert_eq!(MIN_OUTPUT_LEN, 2 + 2 + 2 + 4 + 4 + 4);
+        // 编译期断言：MIN_OUTPUT_LEN 恒为 18（2+2+2+4+4+4 的字段布局，
+        // 见 F-HAL-08）。作为回归测试同时锁定"实测 30>18 必须通过长度校验"
+        // 的关系。
+        const _: () = assert!(MIN_OUTPUT_LEN == 18);
+        const _: () = assert!(2 + 2 + 2 + 4 + 4 + 4 == MIN_OUTPUT_LEN);
+        const _: () = assert!(30 >= MIN_OUTPUT_LEN);
     }
 
     /// 回归测试（B-WMI-2）：确定性致命错误必须熔断——坏固件上每次调用都
@@ -1074,6 +1086,83 @@ mod tests {
         assert_eq!(wmi_rawcode_for_percent(60), 6);
         assert_eq!(wmi_rawcode_for_percent(50), 7);
         assert_eq!(wmi_rawcode_for_percent(40), 8);
+    }
+
+    /// 回归测试（B-WMI-4）：并发调用后端时，应答必须按命令正确配对——
+    /// 不能出现线程 A 收到线程 B 的命令应答。历史实现只锁 recv（不锁
+    /// send），两个线程并发调用时 B 抢到锁后可能收到 A 的命令的应答，
+    /// 错误被静默错配。修复后锁覆盖 send+recv 全程串行，配对确定。
+    /// 用延迟应答的仿真 worker 放大竞争窗口，两个线程各自反复调用不同
+    /// 方法，校验各自收到的应答类型与值。
+    #[test]
+    fn test_concurrent_calls_pair_replies() {
+        use std::sync::Arc;
+
+        let (tx, rx) = mpsc::channel::<WmiCmd>();
+        let (res_tx, res_rx) = mpsc::channel::<WmiReply>();
+        let backend = Arc::new(WmiBackend {
+            tx,
+            res: Mutex::new(res_rx),
+        });
+
+        // 仿真 worker：按命令 FIFO 应答，每次应答前微眠放大并发窗口。
+        std::thread::spawn(move || {
+            while let Ok(cmd) = rx.recv() {
+                let reply = match cmd {
+                    WmiCmd::GetPerfMode => WmiReply::PerfMode(Ok(0x99)),
+                    WmiCmd::GetBatteryState => WmiReply::BatteryState(Ok((true, 0x55))),
+                    _ => {
+                        WmiReply::Unit(Err(EcError::BackendUnavailable("unexpected".into())))
+                    }
+                };
+                std::thread::sleep(std::time::Duration::from_micros(150));
+                if res_tx.send(reply).is_err() {
+                    break;
+                }
+            }
+        });
+
+        const ITERS: usize = 40;
+        let a = backend.clone();
+        let thread_a = std::thread::spawn(move || {
+            let mut got = Vec::with_capacity(ITERS);
+            for _ in 0..ITERS {
+                got.push(backend_get_perf(&a));
+            }
+            got
+        });
+        let b = backend.clone();
+        let thread_b = std::thread::spawn(move || {
+            let mut got = Vec::with_capacity(ITERS);
+            for _ in 0..ITERS {
+                got.push(backend_get_battery(&b));
+            }
+            got
+        });
+
+        let got_a = thread_a.join().expect("thread A panicked");
+        let got_b = thread_b.join().expect("thread B panicked");
+
+        assert!(got_a.iter().all(|&m| m == 0x99), "A got wrong replies: {:?}", got_a);
+        assert!(
+            got_b.iter().all(|&(c, l)| c && l == 0x55),
+            "B got wrong replies: {:?}",
+            got_b
+        );
+    }
+
+    fn backend_get_perf(b: &WmiBackend) -> u8 {
+        match b.get_performance_mode() {
+            Ok(m) => m,
+            Err(e) => panic!("perf call failed: {}", e),
+        }
+    }
+
+    fn backend_get_battery(b: &WmiBackend) -> (bool, u8) {
+        match b.get_battery_state() {
+            Ok(s) => s,
+            Err(e) => panic!("battery call failed: {}", e),
+        }
     }
 
     #[test]
