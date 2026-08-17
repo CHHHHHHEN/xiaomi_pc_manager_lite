@@ -55,6 +55,16 @@ fn main() {
     init_logging();
     init_pause_on_panic();
 
+    // 单实例预检（F-AUTO-08）：必须在**提权之前**执行。若已有实例在运行
+    // （如自启动驻留托盘中），直接唤醒其窗口并退出——否则每次手动启动都会
+    // 先弹 UAC 提权、再被互斥体判定为第二实例，白白弹一次提权提示。
+    // pre_flight 只探测不持有：临时取得的所有权立即释放，真正的互斥体
+    // 所有权由下方提权完成后的 acquire() 取得。
+    if crate::platform::single_instance::pre_flight() {
+        crate::platform::window::show_main_window();
+        return;
+    }
+
     // 启动即提权：**WMI 与 WinRing0 都需要管理员权限**。本机实测
     // （受限令牌对照实验）：非管理员下 `SELECT * FROM MICommonInterface`
     // 直接返回拒绝访问（Access denied），WMI 后端完全不可用；WinRing0

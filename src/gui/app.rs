@@ -25,6 +25,9 @@ pub struct XiaomiApp {
     /// 立即重绘快速等待；超过上限后按 500ms 低频重试（见 update()），
     /// 避免"窗口始终未可见"时陷入 60fps 忙循环（NFR-PERF-01）。
     autostart_wait_frames: u32,
+    /// start_minimized 开始等待的时间点：低频重试窗口有时间上限（30s），
+    /// 超过后放弃隐藏（此时窗口仍不可见，属于异常场景）。
+    autostart_start: std::time::Instant,
     /// 标题栏应用图标纹理（首帧由 icon.png 创建）。
     pub(crate) icon_tex: Option<egui::TextureHandle>,
 }
@@ -50,6 +53,7 @@ impl XiaomiApp {
             error_msg: None,
             start_minimized,
             autostart_wait_frames: 0,
+            autostart_start: std::time::Instant::now(),
             icon_tex: None,
         };
 
@@ -113,8 +117,11 @@ impl eframe::App for XiaomiApp {
         // F-AUTO-07: --autostart 启动时隐藏驻留托盘（任务栏不显示图标）。
         // 首帧窗口可能尚未创建完成（FindWindow 找不到），保持标记并重试。
         // 前 10 帧立即重绘（窗口即将出现，尽快隐藏、避免任务栏闪烁）；
-        // 超过后窗口仍未可见（异常场景）降级为低频重试，防止 60fps 忙循环
-        // 空转 CPU（NFR-PERF-01），且不阻塞正常关闭/退出流程。
+        // 超过后窗口仍未可见按 500ms 低频重试（NFR-PERF-01）。
+        // 注意：**不能**在首 10 帧后就把 start_minimized 置 false——若窗口
+        // 因首帧字体编译 / GPU 初始化较慢而在首 10 帧之后才被创建，提前清除
+        // 标记会让 --autostart 实例的窗口原样显示在桌面上，违背"驻留托盘
+        // 不打扰用户"。低频重试需保持到窗口出现并隐藏，或超时（30s）放弃。
         if self.start_minimized {
             if crate::platform::window::main_window_visible() {
                 self.start_minimized = false;
@@ -122,10 +129,13 @@ impl eframe::App for XiaomiApp {
             } else if self.autostart_wait_frames < 10 {
                 self.autostart_wait_frames += 1;
                 ctx.request_repaint();
-            } else {
+            } else if self.autostart_start.elapsed() >= std::time::Duration::from_secs(30) {
                 self.start_minimized = false;
-                crate::platform::window::hide_main_window();
+                log::warn!("--autostart: main window never became visible within 30s");
             }
+            // 其余情况（窗口尚不可见且未超时）：保持 start_minimized，
+            // 由 update 末尾的 request_repaint_after(500ms) 提供低频重试帧；
+            // 窗口一旦出现，下一帧即被上面的可见分支隐藏。
         }
 
         // 标题栏应用图标：首帧由 icon.png 创建纹理（窗口图标与任务栏图标

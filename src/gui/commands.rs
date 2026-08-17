@@ -9,6 +9,16 @@ use super::app::XiaomiApp;
 
 const PERF_CYCLE: [PerfMode; 3] = [PerfMode::Smart, PerfMode::Quiet, PerfMode::Extreme];
 
+/// 开机自启动操作的**串行** worker（进程级单例）：
+///
+/// UiCommand::SetAutostart 的注册/删除是异步的。历史实现每次切换都 spawn
+/// 一个新线程，快速连续切换（如勾上又立刻取消）时两个操作并发执行，完成顺序
+/// 不确定——结果以"最后完成的那个"覆盖 config 与任务状态，可能与用户最后的
+/// 操作相反（enable 晚到 → config=true 但任务已删）。串行 worker 保证所有
+/// 请求按到达顺序执行、结果按相同顺序回传，最终状态恒等于最后一次请求。
+static AUTOSTART_WORKER: std::sync::OnceLock<std::sync::mpsc::Sender<bool>> =
+    std::sync::OnceLock::new();
+
 impl XiaomiApp {
     pub fn process_commands(&mut self, ctx: &egui::Context) {
         let mut needs_repaint = false;
@@ -90,18 +100,26 @@ impl XiaomiApp {
                     }
                 }
                 UiCommand::SetAutostart(enabled) => {
-                    // 计划任务注册/删除走后台线程：ITaskService 需要在本线程
-                    // 初始化 COM，GUI 线程的 COM 状态由 eframe/winit 管理，
-                    // 不得污染（见 21e0aaf 的公寓冲突教训）。
-                    let tx = self.cmd_tx.clone();
-                    std::thread::spawn(move || {
-                        let result = if enabled {
-                            crate::platform::autostart::enable()
-                        } else {
-                            crate::platform::autostart::disable()
-                        };
-                        let _ = tx.send(UiCommand::SetAutostartResult(enabled, result));
+                    // 注册/删除走**单一串行** worker 线程（见 AUTOSTART_WORKER
+                    // 注释）：ITaskService 需要在该线程初始化 COM，GUI 线程的
+                    // COM 状态由 eframe/winit 管理，不得污染（见 21e0aaf 的
+                    // 公寓冲突教训）；同时杜绝并发操作的乱序覆盖。
+                    let cmd_tx = self.cmd_tx.clone();
+                    let worker_tx = AUTOSTART_WORKER.get_or_init(move || {
+                        let (tx, rx) = std::sync::mpsc::channel::<bool>();
+                        std::thread::spawn(move || {
+                            for enabled in rx {
+                                let result = if enabled {
+                                    crate::platform::autostart::enable()
+                                } else {
+                                    crate::platform::autostart::disable()
+                                };
+                                let _ = cmd_tx.send(UiCommand::SetAutostartResult(enabled, result));
+                            }
+                        });
+                        tx
                     });
+                    let _ = worker_tx.send(enabled);
                 }
                 UiCommand::SetAutostartResult(enabled, result) => {
                     match result {

@@ -66,6 +66,29 @@ pub fn acquire() -> SingleInstance {
     }
 }
 
+/// 在**提权之前**的预检：是否已有另一实例在运行（F-AUTO-08）。
+///
+/// 必要性：`main()` 先于单实例检查执行 `elevate_self()`（启动即提权）。
+/// 若已有实例驻留托盘、用户再次启动（双击 exe / 运行快捷方式），当前
+/// 流程会先弹 UAC、再被互斥体判定为"第二实例"退出——每次手动启动都
+/// 白白弹一次 UAC。把"已有实例 → 唤醒窗口并退出"提前到提权之前即可
+/// 免掉这次无意义的提权提示。
+///
+/// 语义：**只探测不持有**——进程刚创建的新互斥体在这里立刻释放（Drop），
+/// 所有权由提权之后的 `acquire()` 正式取得；否则自我提权重启的新进程会
+/// 因旧进程短暂持有的互斥体被误判为"第二实例"而退出（见模块顶部注释）。
+/// API 异常（Unknown）时按"无冲突"返回 false，不阻塞启动。
+pub fn pre_flight() -> bool {
+    match acquire() {
+        SingleInstance::Existing => true,
+        SingleInstance::Acquired(guard) => {
+            drop(guard);
+            false
+        }
+        SingleInstance::Unknown => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,6 +138,29 @@ mod tests {
         match acquire() {
             SingleInstance::Acquired(guard) => drop(guard),
             other => panic!("expected acquired after release, got {:?}", other_kind(&other)),
+        }
+    }
+
+    /// 回归测试：已有实例运行时 pre_flight 必须返回 true（提权前预检），
+    /// 释放后必须返回 false——否则每次双击启动都会先弹 UAC 再被互斥体
+    /// 挡下，白白弹一次提权提示。
+    #[test]
+    fn test_pre_flight_detects_running_instance() {
+        let _guard = TEST_SERIALIZER.lock().unwrap_or_else(|e| e.into_inner());
+        match acquire() {
+            SingleInstance::Acquired(guard) => {
+                // 持有期间：另一实例"在运行"，预检必须命中。
+                assert!(pre_flight(), "pre_flight must see the held mutex");
+                drop(guard);
+                // 释放后：不再有实例，预检必须放行（且不遗留所有权）。
+                assert!(!pre_flight(), "pre_flight must pass after release");
+            }
+            SingleInstance::Existing => {
+                eprintln!("skip: a real app instance is running in this session");
+            }
+            SingleInstance::Unknown => {
+                eprintln!("skip: mutex API unavailable");
+            }
         }
     }
 
