@@ -2,7 +2,7 @@
 
 轻量级小米 PC 管理工具 — 电池养护 / 性能模式切换
 
-<img src="docs/ui.png" alt="UI 截图" style="max-width: 100px; height: auto;">
+![UI 截图](docs/ui.png =300x427)
 
 ## 主要功能
 
