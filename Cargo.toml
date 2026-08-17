@@ -3,6 +3,11 @@ name = "xiaomi-pc-manager-lite"
 version = "0.2.0"
 edition = "2021"
 description = "Xiaomi PC Manager Lite - Battery care / Performance mode"
+authors = ["opencode"]
+license = "MIT"
+
+[build-dependencies]
+winres = "0.1"
 
 [dependencies]
 eframe = "0.31"
@@ -34,3 +39,19 @@ windows = { version = "0.62", features = [
     "Win32_System_Services",
     "Win32_System_TaskScheduler",
 ]}
+
+# 发布构建优化（NFR-PERF-04 目标 ≤ 5 MB）：
+# - lto = "fat"：跨 crate 链接期优化，消除依赖间冗余代码；
+# - codegen-units = 1：单 codegen 单元最大化内联收益（与 LTO 配合）；
+# - opt-level = "z"：极致优化体积；本应用是 IO/等待密集（WMI/托盘/热键），
+#   无热计算路径，z 的尺寸收益没有性能代价；
+# - strip = true：剥离符号表（调试信息单独由 PDB 承载，不影响可排查性）；
+# - panic = "abort"：消除 unwind 表与 panic 处理路径。
+#   注意：panic hook 依然在 abort 前执行（写日志文件），不影响现有
+#   init_panic_hook 的日志化设计；debug 构建保持 unwinding。
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = "z"
+strip = true
+panic = "abort"
