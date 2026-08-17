@@ -13,6 +13,7 @@
 - `cargo build --release` — release build
 - `cargo check` — type check only
 - `cargo clippy` — lint
+- `cargo fmt --check` — formatting check (keep the tree rustfmt-clean)
 
 ### Run
 - `cargo run` — run from terminal

@@ -22,3 +22,5 @@ WinRing0x64.sys
 # OS
 .DS_Store
 Thumbs.db
+
+.opencode/
