@@ -1,15 +1,13 @@
 //! 进程权限查询与自我提权（WinRing0 后端需要管理员权限）。
 
+use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
-use windows::Win32::Security::{
-    GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY,
-};
+use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY};
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWDEFAULT;
-use windows::core::PCWSTR;
 
-use crate::util::to_pcwstr;
+use crate::util::WideString;
 
 /// 当前进程是否以管理员（提升）权限运行。
 pub fn is_admin() -> bool {
@@ -58,16 +56,16 @@ pub fn elevate_self() -> bool {
             return false;
         }
     };
-    let (_verb_buf, verb) = to_pcwstr("runas");
-    let (_path_buf, path) = to_pcwstr(&exe.to_string_lossy());
+    let verb = WideString::new("runas");
+    let path = WideString::new(&exe.to_string_lossy());
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
-    let (_args_buf, args_ptr) = to_pcwstr(&build_command_line(&args));
+    let args_buf = WideString::new(&build_command_line(&args));
     let ret = unsafe {
         ShellExecuteW(
             None,
-            verb,
-            path,
-            args_ptr,
+            verb.as_pcwstr(),
+            path.as_pcwstr(),
+            args_buf.as_pcwstr(),
             PCWSTR::null(),
             SW_SHOWDEFAULT,
         )
@@ -81,7 +79,10 @@ pub fn elevate_self() -> bool {
         log::warn!("Elevation declined by the user; continuing without admin. WinRing0 will be unavailable.");
         false
     } else {
-        log::warn!("Elevation failed (ret={}); continuing without admin. WinRing0 will be unavailable.", ret_val);
+        log::warn!(
+            "Elevation failed (ret={}); continuing without admin. WinRing0 will be unavailable.",
+            ret_val
+        );
         false
     }
 }

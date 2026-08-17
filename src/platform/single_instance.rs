@@ -42,11 +42,11 @@ pub enum SingleInstance {
 
 /// 尝试取得单实例互斥体所有权。
 pub fn acquire() -> SingleInstance {
-    let (_buf, name) = crate::util::to_pcwstr(INSTANCE_MUTEX_NAME);
+    let name = crate::util::WideString::new(INSTANCE_MUTEX_NAME);
     unsafe {
         // bInitialOwner=true：新创建则当前线程即所有者；已存在则
         // GetLastError 返回 ERROR_ALREADY_EXISTS。
-        let handle = match CreateMutexW(None, true, name) {
+        let handle = match CreateMutexW(None, true, name.as_pcwstr()) {
             Ok(h) => h,
             Err(_) => {
                 log::warn!("Single instance mutex: CreateMutexW failed; proceeding");
@@ -137,7 +137,10 @@ mod tests {
         // 释放后应能再次取得。
         match acquire() {
             SingleInstance::Acquired(guard) => drop(guard),
-            other => panic!("expected acquired after release, got {:?}", other_kind(&other)),
+            other => panic!(
+                "expected acquired after release, got {:?}",
+                other_kind(&other)
+            ),
         }
     }
 

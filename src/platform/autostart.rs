@@ -1,4 +1,5 @@
-use windows::core::{BSTR, Interface};
+use windows::core::{Interface, BSTR};
+use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 use windows::Win32::System::TaskScheduler::*;
 use windows::Win32::System::Variant::VARIANT;
 
@@ -14,17 +15,45 @@ use windows::Win32::System::Variant::VARIANT;
 const TASK_NAME: &str = "XiaomiPcManagerLite";
 const TASK_DESC: &str = "Xiaomi PC Manager Lite - 开机自启动";
 
-fn task_service() -> Result<ITaskService, String> {
-    // 调用方均为后台线程（UiCommand::SetAutostart 的线程、main.rs 的 sync
-    // 线程），本线程初始化 COM 不会污染 GUI 线程（见 21e0aaf 的教训）。
-    unsafe {
-        windows::Win32::System::Com::CoInitializeEx(
-            None,
-            windows::Win32::System::Com::COINIT_MULTITHREADED,
-        )
-        .ok()
-        .map_err(|e| format!("CoInitializeEx: {}", e))?;
+/// HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) = 0x80070002：任务不存在。
+/// GetTask / DeleteTask 对"任务不存在"返回该值（本机实测），与其它错误
+/// （瞬态 RPC/提供者失败、权限不足等）以此区分。
+const HRESULT_TASK_NOT_FOUND: i32 = -2147024894; // 0x80070002
+
+/// 单次任务调度器操作的 COM 生命周期作用域。
+///
+/// 每个**操作**（task_state / enable / disable）在自己独立的
+/// `ComScope::init()` 内执行并与其配对 `CoUninitialize`（Drop 时自动执行，
+/// 出错提前返回也不会漏）。历史实现只 `CoInitializeEx` 不 `CoUninitialize`：
+/// `SetAutostart` 串行 worker 线程每切换一次开关都会调用一次 enable/disable，
+/// 该线程的 COM 公寓引用计数随之无界增长；且与 fnkey.rs 明确写下的
+/// "init 与 uninit 严格配对"约定矛盾（见其 run_watcher_once 注释）。配对后
+/// 每次操作引用计数回到 0，下轮操作重新初始化，行为确定。
+struct ComScope;
+
+impl ComScope {
+    /// 在本线程初始化 MTA 公寓（操作期间持有，Drop 时归零）。
+    fn init() -> Result<Self, String> {
+        unsafe {
+            CoInitializeEx(None, COINIT_MULTITHREADED)
+                .ok()
+                .map_err(|e| format!("CoInitializeEx: {}", e))?;
+        }
+        Ok(Self)
     }
+}
+
+impl Drop for ComScope {
+    fn drop(&mut self) {
+        unsafe {
+            CoUninitialize();
+        }
+    }
+}
+
+fn task_service() -> Result<ITaskService, String> {
+    // COM 已由调用方操作入口（task_state / enable / disable）的 ComScope
+    // 初始化；本函数只负责创建服务对象。
     let service: ITaskService = unsafe {
         windows::Win32::System::Com::CoCreateInstance(
             &TaskScheduler,
@@ -55,12 +84,21 @@ fn task_folder(service: &ITaskService) -> Result<ITaskFolder, String> {
 }
 
 /// 已注册的计划任务（F-AUTO-06 的查询与校验基础）。
+///
+/// 只把 `GetTask` 的"任务不存在"（HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)
+/// = 0x80070002，本机实测）映射为 `Ok(None)`；**其余错误如实传播**。
+/// 历史实现把一切错误都当"任务不存在"（`Err(_) => Ok(None)`），
+/// 计划任务服务临时故障（RPC 中断、提供程序忙、权限变更）时会被误判为
+/// 任务缺失——`sync` 据此重建任务（TASK_CREATE_OR_UPDATE），把一次瞬态
+/// 错误放大成一次不必要的任务重写，且错误本身被静默吞掉。
 fn task_state() -> Result<Option<IRegisteredTask>, String> {
+    let _com = ComScope::init()?;
     let service = task_service()?;
     let folder = task_folder(&service)?;
     match unsafe { folder.GetTask(&BSTR::from(TASK_NAME)) } {
         Ok(task) => Ok(Some(task)),
-        Err(_) => Ok(None),
+        Err(e) if e.code().0 == HRESULT_TASK_NOT_FOUND => Ok(None),
+        Err(e) => Err(format!("GetTask: {}", e)),
     }
 }
 
@@ -81,10 +119,7 @@ fn task_matches(task: &IRegisteredTask) -> Result<bool, String> {
     };
 
     // 运行级别必须是最高权限。
-    let principal = unsafe {
-        def.Principal()
-            .map_err(|e| format!("Principal: {}", e))?
-    };
+    let principal = unsafe { def.Principal().map_err(|e| format!("Principal: {}", e))? };
     let mut runlevel = TASK_RUNLEVEL_LUA;
     unsafe {
         principal
@@ -97,10 +132,7 @@ fn task_matches(task: &IRegisteredTask) -> Result<bool, String> {
     }
 
     // 首个动作必须是 `<exe> --autostart`。
-    let actions = unsafe {
-        def.Actions()
-            .map_err(|e| format!("Actions: {}", e))?
-    };
+    let actions = unsafe { def.Actions().map_err(|e| format!("Actions: {}", e))? };
     let mut count = 0i32;
     unsafe {
         actions
@@ -134,10 +166,17 @@ fn task_matches(task: &IRegisteredTask) -> Result<bool, String> {
     let path_matches = bstr_to_string(&path).eq_ignore_ascii_case(&exe);
     let args_match = bstr_to_string(&args) == "--autostart";
     if !path_matches {
-        log::warn!("Autostart task path '{}' != current exe '{}'", bstr_to_string(&path), exe);
+        log::warn!(
+            "Autostart task path '{}' != current exe '{}'",
+            bstr_to_string(&path),
+            exe
+        );
     }
     if !args_match {
-        log::warn!("Autostart task args '{}' != '--autostart'", bstr_to_string(&args));
+        log::warn!(
+            "Autostart task args '{}' != '--autostart'",
+            bstr_to_string(&args)
+        );
     }
     Ok(path_matches && args_match)
 }
@@ -146,6 +185,7 @@ fn task_matches(task: &IRegisteredTask) -> Result<bool, String> {
 ///
 /// 登录触发 + 当前用户交互令牌，普通权限即可注册（无需管理员）。
 pub fn enable() -> Result<(), String> {
+    let _com = ComScope::init()?;
     let exe = std::env::current_exe()
         .map_err(|e| format!("current_exe: {}", e))?
         .to_string_lossy()
@@ -154,11 +194,8 @@ pub fn enable() -> Result<(), String> {
     let service = task_service()?;
     let folder = task_folder(&service)?;
 
-    let def: ITaskDefinition = unsafe {
-        service
-            .NewTask(0)
-            .map_err(|e| format!("NewTask: {}", e))?
-    };
+    let def: ITaskDefinition =
+        unsafe { service.NewTask(0).map_err(|e| format!("NewTask: {}", e))? };
 
     // 注册信息：名称 + 描述
     unsafe {
@@ -167,7 +204,7 @@ pub fn enable() -> Result<(), String> {
             .map_err(|e| format!("RegistrationInfo: {}", e))?;
         reg.SetDescription(&BSTR::from(TASK_DESC))
             .map_err(|e| format!("SetDescription: {}", e))?;
-        reg.SetAuthor(&BSTR::from("Xiaomi PC Manager Lite"))
+        reg.SetAuthor(&BSTR::from(crate::util::APP_NAME))
             .map_err(|e| format!("SetAuthor: {}", e))?;
     }
 
@@ -178,9 +215,7 @@ pub fn enable() -> Result<(), String> {
     // 应用启动时 `elevate_self()` 会每次登录弹出 UAC，违背自启动"驻留托盘
     // 不打扰用户"的设计。
     unsafe {
-        let principal = def
-            .Principal()
-            .map_err(|e| format!("Principal: {}", e))?;
+        let principal = def.Principal().map_err(|e| format!("Principal: {}", e))?;
         principal
             .SetRunLevel(TASK_RUNLEVEL_HIGHEST)
             .map_err(|e| format!("SetRunLevel: {}", e))?;
@@ -188,9 +223,7 @@ pub fn enable() -> Result<(), String> {
 
     // 触发器：登录时（TASK_TRIGGER_LOGON）
     unsafe {
-        let triggers = def
-            .Triggers()
-            .map_err(|e| format!("Triggers: {}", e))?;
+        let triggers = def.Triggers().map_err(|e| format!("Triggers: {}", e))?;
         let trigger: ITrigger = triggers
             .Create(TASK_TRIGGER_LOGON)
             .map_err(|e| format!("Triggers::Create: {}", e))?;
@@ -204,9 +237,7 @@ pub fn enable() -> Result<(), String> {
 
     // 动作：执行当前 exe，携带 --autostart
     unsafe {
-        let actions = def
-            .Actions()
-            .map_err(|e| format!("Actions: {}", e))?;
+        let actions = def.Actions().map_err(|e| format!("Actions: {}", e))?;
         let action: IAction = actions
             .Create(TASK_ACTION_EXEC)
             .map_err(|e| format!("Actions::Create: {}", e))?;
@@ -233,7 +264,11 @@ pub fn enable() -> Result<(), String> {
             )
             .map_err(|e| format!("RegisterTaskDefinition: {}", e))?;
     }
-    log::info!("Autostart task '{}' registered ({} --autostart)", TASK_NAME, exe);
+    log::info!(
+        "Autostart task '{}' registered ({} --autostart)",
+        TASK_NAME,
+        exe
+    );
     Ok(())
 }
 
@@ -243,17 +278,19 @@ pub fn enable() -> Result<(), String> {
 /// 会错误地展示"设置开机自启动失败"（F-AUTO-03），而任务本来就没有。
 /// 删除失败仅当任务存在但删除操作被拒绝（如权限不足）。
 pub fn disable() -> Result<(), String> {
+    let _com = ComScope::init()?;
     let service = task_service()?;
     let folder = task_folder(&service)?;
-    // HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)=0x80070002：任务不存在。
-    const HRESULT_TASK_NOT_FOUND: i32 = -2147024894; // 0x80070002
     match unsafe { folder.DeleteTask(&BSTR::from(TASK_NAME), 0) } {
         Ok(()) => {
             log::info!("Autostart task '{}' deleted", TASK_NAME);
             Ok(())
         }
         Err(e) if e.code().0 == HRESULT_TASK_NOT_FOUND => {
-            log::info!("Autostart task '{}' not found; nothing to delete", TASK_NAME);
+            log::info!(
+                "Autostart task '{}' not found; nothing to delete",
+                TASK_NAME
+            );
             Ok(())
         }
         Err(e) => Err(format!("DeleteTask: {}", e)),
@@ -266,6 +303,11 @@ pub fn disable() -> Result<(), String> {
 ///   参数与当前 exe 不符 → 任务失效）时重建；
 /// - 配置关闭但任务存在时删除（保守：不自动删除，交由用户操作）。
 pub fn sync(config_enabled: bool) -> Result<(), String> {
+    // ComScope 覆盖整个同步流程：`task_state` 返回的 IRegisteredTask 对象
+    // 随后被 `task_matches` 使用，若在 task_state 内就 CoUninitialize，
+    // 公寓销毁后对该 COM 对象的调用行为未定义（同步线程每次只跑一次，
+    // 此处必须持有到全部对象用完）。
+    let _com = ComScope::init()?;
     let task = task_state()?;
     match task {
         None => {
@@ -278,6 +320,13 @@ pub fn sync(config_enabled: bool) -> Result<(), String> {
             if config_enabled && !task_matches(&t)? {
                 log::warn!("Autostart task is stale; re-registering");
                 enable()?;
+            } else if !config_enabled {
+                // 配置关闭但任务存在：按设计不自动删除（保守，交由用户操作）。
+                // 记录一次 debug，便于排查"明明关掉了开机自启动，任务计划里
+                // 怎么还有 XiaomiPcManagerLite"。
+                log::debug!(
+                    "Autostart task exists but config disables it; leaving untouched (user-managed)"
+                );
             }
         }
     }
@@ -294,6 +343,18 @@ mod tests {
         assert_eq!(TASK_NAME, "XiaomiPcManagerLite");
     }
 
+    /// 回归测试（无条件兜底清理）："任务不存在"的判定 HRESULT 必须是
+    /// HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)=0x80070002（本机实测
+    /// ITaskFolder::GetTask 对缺失任务返回该值）。历史实现把 GetTask 的
+    /// **一切**错误都当作"任务不存在"，任务计划服务瞬态故障会触发 sync
+    /// 不必要的重建；此常量是 task_state 区分"不存在"与"其它错误"的基准，
+    /// 锁定其值与位模式，防止未来改动引入漂移。
+    #[test]
+    fn test_task_not_found_hresult_is_error_file_not_found() {
+        assert_eq!(HRESULT_TASK_NOT_FOUND, -2_147_024_894);
+        assert_eq!(HRESULT_TASK_NOT_FOUND as u32, 0x8007_0002);
+    }
+
     /// 真实环境验证（本机）：注册任务 → 查询存在 → 删除。
     /// 任务注册无需管理员（交互令牌、非最高权限）。
     ///
@@ -303,7 +364,9 @@ mod tests {
     #[test]
     fn test_enable_exists_disable_roundtrip() {
         if std::env::var_os("XIAOMI_LIVE_TASKSCHEDULER_TEST").is_none() {
-            eprintln!("skipping live Task Scheduler test (set XIAOMI_LIVE_TASKSCHEDULER_TEST=1 to run)");
+            eprintln!(
+                "skipping live Task Scheduler test (set XIAOMI_LIVE_TASKSCHEDULER_TEST=1 to run)"
+            );
             return;
         }
         let _ = env_logger::builder().is_test(true).try_init();
@@ -312,9 +375,15 @@ mod tests {
         assert!(task_state().unwrap_or(None).is_none());
 
         enable().expect("enable must succeed");
-        assert!(task_state().unwrap_or(None).is_some(), "task must exist after enable");
+        assert!(
+            task_state().unwrap_or(None).is_some(),
+            "task must exist after enable"
+        );
 
         disable().expect("disable must succeed");
-        assert!(task_state().unwrap_or(None).is_none(), "task must be gone after disable");
+        assert!(
+            task_state().unwrap_or(None).is_none(),
+            "task must be gone after disable"
+        );
     }
 }
