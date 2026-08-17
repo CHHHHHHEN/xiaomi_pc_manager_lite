@@ -1,41 +1,122 @@
+use std::cell::RefCell;
 use std::sync::{mpsc, Mutex, OnceLock};
 
+use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT,
 };
 use windows::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIM_ADD, NIF_ICON, NIF_MESSAGE, NIF_TIP, NOTIFYICONDATAW,
+    Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_MODIFY,
+    NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreateIconFromResourceEx, CreatePopupMenu, DefWindowProcW,
-    DestroyMenu, GetCursorPos, KillTimer, PostMessageW, PostQuitMessage,
-    RegisterWindowMessageW, SetForegroundWindow, SetTimer, TrackPopupMenu, WM_APP,
-    WM_COMMAND, WM_DESTROY, WM_HOTKEY, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WM_TIMER,
-    HICON, MF_SEPARATOR, MF_STRING, LR_DEFAULTCOLOR, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
-    TPM_LEFTBUTTON,
+    AppendMenuW, CreatePopupMenu, DefWindowProcW, DestroyMenu, GetCursorPos, KillTimer,
+    PostMessageW, PostQuitMessage, RegisterWindowMessageW, SetForegroundWindow, SetTimer,
+    TrackPopupMenu, HICON, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, TPM_BOTTOMALIGN,
+    TPM_LEFTALIGN, TPM_LEFTBUTTON, WM_APP, WM_COMMAND, WM_DESTROY, WM_HOTKEY, WM_LBUTTONUP,
+    WM_NULL, WM_RBUTTONUP, WM_TIMER,
 };
-use windows::core::PCWSTR;
 
 use crate::command::UiCommand;
-use crate::tray::window;
+use crate::tray::message_window;
+use crate::tray::{SharedTrayStatus, TrayStatus};
 
 const WM_TRAY: u32 = WM_APP + 1;
 const WM_POWERBROADCAST: u32 = 0x0218;
-const PBT_APMPOWERSTATUSCHANGE: u32 = 0x0018;
+
+/// PBT_APMPOWERSTATUSCHANGE = 0x000A：交流/电池供电状态变化。
+/// 值由 Microsoft SDK（WinUser.h）定义。历史实现误写为 0x0018（=24，
+/// 不属于任何 PBT 事件），导致 `handle_power_broadcast` 的 wParam 比较
+/// 永不成立——"电源切换时自动重设"静默失效，且连对应用日志都不会出现。
+/// 常量值由回归测试锁定（test_power_broadcast_constants_match_sdk）。
+const PBT_APMPOWERSTATUSCHANGE: u32 = 0x000A;
+
+/// PBT_APMRESUMEAUTOMATIC = 0x0012：系统从低功耗状态自动恢复（每次恢复
+/// 都会发送）。PBT_APMRESUMESUSPEND = 0x0007：用户输入触发的恢复。
+/// 两者不触发重设，但记录便于排查"休眠唤醒后状态异常"。
+const PBT_APMRESUMEAUTOMATIC: u32 = 0x0012;
+const PBT_APMRESUMESUSPEND: u32 = 0x0007;
 
 const MID_SHOW: u32 = 100;
 const MID_QUIT: u32 = 101;
+const MID_TOGGLE_BATTERY: u32 = 102;
+const MID_CYCLE_PERF: u32 = 103;
+/// 性能模式直接选择的子菜单项基址：`MID_PERF_BASE + PerfMode::all()` 下标。
+const MID_PERF_BASE: u32 = 110;
 
 const HK_TOGGLE_BATTERY: i32 = 1;
-const HK_CYCLE_PERF: i32 = 2;
 
 /// NIM_ADD 失败时的重试定时器（任务栏未就绪时 `TaskbarCreated` 广播可能
 /// 已经错过，见 register_tray_icon 的注释）。
 const TIMER_TRAY_RETRY: usize = 1;
 const TRAY_RETRY_MS: u32 = 2000;
 
-static CMD_TX: OnceLock<mpsc::Sender<UiCommand>> = OnceLock::new();
+/// Tooltip 刷新的定时器：托盘常驻期间后台定期读取共享状态刷新 tooltip，
+/// 使"性能模式/电池养护"在托盘悬停文字上保持实时（窗口离屏隐藏时 GUI
+/// update 循环仍运行，但托盘由消息泵的 WM_TIMER 独立驱动，与 GUI 解耦）。
+const TIMER_STATUS: usize = 2;
+const STATUS_REFRESH_MS: u32 = 2000;
+
+// 托盘 worker 线程的命令通道发送端。
+//
+// 用**线程局部存储**而非进程级 `static`：托盘消息窗口的 `wndproc`（及
+// 热键/电源广播/托盘事件回调）全部在该 worker 线程上执行（`message_loop`
+// 的 `DispatchMessageW` 同线程），通道生命周期恰好等于 worker 线程。
+// 进程级 `OnceLock` 方案在 `spawn` 被再次调用时 `set().ok()` 静默丢弃
+// 新发送端，全局状态横跨本不需要跨线程的边界。
+thread_local! {
+    static CMD_TX: RefCell<Option<mpsc::Sender<UiCommand>>> =
+        const { RefCell::new(None) };
+}
+
+// 托盘线程的共享状态引用（worker 线程及其 wndproc 回调使用）。
+thread_local! {
+    static TRAY_STATUS: RefCell<Option<SharedTrayStatus>> =
+        const { RefCell::new(None) };
+}
+
+// 托盘线程记录的上一次已知性能模式：用于检测"性能模式变化"并在窗口隐藏时
+// 弹托盘通知（见 show_perf_notification）。
+thread_local! {
+    static LAST_PERF_MODE: RefCell<Option<u8>> = const { RefCell::new(None) };
+}
+
+// 托盘线程记录的上一次已知电池养护状态：用于检测"养护状态变化"并在窗口
+// 隐藏时弹托盘通知（见 show_battery_care_notification）。与 LAST_PERF_MODE
+// 分离：两者变化相互独立（Fn+K 循环性能模式不会触发养护通知，反之亦然）。
+thread_local! {
+    static LAST_BATTERY_CARE: RefCell<Option<bool>> = const { RefCell::new(None) };
+}
+
+// 托盘线程的 egui Context 唤醒句柄（GUI 事件循环隐藏态唤醒用）。
+thread_local! {
+    static EGUI_CTX: RefCell<Option<egui::Context>> = const { RefCell::new(None) };
+}
+
+/// 读取当前线程的命令发送端副本（worker 线程及其 wndproc 回调使用）。
+fn cmd_tx() -> Option<mpsc::Sender<UiCommand>> {
+    CMD_TX.with(|tx| tx.borrow().clone())
+}
+
+/// 发送命令并唤醒 GUI 事件循环。
+///
+/// 窗口离屏隐藏（驻留托盘）时 update 循环仍以 500ms 间隔运行（修订 1.19），
+/// 命令最迟一个间隔被处理；发送后立即 `ctx.request_repaint()` 把延迟压到
+/// 最小（托盘点击/热键/Fn+K 即时响应）。
+fn send_command(cmd: UiCommand) {
+    if let Some(tx) = cmd_tx() {
+        if let Err(e) = tx.send(cmd) {
+            log::warn!("Tray: command send failed: {}", e);
+        }
+        // 无论发送成功与否都尝试唤醒：即使通道已断，请求重绘也无副作用。
+        EGUI_CTX.with(|c| {
+            if let Some(ctx) = c.borrow().as_ref() {
+                ctx.request_repaint();
+            }
+        });
+    }
+}
 
 /// 托盘图标重建所需状态（含 HICON）。
 struct TrayIconState {
@@ -59,25 +140,36 @@ static TRAY_ICON: Mutex<Option<TrayIconState>> = Mutex::new(None);
 fn taskbar_created_msg() -> u32 {
     static MSG_ID: OnceLock<u32> = OnceLock::new();
     *MSG_ID.get_or_init(|| {
-        let (_buf, name) = crate::util::to_pcwstr("TaskbarCreated");
-        unsafe { RegisterWindowMessageW(name) }
+        let name = crate::util::WideString::new("TaskbarCreated");
+        unsafe { RegisterWindowMessageW(name.as_pcwstr()) }
     })
 }
 
-pub fn spawn(cmd_tx: mpsc::Sender<UiCommand>) {
-    CMD_TX.set(cmd_tx).ok();
-    std::thread::spawn(worker_thread);
+pub fn spawn(cmd_tx: mpsc::Sender<UiCommand>, status: SharedTrayStatus, ctx: egui::Context) {
+    std::thread::spawn(move || worker_thread(cmd_tx, status, ctx));
 }
 
-fn worker_thread() {
-    let hwnd = match window::create_message_window() {
+fn worker_thread(cmd_tx: mpsc::Sender<UiCommand>, status: SharedTrayStatus, ctx: egui::Context) {
+    // 托盘 worker 生命周期起点：消息窗口创建失败等路径会提前 return，
+    // 从日志的 start → (error) → 无 exit 即可判断 worker 是否完整存活。
+    log::info!("Tray worker thread started");
+    // 发送端存入本线程的线程局部存储：wndproc 及全部回调在本线程执行，
+    // 通过 cmd_tx() 读取；worker 线程结束（message_loop 返回）即随线程
+    // 局部存储一起销毁，发送端关闭，GUI 侧 recv 立即得到断开信号。
+    CMD_TX.with(|tx| *tx.borrow_mut() = Some(cmd_tx));
+    // GUI 事件循环唤醒句柄：发送命令后 request_repaint 即时唤醒（窗口离屏
+    // 存活时 update 循环仍运行，命令随时可被消费，见修订 1.19）。
+    EGUI_CTX.with(|c| *c.borrow_mut() = Some(ctx));
+    TRAY_STATUS.with(|s| *s.borrow_mut() = Some(status));
+
+    let hwnd = match message_window::create_message_window() {
         Ok(w) => w,
         Err(e) => {
             log::error!("Message worker window: {}", e);
             return;
         }
     };
-    if let Err(e) = window::set_wndproc(hwnd, wndproc) {
+    if let Err(e) = message_window::set_wndproc(hwnd, wndproc) {
         log::error!("Set message window wndproc: {}", e);
         return;
     }
@@ -86,26 +178,34 @@ fn worker_thread() {
     // 热键注册不依赖托盘是否注册成功：托盘注册失败（任务栏未就绪）时
     // 热键仍须可用，图标稍后由重试定时器或 TaskbarCreated 广播补建。
     // MOD_NOREPEAT：不设置时按住热键会因键盘自动重复产生连续的 WM_HOTKEY，
-    // 导致 Ctrl+Alt+B 反复翻转养护开关、Ctrl+Alt+P 连续循环性能模式
-    // （MSDN RegisterHotKey: "does not yield multiple hotkey notifications"）。
+    // 导致 Ctrl+Alt+B 反复翻转养护开关（MSDN RegisterHotKey: "does not yield
+    // multiple hotkey notifications"）。
     let mods = MOD_CONTROL | MOD_ALT | MOD_NOREPEAT;
     if let Err(e) = unsafe { RegisterHotKey(Some(hwnd), HK_TOGGLE_BATTERY, mods, 0x42) } {
         log::error!("Register hotkey (B): {:?}", e);
+    } else {
+        log::info!("Hotkey registered: Ctrl+Alt+B (toggle battery care)");
     }
-    if let Err(e) = unsafe { RegisterHotKey(Some(hwnd), HK_CYCLE_PERF, mods, 0x50) } {
-        log::error!("Register hotkey (P): {:?}", e);
-    }
+    // 性能模式循环不再注册全局热键（Ctrl+Alt+P 已移除）：循环由 Fn+K
+    // 功能键绑定提供（见 F-HOTKEY-02 / F-FNK，修订 1.19），Fn+K 是笔记本
+    // 上最直接的单键入口，且不占用全局热键槽位、不与其他软件冲突。
 
     if let Err(e) = register_tray_icon(hwnd) {
         log::error!("Tray icon: {}", e);
     }
 
-    window::message_loop(hwnd);
+    // 启动 tooltip 实时刷新定时器（NIM_ADD 失败时仍启动：状态刷新只改
+    // tooltip 文案，与图标是否出现独立；图标恢复后即开始实时更新）。
+    let _ = unsafe { SetTimer(Some(hwnd), TIMER_STATUS, STATUS_REFRESH_MS, None) };
+
+    message_window::message_loop(hwnd);
+    // message_loop 收到 WM_QUIT 后返回：托盘 worker 生命周期结束。托盘驻留
+    // 期间该线程本应无限存活，此处记录退出，避免"托盘图标消失/热键失效"
+    // 时日志里只有 start 没有 exit 无从定位。
+    log::info!("Tray worker message loop exited; worker thread ending");
 }
 
-unsafe extern "system" fn wndproc(
-    hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM,
-) -> LRESULT {
+unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_DESTROY => {
             PostQuitMessage(0);
@@ -127,6 +227,8 @@ unsafe extern "system" fn wndproc(
         WM_TIMER => {
             if wparam.0 == TIMER_TRAY_RETRY {
                 retry_tray_icon(hwnd);
+            } else if wparam.0 == TIMER_STATUS {
+                refresh_tray_tooltip();
             }
             LRESULT(0)
         }
@@ -138,12 +240,28 @@ fn handle_menu_command(wparam: WPARAM, _lparam: LPARAM) -> LRESULT {
     let id = (wparam.0 as u32) & 0xFFFF;
     match id {
         MID_SHOW => {
-            // 直接操作窗口：窗口隐藏后 GUI update 循环停止，经命令通道
-            // 的命令无人消费，托盘必须自给自足。
+            // 直接操作窗口：托盘隐藏/显示不依赖 GUI update 循环（窗口离屏
+            // 隐藏时循环仍运行，但托盘自给自足可即时生效，修订 1.19）。
             toggle_main_window();
         }
         MID_QUIT => {
             quit_app();
+        }
+        MID_TOGGLE_BATTERY => {
+            log::info!("Tray menu: toggle battery care");
+            send_command(UiCommand::ToggleBatteryCare);
+        }
+        MID_CYCLE_PERF => {
+            log::info!("Tray menu: cycle perf mode");
+            send_command(UiCommand::CyclePerfMode);
+        }
+        // 性能模式子菜单项：MID_PERF_BASE + PerfMode::all() 下标。
+        id if (MID_PERF_BASE..MID_PERF_BASE + 16).contains(&id) => {
+            let idx = (id - MID_PERF_BASE) as usize;
+            if let Some(mode) = crate::ec::performance::PerfMode::all().get(idx) {
+                log::info!("Tray menu: set perf mode {}", mode.name());
+                send_command(UiCommand::SetPerfMode(mode.ec_value()));
+            }
         }
         _ => {}
     }
@@ -179,17 +297,12 @@ fn toggle_main_window() {
 const QUIT_FALLBACK_MS: u64 = 15000;
 
 fn quit_app() {
-    if let Some(hwnd) = crate::platform::window::find_main_window_handle() {
-        log::info!("Tray quit: posting WM_QUIT to main window");
-        let _ = unsafe {
-            windows::Win32::UI::WindowsAndMessaging::PostMessageW(
-                Some(hwnd),
-                windows::Win32::UI::WindowsAndMessaging::WM_QUIT,
-                WPARAM(0),
-                LPARAM(0),
-            )
-        };
-    }
+    log::info!("Tray quit: requesting app shutdown");
+    // 经命令通道请求 GUI 线程正常退出（ViewportCommand::Close → eframe
+    // run_native 返回 → 组件 Drop 清理）。不能直接 `PostMessage(WM_QUIT)`
+    // 给主窗口：winit 事件循环不消费外部 WM_QUIT，run_native 不返回，
+    // 只能靠下方兜底 process::exit 强杀、跳过所有清理（实测，修订 1.21）。
+    send_command(UiCommand::Quit);
     std::thread::sleep(std::time::Duration::from_millis(QUIT_FALLBACK_MS));
     log::warn!(
         "Tray quit: app did not exit within {}ms; forcing exit",
@@ -199,25 +312,42 @@ fn quit_app() {
 }
 
 fn handle_hotkey(wparam: WPARAM) -> LRESULT {
-    if let Some(tx) = CMD_TX.get() {
-        let id = wparam.0 as i32;
-        match id {
-            HK_TOGGLE_BATTERY => { let _ = tx.send(UiCommand::ToggleBatteryCare); }
-            HK_CYCLE_PERF => { let _ = tx.send(UiCommand::CyclePerfMode); }
-            _ => {}
-        }
+    let id = wparam.0 as i32;
+    log::debug!("Hotkey received: id={}", id);
+    if id == HK_TOGGLE_BATTERY {
+        send_command(UiCommand::ToggleBatteryCare);
     }
     LRESULT(0)
 }
 
 fn handle_power_broadcast(wparam: WPARAM, _lparam: LPARAM) -> LRESULT {
-    if wparam.0 == PBT_APMPOWERSTATUSCHANGE as usize {
-        log::info!("Power status changed");
-        if let Some(tx) = CMD_TX.get() {
-            let _ = tx.send(UiCommand::ReapplyConfig);
+    match power_broadcast_to_command(wparam.0 as u32) {
+        Some(UiCommand::ReapplyConfig) => {
+            log::info!("Power broadcast 0x{:08X}; sending ReapplyConfig", wparam.0);
+            send_command(UiCommand::ReapplyConfig);
+        }
+        _ => {
+            log::debug!("Power broadcast ignored: 0x{:08X}", wparam.0);
         }
     }
     LRESULT(1)
+}
+
+/// 电源广播 → 应执行的命令的纯决策逻辑（可单测）。
+///
+/// - `PBT_APMPOWERSTATUSCHANGE`（AC/电池切换）：重新应用配置；
+/// - 休眠唤醒（`PBT_APMRESUMEAUTOMATIC`/`PBT_APMRESUMESUSPEND`）：休眠期间
+///   EC/固件可能重置部分寄存器（风扇策略/充电上限），唤醒后同样重新应用
+///   配置（"唤醒后设置不生效"是用户高频反馈）；内部再按
+///   `auto_reapply_on_power_change` 决定是否真正写入；
+/// - 其余电源事件（挂起、电源设置变更等）：不处理。
+fn power_broadcast_to_command(wparam: u32) -> Option<UiCommand> {
+    match wparam {
+        PBT_APMPOWERSTATUSCHANGE | PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMESUSPEND => {
+            Some(UiCommand::ReapplyConfig)
+        }
+        _ => None,
+    }
 }
 
 fn handle_tray_event(hwnd: HWND, lparam: LPARAM) -> LRESULT {
@@ -242,7 +372,7 @@ fn register_tray_icon(hwnd: HWND) -> Result<(), String> {
 
     // 先保存 NID（含 HICON）：即使本次 NIM_ADD 失败（如应用在任务栏就绪前
     // 启动），重试定时器 / TaskbarCreated 广播仍会按此状态自动重建图标。
-    *TRAY_ICON.lock().unwrap_or_else(|e| e.into_inner()) = Some(TrayIconState { nid });
+    *crate::util::lock_or_recover(&TRAY_ICON, "tray icon") = Some(TrayIconState { nid });
 
     if !unsafe { Shell_NotifyIconW(NIM_ADD, &nid).as_bool() } {
         // TaskbarCreated 只在任务栏创建时广播一次：若该广播已先于本消息窗口
@@ -266,7 +396,7 @@ fn build_tray_nid(hwnd: HWND, hicon: HICON) -> NOTIFYICONDATAW {
     nid.hIcon = hicon;
 
     nid.szTip = [0u16; 128];
-    set_tip(&mut nid.szTip, "Xiaomi PC Manager Lite");
+    set_tip(&mut nid.szTip, crate::util::APP_NAME);
     nid
 }
 
@@ -279,11 +409,140 @@ fn set_tip(sz_tip: &mut [u16; 128], tip: &str) {
     sz_tip[..wide.len()].copy_from_slice(&wide);
 }
 
+/// 生成托盘 tooltip 文案（含实时状态）。
+fn build_tooltip(status: &TrayStatus) -> String {
+    let perf = crate::ec::performance::PerfMode::name_or_unknown(status.performance_mode);
+    let care = if status.battery_care_enabled {
+        format!("开启 (上限{}%)", status.charge_limit)
+    } else {
+        "关闭".to_string()
+    };
+    // 电量来自系统 API（GetSystemPowerStatus），实时读取。
+    let snap = crate::platform::power::power_snapshot();
+    let power = match (snap.status, snap.battery_percent) {
+        (crate::platform::power::PowerStatus::OnAc, Some(pct)) => format!("交流 {pct}%"),
+        (crate::platform::power::PowerStatus::OnAc, None) => "交流".to_string(),
+        (crate::platform::power::PowerStatus::OnBattery, Some(pct)) => format!("电池 {pct}%"),
+        (crate::platform::power::PowerStatus::OnBattery, None) => "电池".to_string(),
+        (crate::platform::power::PowerStatus::Unknown, _) => "未知".to_string(),
+    };
+    format!(
+        "{} · 性能:{} · 养护:{} · 电源:{}",
+        crate::util::APP_NAME,
+        perf,
+        care,
+        power
+    )
+}
+
+/// 按共享状态刷新托盘 tooltip（NIM_MODIFY）。由 STATUS_REFRESH_MS 定时器
+/// 周期驱动：托盘常驻期间后台定期更新，保证悬停提示保持最新（不依赖 GUI
+/// update 循环）。图标尚未创建（NIM_ADD 失败重试期）时
+/// 直接跳过——定时器继续跑，图标恢复后下一轮即生效。
+fn refresh_tray_tooltip() {
+    let Some(status) = TRAY_STATUS.with(|s| s.borrow().clone()) else {
+        return;
+    };
+    let Some(mut nid) = tray_nid_snapshot() else {
+        return;
+    };
+    let (text, perf_mode, battery_care) = {
+        let guard = crate::util::lock_or_recover(&status, "tray status");
+        (
+            build_tooltip(&guard),
+            guard.performance_mode,
+            guard.battery_care_enabled,
+        )
+    };
+    // 只更新 tooltip（NIF_TIP）：NIM_MODIFY 按 nid 的 uFlags 只改声明字段，
+    // 不改图标/消息，避免重建图标的闪烁与消息通道重置。
+    nid.uFlags = NIF_TIP;
+    set_tip(&mut nid.szTip, &text);
+    if !unsafe { Shell_NotifyIconW(NIM_MODIFY, &nid).as_bool() } {
+        // 修改失败通常意味着图标尚未注册（重试期），忽略——定时器下轮重试。
+        log::debug!("Tray: NIM_MODIFY tooltip failed (icon not ready?)");
+    }
+
+    // 性能模式/电池养护变化时弹通知。只在主窗口隐藏时弹：窗口可见时用户
+    // 能直接看到 GUI 变化，再弹通知反而是打扰（NFR-UX 一致性）。
+    let should_notify_perf =
+        should_notify_perf_change(LAST_PERF_MODE.with(|m| *m.borrow()), perf_mode);
+    LAST_PERF_MODE.with(|m| *m.borrow_mut() = Some(perf_mode));
+    let should_notify_care =
+        should_notify_care_change(LAST_BATTERY_CARE.with(|m| *m.borrow()), battery_care);
+    LAST_BATTERY_CARE.with(|m| *m.borrow_mut() = Some(battery_care));
+    if crate::platform::window::main_window_visible() {
+        return;
+    }
+    if should_notify_perf {
+        let name = crate::ec::performance::PerfMode::name_or_unknown(perf_mode);
+        show_perf_notification(nid, name);
+    }
+    if should_notify_care {
+        show_battery_care_notification(nid, battery_care);
+    }
+}
+
+/// 纯决策：性能模式变化且非首次采样时是否需要弹通知。
+///
+/// 首次采样（last 为 None）不弹：启动时托盘首次拿到状态只是基线，并非用户
+/// 操作导致的切换，弹通知会打扰。之后每次变化都视为真实切换（Fn+K/热键/
+/// 电池自动切节能/托盘菜单），返回 true 由调用方在窗口隐藏时弹气泡。
+fn should_notify_perf_change(last: Option<u8>, current: u8) -> bool {
+    matches!(last, Some(prev) if prev != current)
+}
+
+/// 纯决策：电池养护状态变化且非首次采样时是否需要弹通知。
+///
+/// 与 `should_notify_perf_change` 语义一致（首次采样不弹、之后每次变化都
+/// 视为真实切换）。单独成函数便于单元测试与独立演进。
+fn should_notify_care_change(last: Option<bool>, current: bool) -> bool {
+    matches!(last, Some(prev) if prev != current)
+}
+
+/// 弹托盘气泡通知（NIF_INFO）：通用通知（性能模式/电池养护共用）。
+///
+/// 只在"窗口隐藏 + 状态变化"时调用。气泡是系统托盘通知，无需额外窗口即可
+/// 展示，用户在当前窗口继续工作的同时获得状态切换反馈。
+fn show_tray_notification(nid: NOTIFYICONDATAW, body: &str) {
+    log::info!("Tray notification: {}", body);
+    let mut nid = nid;
+    nid.uFlags = NIF_INFO;
+    nid.dwInfoFlags = NIIF_INFO;
+    // 气泡标题与正文（szInfoTitle/szInfo 均为 64 UTF-16 单元上限）。
+    let title = crate::util::WideString::new(crate::util::APP_NAME);
+    let title_len = title.units().len().min(64);
+    nid.szInfoTitle[..title_len].copy_from_slice(&title.units()[..title_len]);
+    let info_wide: Vec<u16> = body.encode_utf16().take(63).collect();
+    nid.szInfo[..info_wide.len()].copy_from_slice(&info_wide);
+    // NIM_MODIFY 携带 NIF_INFO 触发气泡。
+    if !unsafe { Shell_NotifyIconW(NIM_MODIFY, &nid).as_bool() } {
+        log::debug!("Tray: NIM_MODIFY notification failed");
+    }
+}
+
+/// 弹托盘气泡通知：性能模式已切换。
+fn show_perf_notification(nid: NOTIFYICONDATAW, perf_name: &str) {
+    show_tray_notification(nid, &format!("性能模式: {}", perf_name));
+}
+
+/// 弹托盘气泡通知：电池养护已启用/停用。
+fn show_battery_care_notification(nid: NOTIFYICONDATAW, enabled: bool) {
+    show_tray_notification(
+        nid,
+        if enabled {
+            "电池养护: 已启用"
+        } else {
+            "电池养护: 已停用"
+        },
+    );
+}
+
 /// 在锁内拷贝 NID（NOTIFYICONDATAW 实现 Copy）后立即释放锁，再调用
 /// Shell_NotifyIconW。避免 Shell 调用期间持有锁：wndproc 处理其它消息时
 /// 也会获取同一把锁，若 Shell 调用重入本窗口将形成死锁。
 fn tray_nid_snapshot() -> Option<NOTIFYICONDATAW> {
-    let guard = TRAY_ICON.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = crate::util::lock_or_recover(&TRAY_ICON, "tray icon");
     guard.as_ref().map(|s| s.nid)
 }
 
@@ -321,11 +580,50 @@ fn handle_taskbar_created(hwnd: HWND) {
 
 fn show_tray_menu(hwnd: HWND) {
     let hmenu = unsafe { CreatePopupMenu().unwrap_or_default() };
-    let (_show_buf, show) = crate::util::to_pcwstr("显示/隐藏窗口");
-    let _ = unsafe { AppendMenuW(hmenu, MF_STRING, MID_SHOW as usize, show) };
+
+    // 性能模式直接选择子菜单：列出全部模式，当前模式打勾（读取共享状态）。
+    // 相比"切换性能模式"循环，用户可一步直达目标模式（F-PERF 核心场景）。
+    let perf_sub = unsafe { CreatePopupMenu().unwrap_or_default() };
+    let current_perf = TRAY_STATUS
+        .with(|s| s.borrow().clone())
+        .map(|s| crate::util::lock_or_recover(&s, "tray status").performance_mode);
+    for (idx, mode) in crate::ec::performance::PerfMode::all().iter().enumerate() {
+        let name = crate::util::WideString::new(mode.name());
+        let flags = if Some(mode.ec_value()) == current_perf {
+            MF_STRING | MF_CHECKED
+        } else {
+            MF_STRING
+        };
+        let _ = unsafe {
+            AppendMenuW(
+                perf_sub,
+                flags,
+                (MID_PERF_BASE + idx as u32) as usize,
+                name.as_pcwstr(),
+            )
+        };
+    }
+    let perf_title = crate::util::WideString::new("性能模式");
+    let _ = unsafe { AppendMenuW(hmenu, MF_POPUP, perf_sub.0 as usize, perf_title.as_pcwstr()) };
+
+    // 菜单项顺序：性能模式 → 常用操作（电池养护 / 性能模式循环）→ 分隔 → 窗口显隐 → 退出。
+    let toggle = crate::util::WideString::new("切换电池养护");
+    let _ = unsafe {
+        AppendMenuW(
+            hmenu,
+            MF_STRING,
+            MID_TOGGLE_BATTERY as usize,
+            toggle.as_pcwstr(),
+        )
+    };
+    let cycle = crate::util::WideString::new("切换性能模式");
+    let _ = unsafe { AppendMenuW(hmenu, MF_STRING, MID_CYCLE_PERF as usize, cycle.as_pcwstr()) };
     let _ = unsafe { AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null()) };
-    let (_quit_buf, quit) = crate::util::to_pcwstr("退出");
-    let _ = unsafe { AppendMenuW(hmenu, MF_STRING, MID_QUIT as usize, quit) };
+    let show = crate::util::WideString::new("显示/隐藏窗口");
+    let _ = unsafe { AppendMenuW(hmenu, MF_STRING, MID_SHOW as usize, show.as_pcwstr()) };
+    let _ = unsafe { AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null()) };
+    let quit = crate::util::WideString::new("退出");
+    let _ = unsafe { AppendMenuW(hmenu, MF_STRING, MID_QUIT as usize, quit.as_pcwstr()) };
 
     let mut pt = POINT { x: 0, y: 0 };
     let _ = unsafe { GetCursorPos(&mut pt) };
@@ -349,28 +647,15 @@ fn show_tray_menu(hwnd: HWND) {
     let _ = unsafe { DestroyMenu(hmenu) };
 }
 
+/// 从托盘 ICO 字节构建 HICON：解析多尺寸 ICO，取最接近 16px（托盘标准
+/// 尺寸）的单帧交给 `CreateIconFromResourceEx`。
+///
+/// **为什么不能把整份 ICO 直接传**：实测整份多帧 ICO 会返回
+/// `0x80070006`（INVALID_HANDLE），单帧 PNG 块才能创建（见
+/// `platform::window::create_hicon_from_ico` 的注释）。恶意/损坏 ICO 的
+/// 越界/溢出区间由该 helper 统一校验。
 fn load_icon(bytes: &[u8]) -> Result<windows::Win32::UI::WindowsAndMessaging::HICON, String> {
-    if bytes.len() < 6 {
-        return Err("ICO too short".into());
-    }
-    let count = u16::from_le_bytes([bytes[4], bytes[5]]) as usize;
-    if count == 0 || bytes.len() < 6 + count * 16 {
-        return Err("No icon entries".into());
-    }
-    let e = 6;
-    let off = u32::from_le_bytes([bytes[e + 12], bytes[e + 13], bytes[e + 14], bytes[e + 15]]) as usize;
-    let sz = u32::from_le_bytes([bytes[e + 8], bytes[e + 9], bytes[e + 10], bytes[e + 11]]) as usize;
-    // checked_add: 恶意/损坏的 ICO 可能使 off+sz 溢出（32 位平台 usize 溢出
-    // 会 panic 或回绕），进而绕过 OOB 检查、`&bytes[off..off+sz]` 越界 panic。
-    // 用 checked_add 先验证区间落在字节缓冲内再切取。
-    match off.checked_add(sz) {
-        Some(end) if end <= bytes.len() => {}
-        _ => return Err("OOB".into()),
-    }
-    unsafe {
-        CreateIconFromResourceEx(&bytes[off..off + sz], true, 0x00030000, 0, 0, LR_DEFAULTCOLOR)
-            .map_err(|e| format!("CreateIconFromResourceEx: {}", e))
-    }
+    crate::platform::window::create_hicon_from_ico(bytes, 16)
 }
 
 #[cfg(test)]
@@ -394,7 +679,7 @@ mod tests {
         assert_eq!(nid.uCallbackMessage, WM_TRAY);
         assert_eq!(nid.hIcon, hicon);
 
-        let mut expected: Vec<u16> = "Xiaomi PC Manager Lite".encode_utf16().collect();
+        let mut expected: Vec<u16> = crate::util::APP_NAME.encode_utf16().collect();
         expected.push(0); // NUL 结尾
         assert!(
             expected.len() <= nid.szTip.len(),
@@ -436,10 +721,92 @@ mod tests {
     fn test_taskbar_created_message_registers() {
         let msg1 = taskbar_created_msg();
         let msg2 = taskbar_created_msg();
-        assert_ne!(msg1, 0, "RegisterWindowMessageW(TaskbarCreated) must succeed");
+        assert_ne!(
+            msg1, 0,
+            "RegisterWindowMessageW(TaskbarCreated) must succeed"
+        );
         assert_eq!(msg1, msg2, "taskbar message id must be stable");
         assert!((0xC000..=0xFFFF).contains(&msg1));
         assert_ne!(msg1, WM_TRAY);
+    }
+
+    /// 回归测试（电源广播）：PBT 事件常量必须与 Windows SDK（WinUser.h）
+    /// 一致。历史实现把 PBT_APMPOWERSTATUSCHANGE 误写为 0x0018（不属于
+    /// 任何 PBT 事件），WM_POWERBROADCAST 的 wParam 比较永不成立——"电源
+    /// 切换时自动重设"静默失效且日志中从未出现过 "Power status changed"。
+    #[test]
+    fn test_power_broadcast_constants_match_sdk() {
+        // 本机 MSDN 文档值（WinUser.h）：0x000A / 0x0012 / 0x0007。
+        assert_eq!(PBT_APMPOWERSTATUSCHANGE, 0x000A);
+        assert_eq!(PBT_APMRESUMEAUTOMATIC, 0x0012);
+        assert_eq!(PBT_APMRESUMESUSPEND, 0x0007);
+    }
+
+    /// 电源广播 → 命令的纯决策：电源切换、两种唤醒事件都应触发 Reapply，
+    /// 其余事件（挂起、电源设置变更等）不处理。
+    #[test]
+    fn test_power_broadcast_to_command() {
+        use std::matches;
+        assert!(matches!(
+            power_broadcast_to_command(PBT_APMPOWERSTATUSCHANGE),
+            Some(UiCommand::ReapplyConfig)
+        ));
+        assert!(matches!(
+            power_broadcast_to_command(PBT_APMRESUMEAUTOMATIC),
+            Some(UiCommand::ReapplyConfig)
+        ));
+        assert!(matches!(
+            power_broadcast_to_command(PBT_APMRESUMESUSPEND),
+            Some(UiCommand::ReapplyConfig)
+        ));
+        // 不相关事件（挂起、电源设置变更等）不触发。
+        assert!(power_broadcast_to_command(0x0004).is_none()); // PBT_APMSUSPEND
+        assert!(power_broadcast_to_command(0x0018).is_none()); // 历史误写的错误值
+        assert!(power_broadcast_to_command(0xFFFF).is_none());
+    }
+
+    /// 性能模式变化通知的纯决策：
+    /// - 首次采样（None → 值）不弹（启动基线，非用户操作）；
+    /// - 后续值变化弹；值相同不弹。
+    #[test]
+    fn test_should_notify_perf_change() {
+        assert!(
+            !should_notify_perf_change(None, 0x09),
+            "first sample must not notify"
+        );
+        assert!(
+            !should_notify_perf_change(Some(0x09), 0x09),
+            "no change must not notify"
+        );
+        assert!(
+            should_notify_perf_change(Some(0x09), 0x02),
+            "perf change must notify"
+        );
+        assert!(
+            should_notify_perf_change(Some(0x02), 0x04),
+            "another perf change must notify"
+        );
+    }
+
+    /// 回归测试：电池养护状态变化通知的决策逻辑（与性能模式同语义）。
+    #[test]
+    fn test_should_notify_care_change() {
+        assert!(
+            !should_notify_care_change(None, false),
+            "first sample must not notify"
+        );
+        assert!(
+            !should_notify_care_change(Some(false), false),
+            "no change must not notify"
+        );
+        assert!(
+            should_notify_care_change(Some(false), true),
+            "care enabled must notify"
+        );
+        assert!(
+            should_notify_care_change(Some(true), false),
+            "care disabled must notify"
+        );
     }
 
     /// 回归测试：嵌入式 tray_icon.ico 能被 load_icon 解析并创建图标；
@@ -457,8 +824,8 @@ mod tests {
     #[test]
     fn test_set_tip_normal() {
         let mut sz_tip = [0xAAAAu16; 128];
-        set_tip(&mut sz_tip, "Xiaomi PC Manager Lite");
-        let mut expected: Vec<u16> = "Xiaomi PC Manager Lite".encode_utf16().collect();
+        set_tip(&mut sz_tip, crate::util::APP_NAME);
+        let mut expected: Vec<u16> = crate::util::APP_NAME.encode_utf16().collect();
         expected.push(0);
         assert_eq!(&sz_tip[..expected.len()], expected.as_slice());
         assert!(sz_tip[expected.len()..].iter().all(|&c| c == 0xAAAA));
@@ -477,21 +844,21 @@ mod tests {
         assert_eq!(sz_tip[127], 0);
     }
 
-    /// 回归测试（BUG B）：托盘退出的兜底强制退出时长必须大于 GUI 线程处理
+    /// 回归测试：托盘退出的兜底强制退出时长必须大于 GUI 线程处理
     /// **一整条命令**的最坏阻塞时长——而非仅 WMI 单次调用。GUI 线程处理
     /// WM_QUIT 必须先完成当前命令批次的排空：单条命令（如 ToggleBatteryCare）
     /// 最坏含 3 次顺序 WMI 调用（写限值 + 写养护 + 读回），每次调用的最坏
-    /// 阻塞为 GET_RESULT_TIMEOUT_MS=3000（ec/wmi.rs）；ReapplyConfig 可达
+    /// 阻塞为 GET_RESULT_TIMEOUT_MS（ec/wmi.rs）；ReapplyConfig 可达
     /// 4 次。过早的 `process::exit` 会把进程硬杀在一次尚未完成的硬件调用
     /// 中途。若 WMI 侧的等待上限被调高到超过本常量/3，必须同步调高
     /// QUIT_FALLBACK_MS。
     #[test]
     fn test_quit_fallback_exceeds_wmi_call_timeout() {
-        // 编译期断言：QUIT_FALLBACK_MS 恒 ≥ 3 × WMI 单次调用超时（3000ms）。
-        // 若未来调高 GET_RESULT_TIMEOUT_MS，此断言会直接导致编译失败，
-        // 强制同步调高 QUIT_FALLBACK_MS（避免进程被硬杀在一次未完成的
-        // 硬件调用中途）。
-        const _: () = assert!(QUIT_FALLBACK_MS >= 3 * 3000);
+        // 编译期断言：QUIT_FALLBACK_MS 恒 ≥ 3 × WMI 单次调用超时。引用真实
+        // 常量而非硬编码 3000，保证未来调高 GET_RESULT_TIMEOUT_MS 时此断言
+        // 立即编译失败，强制同步调高 QUIT_FALLBACK_MS（避免进程被硬杀在
+        // 一次未完成的硬件调用中途）。
+        const _: () = assert!(QUIT_FALLBACK_MS >= 3 * crate::ec::wmi::GET_RESULT_TIMEOUT_MS as u64);
     }
 
     /// 回归测试：tray_nid_snapshot 必须返回保存的 NID 副本（NOTIFYICONDATAW
@@ -499,7 +866,7 @@ mod tests {
     #[test]
     fn test_tray_nid_snapshot_returns_stored_state() {
         let nid = build_tray_nid(HWND(std::ptr::null_mut()), HICON(std::ptr::null_mut()));
-        *TRAY_ICON.lock().unwrap_or_else(|e| e.into_inner()) = Some(TrayIconState { nid });
+        *crate::util::lock_or_recover(&TRAY_ICON, "tray icon") = Some(TrayIconState { nid });
 
         let snap = tray_nid_snapshot().expect("snapshot must exist after store");
         assert_eq!(snap.hWnd, nid.hWnd);
@@ -508,5 +875,44 @@ mod tests {
         assert_eq!(snap.uCallbackMessage, nid.uCallbackMessage);
         assert_eq!(snap.hIcon, nid.hIcon);
         assert_eq!(snap.szTip, nid.szTip);
+    }
+
+    /// 托盘 tooltip 文案应包含当前性能模式与电池养护状态。
+    #[test]
+    fn test_build_tooltip_includes_status() {
+        let status = TrayStatus {
+            battery_care_enabled: true,
+            charge_limit: 80,
+            performance_mode: crate::ec::performance::PerfMode::Smart.ec_value(),
+        };
+        let tip = build_tooltip(&status);
+        assert!(tip.contains("智能"), "perf name must appear: {}", tip);
+        assert!(tip.contains("开启"), "care state must appear: {}", tip);
+        assert!(tip.contains("80%"), "limit must appear: {}", tip);
+
+        let off = TrayStatus {
+            battery_care_enabled: false,
+            ..status
+        };
+        assert!(build_tooltip(&off).contains("关闭"));
+    }
+
+    /// 托盘 tooltip 文案必须能写进 szTip（≤127 UTF-16 单元 + NUL）。
+    #[test]
+    fn test_build_tooltip_fits_in_sz_tip() {
+        let status = TrayStatus {
+            battery_care_enabled: true,
+            charge_limit: 80,
+            performance_mode: crate::ec::performance::PerfMode::Extreme.ec_value(),
+        };
+        let tip = build_tooltip(&status);
+        assert!(tip.encode_utf16().count() <= 127);
+        let mut sz_tip = [0u16; 128];
+        set_tip(&mut sz_tip, &tip);
+        assert_eq!(
+            sz_tip[tip.encode_utf16().count()],
+            0,
+            "must be NUL-terminated"
+        );
     }
 }
