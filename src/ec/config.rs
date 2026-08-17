@@ -54,8 +54,41 @@ fn config_path() -> PathBuf {
     config_dir().join("config.toml")
 }
 
+/// 清理 `save()` 崩溃后残留的临时文件（形如 `config.toml.<pid>.<seq>.tmp`）。
+///
+/// 原子保存先写唯一临时文件再 rename；若进程在两步之间崩溃（断电/强杀），
+/// 临时文件会永久残留在配置目录。每次加载时清理由本进程在**启动阶段**执行：
+/// 此时尚无并发保存者，唯一命名的临时文件不可能属于一个正在进行中的写入，
+/// 删除是安全的。测试用目录同样受益（崩溃残留不会跨启动累积）。
+fn cleanup_stale_tmp_files() {
+    let dir = config_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("config.toml.") && name.ends_with(".tmp") {
+            log::debug!("Config: removing stale temp file {}", name);
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// 测试专用：串行化所有读写全局 `XIAOMI_PC_MANAGER_CONFIG_DIR` 的用例。
+/// cargo test 并行运行多个用例时，各用例对同一环境变量的 `set_var` 会互相
+/// 覆盖——读取配置路径的用例（如 test_load_regenerates_missing_config_file、
+/// test_concurrent_saves_are_atomic）可能在 `set_var` 之后、读取磁盘之前
+/// 被其它用例改写环境变量，读到错误的目录而失败（flaky）。读取者须在
+/// 整个用例生命周期持有此锁；仅设置环境变量的写入者（gui::commands 的
+/// redirect_config_dir）在 set_var 时短暂持有即可。
+#[cfg(test)]
+pub(crate) static CONFIG_DIR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 impl AppConfig {
     pub fn load() -> Self {
+        // 清理上次崩溃留下的临时文件（见 cleanup_stale_tmp_files）。
+        cleanup_stale_tmp_files();
         let path = config_path();
         match std::fs::read_to_string(&path) {
             Ok(s) => match toml::from_str::<AppConfig>(&s) {
@@ -136,11 +169,26 @@ impl AppConfig {
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let s = toml::to_string_pretty(self).map_err(|e| e.to_string())?;
 
-        // Atomic write: write to temporary file, then rename (NFR-REL-04)
+        // Atomic write: write to a temporary file, then rename (NFR-REL-04)。
+        // 临时文件名必须**唯一**（pid + 进程内自增序号）：固定名（如
+        // config.toml.tmp）在并发保存时存在撕裂重命名风险——写入者 A 完成
+        // write 后、rename 前，写入者 B 对同一 tmp 文件重新 truncate+write，
+        // A 的 rename 会把 B 尚未写完的 tmp 改名成 config，最终配置文件内容
+        // 被撕裂（下轮启动解析失败回退默认）。唯一名 + 原子 rename 保证目标
+        // 文件永远是某一次完整写入的产物。清理：write/rename 失败时删除
+        // 本次残留的临时文件。
         let path = config_path();
-        let tmp_path = path.with_extension("toml.tmp");
-        std::fs::write(&tmp_path, &s).map_err(|e| e.to_string())?;
-        std::fs::rename(&tmp_path, &path).map_err(|e| e.to_string())?;
+        static SAVE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SAVE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp_path = path.with_extension(format!("toml.{}.{}.tmp", std::process::id(), seq));
+        if let Err(e) = std::fs::write(&tmp_path, &s) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e.to_string());
+        }
+        if let Err(e) = std::fs::rename(&tmp_path, &path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e.to_string());
+        }
 
         Ok(())
     }
@@ -339,6 +387,7 @@ mod tests {
     /// 应用文件不会重新生成，直到下一次修改设置才被创建。
     #[test]
     fn test_load_regenerates_missing_config_file() {
+        let _config_lock = CONFIG_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("xmpl-cfg-test-{}", std::process::id()));
         let path = dir.join("config.toml");
         let _ = std::fs::remove_dir_all(&dir);
@@ -352,6 +401,100 @@ mod tests {
         // 重建的文件可被重新加载。
         let reloaded = AppConfig::load();
         assert_eq!(reloaded, cfg);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 并发保存的原子性（NFR-REL-04）：多线程同时 save() 时，目标
+    /// config.toml 必须始终是某一次完整写入的产物——可被成功解析，
+    /// 且最终不留任何临时文件残留。
+    ///
+    /// 回归测试（历史实现）：固定名 tmp（config.toml.tmp）在并发保存时，
+    /// 写入者 A 完成 write 后、rename 前，写入者 B 对同一 tmp 重新
+    /// truncate+write，A 的 rename 会把 B 尚未写完的 tmp 改名成 config，
+    /// 导致配置文件内容撕裂、下轮启动解析失败回退默认值。修复后每个
+    /// 保存使用唯一 tmp 名（pid+自增序号），该竞态从根上消失。
+    #[test]
+    fn test_concurrent_saves_are_atomic() {
+        let _config_lock = CONFIG_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("xmpl-save-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("XIAOMI_PC_MANAGER_CONFIG_DIR", &dir);
+
+        const THREADS: usize = 8;
+        std::thread::scope(|s| {
+            for i in 0..THREADS {
+                s.spawn(move || {
+                    let cfg = AppConfig {
+                        battery_care_enabled: i % 2 == 0,
+                        battery_charge_limit: (40 + i as u8 * 8) % 101,
+                        ..Default::default()
+                    };
+                    // 多轮写：放大并发窗口。
+                    for _ in 0..20 {
+                        cfg.save().expect("save must succeed");
+                    }
+                });
+            }
+        });
+
+        // 目标文件必须可解析（未撕裂）。
+        let path = config_path();
+        let content = std::fs::read_to_string(&path).expect("config must exist");
+        let parsed: AppConfig = toml::from_str(&content).expect("config must parse");
+        assert!(
+            parsed.battery_charge_limit <= 100,
+            "parsed limit must be valid"
+        );
+
+        // 不得残留任何临时文件。
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read config dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n != "config.toml")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no temp files may remain after concurrent saves: {:?}",
+            leftovers
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 崩溃残留清理：模拟"原子保存写临时文件后、rename 前进程崩溃"的残留
+    /// （`config.toml.<pid>.<seq>.tmp`），`load()` 必须将其清除——否则每次
+    /// 崩溃都留下一个文件，永久累积在配置目录。
+    #[test]
+    fn test_load_cleans_stale_tmp_files() {
+        let _config_lock = CONFIG_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("xmpl-tmp-clean-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("XIAOMI_PC_MANAGER_CONFIG_DIR", &dir);
+        std::fs::create_dir_all(&dir).expect("create config dir");
+
+        // 模拟两次崩溃残留 + 一个正常运行遗留的临时文件。
+        std::fs::write(dir.join("config.toml.1234.0.tmp"), "partial").expect("write stale 1");
+        std::fs::write(dir.join("config.toml.1234.1.tmp"), "partial").expect("write stale 2");
+
+        // 不在清理范围内的其它文件不得被误删。
+        std::fs::write(dir.join("config.toml"), "should survive").expect("write config");
+
+        AppConfig::load();
+
+        assert!(
+            !dir.join("config.toml.1234.0.tmp").exists(),
+            "stale temp file must be removed"
+        );
+        assert!(
+            !dir.join("config.toml.1234.1.tmp").exists(),
+            "stale temp file must be removed"
+        );
+        assert!(
+            dir.join("config.toml").exists(),
+            "config file itself must never be touched"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

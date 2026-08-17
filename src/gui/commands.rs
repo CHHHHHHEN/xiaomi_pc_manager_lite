@@ -426,9 +426,23 @@ mod tests {
     }
 
     /// Point the config writer at a temp directory so save_state() never
-    /// touches the user's real config during tests.
+    /// touches the user's real config during tests. 目录按调用次数唯一命名：
+    /// cargo test 并行运行多个用例，若共用同一目录，各用例的 config save
+    /// 会在同一 config.toml 上交错写入（虽然写入已原子化，目录共享仍会
+    /// 造成用例间互相污染与潜在 flaky）。
     fn redirect_config_dir() {
-        let dir = std::env::temp_dir().join(format!("xmpl-test-{}", std::process::id()));
+        // 与 ec::config::CONFIG_DIR_TEST_LOCK 串行：防止并行测试对全局
+        // XIAOMI_PC_MANAGER_CONFIG_DIR 的覆盖破坏读取配置路径的用例。
+        let _config_lock = crate::ec::config::CONFIG_DIR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "xmpl-test-{}-{}",
+            std::process::id(),
+            seq
+        ));
         std::env::set_var("XIAOMI_PC_MANAGER_CONFIG_DIR", dir);
     }
 
