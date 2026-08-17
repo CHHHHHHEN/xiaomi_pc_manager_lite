@@ -33,26 +33,20 @@ impl XiaomiApp {
                 UiCommand::ReapplyConfig => {
                     if self.config.auto_reapply_on_power_change {
                         log::info!("Reapplying config on power change");
-                        // Keep battery care and limit coherent (see
-                        // apply_startup_config in main.rs).
                         let mut errs: Vec<String> = Vec::new();
-                        if self.config.battery_care_enabled {
-                            // 与启动 apply/GUI 切换路径一致：养护开启时上限
-                            // 必须 < 100%，非自洽的旧配置兜底为 80%。
-                            // 注意：兜底只能作用在局部变量上，**不得**提前改写
-                            // config——若写入失败，else 路径不会保存配置，内存
-                            // 中的 config 若已被改成 80 就会与未更新的 care 状态
-                            // 构成矛盾，随后任何一次 save_state 都会把"用户期望
-                            // 100% 但写入失败"的状态静默持久化为 80%（与
-                            // set_battery_care_internal 的兜底规则一致）。
-                            let mut limit = self.config.battery_charge_limit;
-                            if limit >= 100 {
-                                limit = 80;
-                            }
-                            if let Err(e) = self.backend.set_charge_limit(limit) {
-                                log::error!("Reapply charge limit: {}", e);
-                                errs.push(format!("重设充电上限失败: {}", e));
-                            } else {
+                        // 与启动 apply/GUI 切换路径一致（见
+                        // ec::battery::apply_battery_state）：统一处理"写限值 →
+                        // 写养护 → 读回"及养护开启时的 80% 兜底。兜底只作用在
+                        // 辅助函数内部，**不**提前改写 config——写入失败时
+                        // 内存中的 config 不会被污染（与 set_battery_care_internal
+                        // 的兜底规则一致）。
+                        let outcome = ec::battery::apply_battery_state(
+                            &*self.backend,
+                            self.config.battery_care_enabled,
+                            self.config.battery_charge_limit,
+                        );
+                        match &outcome.charge_limit {
+                            Ok(applied) => {
                                 // 与 set_charge_limit_internal / 启动同步
                                 // （sync_startup_config）的读回约定一致：WMI 后端
                                 // 会把非预设值量化到最近的预设（如 85→80），成功写入
@@ -62,17 +56,16 @@ impl XiaomiApp {
                                 // 仅当应用值 <100%（养护开启）时同步；读回 100%
                                 // 意味着写入被硬件拒绝（养护未生效），保留用户
                                 // 期望值，避免 care=true + limit=100 的矛盾配置。
-                                let applied =
-                                    self.backend.get_charge_limit().unwrap_or(limit).min(100);
-                                if applied < 100 {
-                                    self.config.battery_charge_limit = applied;
+                                if *applied < 100 {
+                                    self.config.battery_charge_limit = *applied;
                                 }
                             }
-                        } else if let Err(e) = self.backend.set_charge_limit(100) {
-                            log::error!("Reapply charge limit: {}", e);
-                            errs.push(format!("重设充电上限失败: {}", e));
+                            Err(e) => {
+                                log::error!("Reapply charge limit: {}", e);
+                                errs.push(format!("重设充电上限失败: {}", e));
+                            }
                         }
-                        if let Err(e) = self.backend.set_battery_care(self.config.battery_care_enabled) {
+                        if let Err(e) = &outcome.care {
                             log::error!("Reapply battery care: {}", e);
                             errs.push(format!("重设电池养护失败: {}", e));
                         }
@@ -134,92 +127,64 @@ impl XiaomiApp {
         // When disabling, only the hardware limit is raised to 100%; the
         // persisted desired limit must be kept so it is not lost when battery
         // care is re-enabled later.
-        // 注意：兜底 80% 只能作用在局部变量上，不能提前改写 config——若随后
-        // 硬件写入失败（limit_ok=false），else 分支不会保存配置，内存中的
-        // config 若已被改成 80 就与未更新的 care=false 构成矛盾状态，后续
-        // 任何一次 save_state 都会把"用户期望 100%、改写失败"静默持久化为
-        // 80%。成功路径会在下方用读回值统一落盘，这里无需预写。
+        // 注意：兜底 80% 只能作用在 apply_battery_state 内部，不能提前改写
+        // config——若随后硬件写入失败（charge_limit 为 Err），else 分支不会
+        // 保存配置，内存中的 config 若已被改成 80 就与未更新的 care=false
+        // 构成矛盾状态，后续任何一次 save_state 都会把"用户期望 100%、改写
+        // 失败"静默持久化为 80%。成功路径会在下方用读回值统一落盘。
         let desired_limit = self.config.battery_charge_limit;
-        let limit = if enabled {
-            if desired_limit >= 100 {
-                80
-            } else {
-                desired_limit
-            }
-        } else {
-            100
-        };
-        // Write charge limit first; some EC firmware auto-syncs the battery
-        // care bit from the charge limit register.  Touching the limit first
-        // lets us clear the bit afterwards without the EC re-asserting it.
-        let limit_ok = match self.backend.set_charge_limit(limit) {
-            Ok(_) => {
-                log::info!("Charge limit set to {}%", limit);
-                true
-            }
-            Err(e) => {
-                log::error!("Failed to set charge limit: {}", e);
-                false
-            }
-        };
-        let care_ok = match self.backend.set_battery_care(enabled) {
-            Ok(_) => {
-                log::info!("Battery care set to {}", if enabled { "enabled" } else { "disabled" });
-                true
-            }
-            Err(e) => {
-                log::error!("Failed to set battery care: {}", e);
-                false
-            }
-        };
-        if limit_ok {
+        let outcome =
+            ec::battery::apply_battery_state(&*self.backend, enabled, desired_limit);
+        match outcome.charge_limit {
             // 限值是两种后端判定养护状态的权威依据（WMI 养护位由限值<100%
             // 推导，WinRing0 读回亦按限值）：set_charge_limit 成功即硬件养护
             // 状态已按限值生效。即使 set_battery_care 失败，状态与持久化配置
             // 也必须按限值保持自洽——否则下次启动会按旧配置（care=false）
             // 强制写 100%，静默覆盖用户刚设置的限值。
-            let applied = self.backend.get_charge_limit().unwrap_or(limit).min(100);
-            self.charge_limit = applied;
-            // When disabling, keep the stored limit as the desired value for
-            // when care is re-enabled; when enabling, sync it to the applied
-            // value so the persisted config matches the hardware.
-            if enabled {
-                self.config.battery_charge_limit = applied;
+            Ok(applied) => {
+                self.charge_limit = applied;
+                // When disabling, keep the stored limit as the desired value for
+                // when care is re-enabled; when enabling, sync it to the applied
+                // value so the persisted config matches the hardware.
+                if enabled {
+                    self.config.battery_charge_limit = applied;
+                }
+                self.config.battery_care_enabled = enabled;
+                self.battery_care_enabled = enabled;
+                if outcome.care.is_err() {
+                    // 与 set_charge_limit_internal 的联动失败处理一致：限值才是
+                    // 权威依据，写入失败仅告警（F-ERR-03），状态保持自洽。
+                    self.push_error("设置电池养护失败".to_string());
+                }
+                self.save_state();
             }
-            self.config.battery_care_enabled = enabled;
-            self.battery_care_enabled = enabled;
-            if !care_ok {
-                // 与 set_charge_limit_internal 的联动失败处理一致：限值才是
-                // 权威依据，写入失败仅告警（F-ERR-03），状态保持自洽。
-                self.push_error("设置电池养护失败".to_string());
-            }
-            self.save_state();
-        } else {
             // 限值写入失败时不得更新状态：硬件未变更，UI 与配置保持一致，
             // 错误在 GUI 中展示（F-ERR-03）。
-            let mut errs = Vec::new();
-            errs.push("设置充电上限失败".to_string());
-            if !care_ok {
-                errs.push("设置电池养护失败".to_string());
+            Err(_) => {
+                let mut errs = Vec::new();
+                errs.push("设置充电上限失败".to_string());
+                if outcome.care.is_err() {
+                    errs.push("设置电池养护失败".to_string());
+                }
+                self.push_error(errs.join("; "));
             }
-            self.push_error(errs.join("; "));
         }
     }
 
     pub fn set_charge_limit_internal(&mut self, limit: u8) {
         let limit = limit.min(100);
-        if let Err(e) = self.backend.set_charge_limit(limit) {
-            log::error!("Failed to set charge limit: {}", e);
-            self.push_error(format!("设置充电上限失败: {}", e));
-            return;
-        }
-        log::info!("Charge limit set to {}%", limit);
-        // Read back the value the hardware actually applied: the WMI backend
-        // only accepts preset values (nearest one is chosen), so the applied
-        // value may differ from the requested one.  Using the read-back value
-        // keeps the UI and the persisted config coherent with the hardware
-        // (AC-BAT-04: 设置 85% 应显示并保存硬件实际生效的 80%).
-        let applied = self.backend.get_charge_limit().unwrap_or(limit).min(100);
+        // 养护位由限值推导：<100% 即养护开启，100% 即关闭。统一的
+        // apply_battery_state 会写限值 → 写养护位 → 读回实际生效值
+        // （WMI 量化到最近预设，如 85→80，见 AC-BAT-04）。
+        let outcome = ec::battery::apply_battery_state(&*self.backend, limit < 100, limit);
+        let applied = match outcome.charge_limit {
+            Ok(applied) => applied,
+            Err(e) => {
+                log::error!("Failed to set charge limit: {}", e);
+                self.push_error(format!("设置充电上限失败: {}", e));
+                return;
+            }
+        };
         self.charge_limit = applied;
         // 100% = 养护关闭（与 set_battery_care_internal 关闭路径/sync_startup_config
         // 的约定一致）：此时必须**保留** config 中用户期望的上限，供重新开启养护
@@ -234,30 +199,26 @@ impl XiaomiApp {
         // from the limit.  Keep the UI flag consistent with the limit.
         let care = applied < 100;
         if care != self.battery_care_enabled {
-            match self.backend.set_battery_care(care) {
-                Ok(_) => {
-                    log::info!(
-                        "Battery care {} (synced from charge limit)",
-                        if care { "enabled" } else { "disabled" }
-                    );
-                    self.battery_care_enabled = care;
-                }
-                Err(e) => {
-                    // The limit was already applied and is the authoritative
-                    // control on both backends, so keep the state coherent
-                    // with the limit even though the care bit write failed.
-                    // Otherwise the persisted config would be inconsistent
-                    // (care off with a sub-100% limit) and the next startup
-                    // would force the limit back to 100%, silently destroying
-                    // the user's choice.
-                    log::warn!(
-                        "Failed to sync battery care bit: {}; deriving care from charge limit",
-                        e
-                    );
-                    self.battery_care_enabled = care;
-                    self.push_error(format!("同步电池养护状态失败: {}", e));
-                }
+            if let Err(e) = &outcome.care {
+                // The limit was already applied and is the authoritative
+                // control on both backends, so keep the state coherent
+                // with the limit even though the care bit write failed.
+                // Otherwise the persisted config would be inconsistent
+                // (care off with a sub-100% limit) and the next startup
+                // would force the limit back to 100%, silently destroying
+                // the user's choice.
+                log::warn!(
+                    "Failed to sync battery care bit: {}; deriving care from charge limit",
+                    e
+                );
+                self.push_error(format!("同步电池养护状态失败: {}", e));
+            } else {
+                log::info!(
+                    "Battery care {} (synced from charge limit)",
+                    if care { "enabled" } else { "disabled" }
+                );
             }
+            self.battery_care_enabled = care;
         }
         // The limit must always be mirrored to the persisted care flag, even
         // when the runtime flag already matched the limit: the runtime state

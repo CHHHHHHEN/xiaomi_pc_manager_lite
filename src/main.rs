@@ -206,6 +206,9 @@ struct StartupApplyOutcome {
     perf_mode_ok: bool,
     /// 实际写入 EC 的性能模式 raw code（经交流电源保护降级后的值）。
     perf_mode_written: u8,
+    /// 充电上限写入成功后读回的硬件实际生效值（WMI 量化后），供
+    /// sync_startup_config 直接回写配置，避免二次读回。
+    charge_limit_applied: Option<u8>,
     /// 失败项的中文描述（每项一条），用于在 GUI 中向用户展示。
     errors: Vec<String>,
 }
@@ -217,6 +220,7 @@ impl Default for StartupApplyOutcome {
             battery_care_ok: true,
             perf_mode_ok: true,
             perf_mode_written: 0,
+            charge_limit_applied: None,
             errors: Vec::new(),
         }
     }
@@ -230,43 +234,36 @@ fn apply_startup_config(backend: &dyn EcBackend, config: &AppConfig) -> StartupA
     log::info!("Applying config on startup");
     // Keep battery care and charge limit coherent: when care is disabled
     // the limit must be 100%, otherwise backends that derive the care bit
-    // from the limit would report it as enabled.  The limit is written
-    // first because some EC firmware auto-syncs the care bit from it.
-    let desired_limit = if config.battery_care_enabled && config.battery_charge_limit >= 100 {
-        // 旧版本/手改配置可能残留 care=true + limit=100 的矛盾组合
-        // （旧版 refresh_from_backend 曾把硬件状态写回 config）。
-        // 与 GUI 切换路径（set_battery_care_internal）保持一致，兜底为
-        // 80%，否则 100% 写进硬件后养护实际失效、配置被静默改写。
+    // from the limit would report it as enabled.  The unified
+    // battery::apply_battery_state writes the limit first (some EC firmware
+    // auto-syncs the care bit from it) then the care bit, and returns the
+    // hardware-applied limit after readback.
+    let desired_limit = ec::battery::coherent_charge_limit(
+        config.battery_care_enabled,
+        config.battery_charge_limit,
+    );
+    if desired_limit != config.battery_charge_limit {
         log::warn!(
             "Incoherent config: battery care on with limit {}%; using 80%",
             config.battery_charge_limit
         );
-        80
-    } else {
-        config.battery_charge_limit
-    };
-    if config.battery_care_enabled {
-        outcome.charge_limit_ok = match backend.set_charge_limit(desired_limit) {
-            Ok(_) => true,
-            Err(e) => {
-                log::warn!("apply charge limit on startup: {}", e);
-                outcome.errors.push(format!("充电上限: {}", e));
-                false
-            }
-        };
-    } else if let Err(e) = backend.set_charge_limit(100) {
+    }
+    let applied = ec::battery::apply_battery_state(
+        backend,
+        config.battery_care_enabled,
+        config.battery_charge_limit,
+    );
+    if let Err(e) = &applied.charge_limit {
         log::warn!("apply charge limit on startup: {}", e);
         outcome.charge_limit_ok = false;
         outcome.errors.push(format!("充电上限: {}", e));
     }
-    outcome.battery_care_ok = match backend.set_battery_care(config.battery_care_enabled) {
-        Ok(_) => true,
-        Err(e) => {
-            log::warn!("apply battery care on startup: {}", e);
-            outcome.errors.push(format!("电池养护: {}", e));
-            false
-        }
-    };
+    if let Err(e) = &applied.care {
+        log::warn!("apply battery care on startup: {}", e);
+        outcome.battery_care_ok = false;
+        outcome.errors.push(format!("电池养护: {}", e));
+    }
+    outcome.charge_limit_applied = applied.charge_limit.ok();
     // 狂暴模式需要交流电源：写入时按电源状态选择实际 raw code，但用户的
     // 选择仍保存在 config 中，待接入电源后通过 ReapplyConfig 恢复。
     let raw =
@@ -314,7 +311,9 @@ fn sync_startup_config(
             // 养护关闭时硬件上限恒为 100%，保留用户期望的 limit（供重新
             // 开启养护时恢复）。
             if enabled {
-                if let Ok(limit) = backend.get_charge_limit() {
+                // apply 阶段已读回硬件实际生效值（量化后），直接使用，
+                // 无需再次读回。
+                if let Some(limit) = outcome.charge_limit_applied {
                     config.battery_charge_limit = limit;
                 }
             }

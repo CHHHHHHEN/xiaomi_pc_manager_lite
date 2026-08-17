@@ -160,8 +160,11 @@ impl AppConfig {
                 "Config: battery care on with limit {}% (incoherent); using 80%",
                 self.battery_charge_limit
             );
-            self.battery_charge_limit = 80;
         }
+        self.battery_charge_limit = crate::ec::battery::coherent_charge_limit(
+            self.battery_care_enabled,
+            self.battery_charge_limit,
+        );
     }
 
     pub fn save(&self) -> Result<(), String> {
