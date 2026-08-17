@@ -5,42 +5,52 @@ mod ec;
 mod embed;
 mod gui;
 mod platform;
+mod startup;
+#[cfg(test)]
+mod testutil;
 mod tray;
 mod util;
 
-use ec::backend::EcBackend;
-use ec::config::{AppConfig, BackendPreference};
+use ec::config::ConfigStore;
 
-/// In debug builds, set up a panic hook that pauses before exit so
-/// the user can read panic messages in the console.
-#[cfg(debug_assertions)]
-fn init_pause_on_panic() {
+/// 统一的 panic hook：无论构建类型都先把 panic 信息写入应用日志文件。
+/// release 构建无控制台（windows_subsystem = "windows"），默认 panic 输出
+/// 不可见，进程"无声消失"时日志是唯一线索；debug 构建额外暂停等待输入，
+/// 便于直接在控制台阅读 panic 信息。
+fn init_panic_hook() {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        log::error!("PANIC: {}", info);
         prev(info);
-        use std::io::Write;
-        let _ = std::io::stdout().write_all(b"\n--- PANIC ---\nPress Enter to exit...");
-        let _ = std::io::stdin().read_line(&mut String::new());
+        #[cfg(debug_assertions)]
+        {
+            use std::io::Write;
+            let _ = std::io::stdout().write_all(b"\n--- PANIC ---\nPress Enter to exit...");
+            let _ = std::io::stdin().read_line(&mut String::new());
+        }
     }));
 }
 
-#[cfg(not(debug_assertions))]
-fn init_pause_on_panic() {}
-
-/// 初始化日志：默认写入 `%TEMP%\XiaomiPcManagerLite\app.log`（每次启动覆盖），
-/// 可用 `XIAOMI_LOG_FILE` 覆盖路径。GUI 程序无控制台，文件日志便于排查
-/// 托盘/后台运行场景的问题。
+/// 初始化日志：默认写入 `%TEMP%\XiaomiPcManagerLite\app.log`，
+/// 可用 `XIAOMI_LOG_FILE` 覆盖路径（统一收敛在 `util::log_file_path`）。
+///
+/// 写入模式：**追加**（历史只 `File::create` 覆盖，每次运行把上一份日志
+/// 抹掉——应用崩溃/异常退出后上次运行日志丢失，无法排查"上一次为什么挂"）。
+/// 追加前做**按大小轮转**：日志超过阈值时把旧文件改名为 `app.log.1` 保留
+/// 上一份，避免无界增长（`%TEMP%` 位于系统盘，长期运行可能写满）。
 fn init_logging() {
-    let mut builder = env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("info"),
-    );
-    let log_path = std::env::var_os("XIAOMI_LOG_FILE")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("XiaomiPcManagerLite").join("app.log"));
+    let mut builder =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
+    let log_path = crate::util::log_file_path();
     if let Some(parent) = log_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    match std::fs::File::create(&log_path) {
+    rotate_log_if_large(&log_path);
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
         Ok(file) => {
             builder.target(env_logger::Target::Pipe(Box::new(file)));
         }
@@ -49,11 +59,61 @@ fn init_logging() {
         }
     }
     let _ = builder.try_init();
+    // 日志文件路径在此之后才可用：默认 `%TEMP%\XiaomiPcManagerLite\app.log`，
+    // 排查问题时日志首行即告知日志落盘位置与版本号。
+    log::info!(
+        "===== {} v{} ====",
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION")
+    );
+    log::info!("Log file: {}", log_path.display());
+}
+
+/// 日志按大小轮转的阈值：超过即把旧文件改名 `app.log.1`。
+const LOG_ROTATE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// 若日志文件超过阈值，先把它改名 `app.log.1`（覆盖旧的 `.1`），再让
+/// 调用方新建/追加新日志。历史内容保留一份，避免无界增长。
+fn rotate_log_if_large(path: &std::path::Path) {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    if meta.len() <= LOG_ROTATE_BYTES {
+        return;
+    }
+    let rotated = path.with_extension("log.1");
+    match std::fs::rename(path, &rotated) {
+        Ok(()) => log::info!("Log rotated: {:?} -> {:?}", path, rotated),
+        Err(e) => eprintln!("log rotate {}: {}", path.to_string_lossy(), e),
+    }
+}
+
+/// 为进程注册显式 AppUserModelID：托盘气泡通知（`NIF_INFO`/`Shell_NotifyIconW`）
+/// 在 Windows 8+ 上依赖它才能可靠展示（无 ID 时通知可能被静默丢弃）。在启动
+/// 时、任何通知弹出前调用一次即可（进程级全局设置）。ID 固定为产品名，
+/// 与托盘图标/版本信息保持一致。失败不影响功能（仅通知展示可能受限），
+/// 记录 debug 日志即可。
+fn register_app_user_model_id() {
+    let id = crate::util::WideString::new("XiaomiPcManagerLite");
+    match unsafe {
+        windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID(id.as_pcwstr())
+    } {
+        Ok(()) => log::debug!("AppUserModelID registered: XiaomiPcManagerLite"),
+        Err(e) => log::warn!("SetCurrentProcessExplicitAppUserModelID failed: {}", e),
+    }
 }
 
 fn main() {
     init_logging();
-    init_pause_on_panic();
+    init_panic_hook();
+    register_app_user_model_id();
+
+    log::debug!(
+        "args: {:?}",
+        std::env::args_os()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+    );
 
     // 单实例预检（F-AUTO-08）：必须在**提权之前**执行。若已有实例在运行
     // （如自启动驻留托盘中），直接唤醒其窗口并退出——否则每次手动启动都会
@@ -61,17 +121,24 @@ fn main() {
     // pre_flight 只探测不持有：临时取得的所有权立即释放，真正的互斥体
     // 所有权由下方提权完成后的 acquire() 取得。
     if crate::platform::single_instance::pre_flight() {
+        log::info!("Existing instance running; activating its window");
         crate::platform::window::show_main_window();
         return;
     }
+    log::debug!("Single-instance pre-flight: no conflict; proceeding");
 
     // 启动即提权：**WMI 与 WinRing0 都需要管理员权限**。本机实测
     // （受限令牌对照实验）：非管理员下 `SELECT * FROM MICommonInterface`
     // 直接返回拒绝访问（Access denied），WMI 后端完全不可用；WinRing0
     // 驱动加载同样需要管理员。用户拒绝 UAC 时继续以非管理员运行，
     // create_backend 会失败并回退，GUI 显示错误（见下方回退逻辑）。
-    if crate::platform::privilege::elevate_self() {
+    if crate::platform::privilege::is_admin() {
+        log::info!("Running with administrator privileges");
+    } else if crate::platform::privilege::elevate_self() {
+        log::info!("Elevated instance relaunched; exiting this process");
         return;
+    } else {
+        log::warn!("Not running as administrator; WMI/WinRing0 may be unavailable");
     }
 
     // 单实例保护（F-AUTO-08）：提权完成后的最终实例在此取得互斥体所有权。
@@ -81,9 +148,13 @@ fn main() {
     // 互斥体立即释放、单实例保护失效），用 let 绑定到 main 作用域末尾。
     let _instance_guard: Option<crate::platform::single_instance::SingleInstanceGuard> =
         match crate::platform::single_instance::acquire() {
-            crate::platform::single_instance::SingleInstance::Acquired(guard) => Some(guard),
+            crate::platform::single_instance::SingleInstance::Acquired(guard) => {
+                log::info!("Single-instance mutex acquired");
+                Some(guard)
+            }
             // 已有实例在运行：唤醒已有窗口后退出，不重复启动。
             crate::platform::single_instance::SingleInstance::Existing => {
+                log::info!("Another instance is running; activating its window");
                 crate::platform::window::show_main_window();
                 return;
             }
@@ -96,17 +167,24 @@ fn main() {
             }
         };
 
-    let config = AppConfig::load();
+    let store = ConfigStore::new();
+    log::info!("Config file: {}", store.path().display());
+    let config = store.load();
+    log::debug!("Loaded config: {:#?}", config);
 
-    // 后端创建与启动应用在后台线程执行：WMI 后端会在此线程调用
-    // CoInitializeEx(MTA) 初始化 COM。GUI 主线程因此不携带任何 COM 初始化
-    // 状态——21e0aaf 修复的回归正是主线程先被初始化为 MTA 后，其它组件
-    // （当时 Tauri/tao 栈的 OleInitialize，要求 STA）再初始化 COM 时返回
-    // RPC_E_CHANGED_MODE 崩溃；保持主线程"未初始化 COM"可让 eframe/winit
-    // 及任何后续组件按需安全初始化。
+    // 后端创建与启动应用在独立线程执行，并**阻塞等待**其完成：目的是把任何
+    // 可能发生在后端初始化路径上的 COM 初始化（无论当前还是未来某后端）都
+    // 挡在 GUI 主线程之外，主线程保持"从未初始化 COM"。WMI 后端自身的
+    // CoInitializeEx(MTA) 实际发生在它专用的 wmi-worker 线程上（见
+    // ec/wmi.rs 的线程模型注释），此处线程并不直接初始化 COM——隔离的是
+    // "万一某个组件在该线程初始化了 COM"的边界，使 eframe/winit 及任何
+    // 后续组件按需安全初始化。历史回归（21e0aaf）正是主线程先被初始化为
+    // MTA 后，其它组件（当时 Tauri/tao 栈的 OleInitialize，要求 STA）再
+    // 初始化 COM 时返回 RPC_E_CHANGED_MODE 崩溃。
     let thread_config = config.clone();
+    let thread_store = store.clone();
     // F-AUTO-06: 开机自启动任务一致性校验（后台线程，不阻塞 GUI；
-    // 该线程的 COM 状态由 create_backend 或 autostart 自行初始化）。
+    // 该线程的 COM 由 autostart::sync 的 ComScope 自行初始化/配对回收）。
     {
         let cfg = thread_config.clone();
         std::thread::spawn(move || {
@@ -119,348 +197,121 @@ fn main() {
     // config 副本上并已落盘；若不把该副本交还给 GUI，GUI 的 save_state()
     // 会把未同步的旧值（如 care=true+limit=100、85% 非预设值）重新写回
     // 磁盘，覆盖启动时验证过的配置，导致磁盘配置反复"复活"矛盾组合。
-    let (backend, config, init_error, effective_pref) =
-        std::thread::spawn(move || -> (Box<dyn EcBackend>, AppConfig, Option<String>, BackendPreference) {
-        let mut config = thread_config;
-        let (backend, mut init_error): (Box<dyn EcBackend>, Option<String>) =
-            match ec::backend::create_backend(config.backend) {
-                Ok(b) => {
-                    log::info!("EC backend: {} (preference: {:?})", b.name(), config.backend);
-                    (b, None)
-                }
-                Err(primary_err) => {
-                    // 回退时**不要**直接尝试 Auto：Auto 是 WMI 优先，会先把刚
-                    // 失败的优先后端原样再试一遍（WMI 会再次拉起 worker 线程并
-                    // 等待握手，非小米机器上白白多耗一次完整连接；WinRing0 会
-                    // 重复停装驱动的清理流程）。直接回退到另一个后端即可。
-                    match fallback_preference(config.backend) {
-                        Some(pref) => {
-                            log::warn!(
-                                "Configured backend {:?} unavailable; falling back to {:?}",
-                                config.backend,
-                                pref
-                            );
-                            match ec::backend::create_backend(pref) {
-                                Ok(b) => {
-                                    let name = b.name().to_string();
-                                    log::info!("Fallback EC backend: {}", name);
-                                    (b, Some(format!("优先后端不可用，已自动切换至 {}", name)))
-                                }
-                                Err(e) => {
-                                    log::error!("Failed to create any EC backend: {}", e);
-                                    (Box::new(ec::backend::NullBackend), Some(e.to_string()))
-                                }
-                            }
-                        }
-                        None => {
-                            log::error!("All EC backends unavailable: {}", primary_err);
-                            (Box::new(ec::backend::NullBackend), Some(primary_err.to_string()))
-                        }
-                    }
-                }
-            };
-
-        if config.auto_apply_on_startup {
-            let outcome = apply_startup_config(&*backend, &config);
-
-            // F-START-04: 自动应用失败的错误除了记录日志，还要在 GUI 中展示。
-            if !outcome.errors.is_empty() {
-                let apply_err = format!("启动应用设置失败: {}", outcome.errors.join("; "));
-                init_error = Some(match init_error.take() {
-                    Some(e) => format!("{}; {}", e, apply_err),
-                    None => apply_err,
-                });
-            }
-
-            // Only sync the stored config to the verified hardware state when it
-            // was actually applied.  Otherwise the saved user preferences would be
-            // silently overwritten by whatever the hardware currently reports.
-            sync_startup_config(&*backend, &mut config, &outcome);
-
-            if let Err(e) = config.save() {
-                log::warn!("save initial config: {}", e);
-            }
-        }
-
-        // 实际生效的后端偏好：后端创建失败、用 NullBackend 兜底时，config.backend
-        // 仍是用户偏好（合理——下次启动还会重试），GUI 的"EC 后端偏好"单选应显示
-        // 用户偏好；回退成功时则显示**实际运行**的后端，避免 GUI 显示"偏好选中了
-        // 一个不可用后端、而状态栏显示另一个"的矛盾（F-ERR-03 的一致性）。
-        let effective_pref = if backend.is_null() {
-            config.backend
-        } else {
-            backend.preference()
-        };
-
-        (backend, config, init_error, effective_pref)
+    //
+    // 后端初始化耗时统计：最耗时的两步（WMI 握手最长 10s、WinRing0 驱动
+    // 安装重试 3 次×500ms）都发生在这里。记录耗时便于排查"启动很慢"类
+    // 问题——若耗时接近某个后端超时上限，日志数值本身即可指向卡点。
+    let backend_init_start = std::time::Instant::now();
+    // **线程内 panic 兜底**（M4 回归）：init_backend 内部涉及 COM/驱动 FFI
+    // 边界，任一步 panic（如 FFI 在异常状态下返回意外状态导致 unwrap 触发）
+    // 都会让线程 panic。历史实现 `.join().expect(...)` 把线程 panic 直接
+    // 传播到主线程——release 构建无控制台（windows_subsystem="windows"），
+    // 进程无声退出，连精心设计的 NullBackend 兜底都到不了。改为在线程内
+    // `catch_unwind`：panic 被捕获后按"后端不可用"优雅降级（NullBackend +
+    // 错误提示），GUI 照常启动并展示错误，仅功能不可用。
+    // 注意：catch_unwind 是闭包内的**第一条**语句，线程不存在"进入闭包前
+    // panic"的窗口，join 只会在闭包整体正常返回后成功；此处对 join 结果
+    // 直接 expect（若真发生也属编程错误，此时无后端可用比静默消失更可排查）。
+    let startup_result = std::thread::spawn(move || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            startup::init_backend(thread_store, thread_config)
+        }))
     })
     .join()
-    .expect("EC backend init thread panicked");
+    .expect("EC backend init thread panicked before catch_unwind");
+    let startup::StartupResult {
+        backend,
+        config,
+        init_error,
+        effective_pref,
+    } = match startup_result {
+        Ok(result) => result,
+        // 线程内 panic：降级为 NullBackend，让 GUI 正常启动并展示错误。
+        Err(panic) => {
+            let payload = panic
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| panic.downcast_ref::<String>().map(|s| s.to_string()))
+                .unwrap_or_else(|| "unknown panic".into());
+            log::error!("EC backend init panicked: {}", payload);
+            let effective_pref = config.backend;
+            startup::StartupResult {
+                backend: Box::new(ec::backend::NullBackend),
+                config,
+                init_error: Some(format!("EC 后端初始化异常: {}", payload)),
+                effective_pref,
+            }
+        }
+    };
+    log::info!(
+        "EC backend init took {} ms",
+        backend_init_start.elapsed().as_millis()
+    );
 
     // F-AUTO-07: --autostart 启动时驻留托盘（首帧最小化）。
     // 用 args_os 而非 args：Windows 允许非 UTF-8 的命令行参数，args()
     // 在遇到非 UTF-8 参数时会 panic，args_os 则只做逐字节比较。
     let autostart = std::env::args_os().any(|a| a == std::ffi::OsStr::new("--autostart"));
-    gui::run_app(backend, config, effective_pref, init_error, autostart);
-}
-
-/// 优先后端不可用时，应回退到的"另一个"后端。
-///
-/// - `Wmi` ↔ `WinRing0`：互为回退；
-/// - `Auto` 返回 `None`：`create_backend(Auto)` 内部已依次尝试过 WMI 与
-///   WinRing0，两者都失败后不存在"另一个"后端可重试——重试 Auto 只会把
-///   同一批双后端原样再来一轮（非小米机器上白白多耗一次完整 WMI 连接握手
-///   与 WinRing0 停装驱动的清理流程），直接进入错误路径。
-fn fallback_preference(pref: BackendPreference) -> Option<BackendPreference> {
-    match pref {
-        BackendPreference::Wmi => Some(BackendPreference::WinRing0),
-        BackendPreference::WinRing0 => Some(BackendPreference::Wmi),
-        BackendPreference::Auto => None,
-    }
-}
-
-/// 启动应用的结果：逐项记录是否成功写入硬件。
-struct StartupApplyOutcome {
-    charge_limit_ok: bool,
-    battery_care_ok: bool,
-    perf_mode_ok: bool,
-    /// 实际写入 EC 的性能模式 raw code（经交流电源保护降级后的值）。
-    perf_mode_written: u8,
-    /// 充电上限写入成功后读回的硬件实际生效值（WMI 量化后），供
-    /// sync_startup_config 直接回写配置，避免二次读回。
-    charge_limit_applied: Option<u8>,
-    /// 失败项的中文描述（每项一条），用于在 GUI 中向用户展示。
-    errors: Vec<String>,
-}
-
-impl Default for StartupApplyOutcome {
-    fn default() -> Self {
-        Self {
-            charge_limit_ok: true,
-            battery_care_ok: true,
-            perf_mode_ok: true,
-            perf_mode_written: 0,
-            charge_limit_applied: None,
-            errors: Vec::new(),
-        }
-    }
-}
-
-fn apply_startup_config(backend: &dyn EcBackend, config: &AppConfig) -> StartupApplyOutcome {
-    let mut outcome = StartupApplyOutcome::default();
-    if !config.auto_apply_on_startup {
-        return outcome;
-    }
-    log::info!("Applying config on startup");
-    // Keep battery care and charge limit coherent: when care is disabled
-    // the limit must be 100%, otherwise backends that derive the care bit
-    // from the limit would report it as enabled.  The unified
-    // battery::apply_battery_state writes the limit first (some EC firmware
-    // auto-syncs the care bit from it) then the care bit, and returns the
-    // hardware-applied limit after readback.
-    let desired_limit = ec::battery::coherent_charge_limit(
-        config.battery_care_enabled,
-        config.battery_charge_limit,
-    );
-    if desired_limit != config.battery_charge_limit {
-        log::warn!(
-            "Incoherent config: battery care on with limit {}%; using 80%",
-            config.battery_charge_limit
-        );
-    }
-    let applied = ec::battery::apply_battery_state(
+    log::info!("Launching GUI (--autostart mode: {})", autostart);
+    gui::run_app(
+        store,
         backend,
-        config.battery_care_enabled,
-        config.battery_charge_limit,
+        config,
+        effective_pref,
+        init_error,
+        autostart,
     );
-    if let Err(e) = &applied.charge_limit {
-        log::warn!("apply charge limit on startup: {}", e);
-        outcome.charge_limit_ok = false;
-        outcome.errors.push(format!("充电上限: {}", e));
-    }
-    if let Err(e) = &applied.care {
-        log::warn!("apply battery care on startup: {}", e);
-        outcome.battery_care_ok = false;
-        outcome.errors.push(format!("电池养护: {}", e));
-    }
-    outcome.charge_limit_applied = applied.charge_limit.ok();
-    // 狂暴模式需要交流电源：写入时按电源状态选择实际 raw code，但用户的
-    // 选择仍保存在 config 中，待接入电源后通过 ReapplyConfig 恢复。
-    let raw =
-        ec::performance::effective_ec_value(config.performance_mode, ec::performance::ac_power_status());
-    outcome.perf_mode_written = raw;
-    outcome.perf_mode_ok = match backend.set_performance_mode(raw) {
-        Ok(_) => true,
-        Err(e) => {
-            log::warn!("apply perf mode on startup: {}", e);
-            outcome.errors.push(format!("性能模式: {}", e));
-            false
-        }
-    };
-    outcome
-}
-
-/// 把启动应用成功后验证过的硬件配置回写进持久化配置，使磁盘配置与硬件
-/// 实际状态保持一致（量化读回、矛盾兜底等规范化已发生在 apply 路径）。
-///
-/// 只在**对应项写入成功**时才回写：写入失败时硬件未按期望改变，读回的是
-/// 硬件旧状态，用它覆盖配置会把用户的选择静默改掉。
-///
-/// 关键场景（B）：电池养护开启但充电上限写入失败时，WMI 的 set_battery_care
-/// 是契约性 no-op 恒返回 Ok（battery_care_ok=true），而硬件上限仍是 100%，
-/// 读回 care=false。若此时回写，config.battery_care_enabled 会被改成 false，
-/// 启动应用失败被静默持久化，下次启动还会按 care=false 强制写 100%，
-/// 用户设置的充电上限被永久摧毁。因此电池回写必须同时要求 charge_limit_ok。
-fn sync_startup_config(
-    backend: &dyn EcBackend,
-    config: &mut AppConfig,
-    outcome: &StartupApplyOutcome,
-) {
-    // 性能模式：仅当写入成功且写入的 raw code 就是用户选择的模式时才回写。
-    // 狂暴模式在电池供电时降级为极速（perf_mode_written != performance_mode），
-    // 不能把降级值当成用户选择。
-    if outcome.perf_mode_ok && outcome.perf_mode_written == config.performance_mode {
-        if let Ok(mode) = backend.get_performance_mode() {
-            config.performance_mode = mode;
-        }
-    }
-    // 电池养护 + 充电上限：两者都写入成功才回写（原因见函数注释）。
-    if outcome.battery_care_ok && outcome.charge_limit_ok {
-        if let Ok(enabled) = backend.get_battery_care_enabled() {
-            config.battery_care_enabled = enabled;
-            // 养护关闭时硬件上限恒为 100%，保留用户期望的 limit（供重新
-            // 开启养护时恢复）。
-            if enabled {
-                // apply 阶段已读回硬件实际生效值（量化后），直接使用，
-                // 无需再次读回。
-                if let Some(limit) = outcome.charge_limit_applied {
-                    config.battery_charge_limit = limit;
-                }
-            }
-        }
-    }
+    // 主流程结束（GUI 事件循环正常返回后唯一路径）：进程即将退出。该行是
+    // 生命周期日志链的终点——从日志第一行的版本号到这一行，能确认进程
+    // "完整走完启动→运行→退出"；若缺失，说明进程被外部强杀（如任务管理器
+    // 结束进程、tray 兜底 process::exit 前的超时）。
+    log::info!("App exiting normally");
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ec::error::EcError;
 
-    /// 充电上限写入失败、养护写入恒成功的后端（模拟 WMI 场景：set_battery_care
-    /// 是 no-op 恒 Ok，而 set_charge_limit 被固件拒绝）。读回值为硬件旧状态
-    /// （养护关闭、上限 100%）。
-    struct ChargeLimitFailsBackend;
-
-    impl EcBackend for ChargeLimitFailsBackend {
-        fn name(&self) -> &'static str {
-            "charge-limit-fails"
-        }
-        fn get_battery_care_enabled(&self) -> Result<bool, EcError> {
-            Ok(false)
-        }
-        fn get_charge_limit(&self) -> Result<u8, EcError> {
-            Ok(100)
-        }
-        fn set_battery_care(&self, _enabled: bool) -> Result<(), EcError> {
-            Ok(())
-        }
-        fn set_charge_limit(&self, _percent: u8) -> Result<(), EcError> {
-            Err(EcError::BackendUnavailable("charge limit rejected".into()))
-        }
-        fn get_performance_mode(&self) -> Result<u8, EcError> {
-            Ok(0x09)
-        }
-        fn set_performance_mode(&self, _mode: u8) -> Result<(), EcError> {
-            Ok(())
-        }
-    }
-
-    /// 全部写入成功、读回硬件量化值的模拟后端（模拟 WMI 85%→80% 量化）。
-    struct QuantSyncBackend;
-
-    impl EcBackend for QuantSyncBackend {
-        fn name(&self) -> &'static str {
-            "quant-sync"
-        }
-        fn get_battery_care_enabled(&self) -> Result<bool, EcError> {
-            Ok(true)
-        }
-        fn get_charge_limit(&self) -> Result<u8, EcError> {
-            Ok(80)
-        }
-        fn set_battery_care(&self, _enabled: bool) -> Result<(), EcError> {
-            Ok(())
-        }
-        fn set_charge_limit(&self, _percent: u8) -> Result<(), EcError> {
-            Ok(())
-        }
-        fn get_performance_mode(&self) -> Result<u8, EcError> {
-            Ok(0x09)
-        }
-        fn set_performance_mode(&self, _mode: u8) -> Result<(), EcError> {
-            Ok(())
-        }
-    }
-
-    /// 回归测试（B）：养护开启但充电上限写入失败时，启动同步不得把用户
-    /// 的 care=true 静默改写为硬件读回的 false。历史实现只检查 battery_care_ok
-    /// （WMI 的 set_battery_care 恒 Ok），导致应用失败被静默持久化，下次
-    /// 启动还会按 care=false 强制写 100%，摧毁用户设置的充电上限。
+    /// 日志轮转：超过阈值时旧文件被改名 `app.log.1`（保留上一份历史），
+    /// 未超过时保持原样。改名前旧的 `.1` 会被覆盖（只保留最近两份）。
     #[test]
-    fn test_partial_write_failure_keeps_user_config() {
-        let backend = ChargeLimitFailsBackend;
-        let config = AppConfig {
-            auto_apply_on_startup: true,
-            battery_care_enabled: true,
-            battery_charge_limit: 80,
-            ..Default::default()
-        };
-        let outcome = apply_startup_config(&backend, &config);
+    fn test_rotate_log_if_large() {
+        let dir = std::env::temp_dir().join(format!("xmpl-log-rotate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create log dir");
+        let path = dir.join("app.log");
 
-        // 写入结果必须如实反映失败。
-        assert!(!outcome.charge_limit_ok);
-        assert!(outcome.battery_care_ok);
-        assert!(!outcome.errors.is_empty());
+        // 小文件（低于阈值）：不轮转，原文件保留。
+        std::fs::write(&path, "small log").expect("write small");
+        rotate_log_if_large(&path);
+        assert!(path.exists(), "small log must not be rotated");
+        assert!(!dir.join("app.log.1").exists());
 
-        let mut cfg = config.clone();
-        sync_startup_config(&backend, &mut cfg, &outcome);
-        // 用户选择必须保留，不得被硬件旧状态覆盖。
-        assert!(cfg.battery_care_enabled, "care must not be overwritten by readback");
-        assert_eq!(cfg.battery_charge_limit, 80);
-    }
-
-    /// 回归测试：Auto 偏好失败后必须回退到"无可重试"，而不是把刚失败的
-    /// WMI+WinRing0 双后端原样再试一遍（浪费一次完整连接握手 + 驱动清理）。
-    #[test]
-    fn test_fallback_preference_auto_is_none() {
-        assert_eq!(fallback_preference(BackendPreference::Auto), None);
-        assert_eq!(
-            fallback_preference(BackendPreference::Wmi),
-            Some(BackendPreference::WinRing0)
+        // 超阈值文件：改名 `app.log.1`，原路径不再存在。
+        std::fs::write(&path, vec![b'x'; (LOG_ROTATE_BYTES + 1) as usize]).expect("write large");
+        rotate_log_if_large(&path);
+        assert!(!path.exists(), "oversized log must be renamed away");
+        assert!(
+            dir.join("app.log.1").exists(),
+            "oversized log must become app.log.1"
         );
+
+        // 已有旧 `.1` 时新轮转覆盖它（只保留最近一份历史）。
+        std::fs::write(&path, vec![b'y'; (LOG_ROTATE_BYTES + 1) as usize]).expect("write large 2");
+        std::fs::write(dir.join("app.log.1"), b"old backup").expect("write old backup");
+        rotate_log_if_large(&path);
+        let content = std::fs::read(dir.join("app.log.1")).expect("read rotated");
         assert_eq!(
-            fallback_preference(BackendPreference::WinRing0),
-            Some(BackendPreference::Wmi)
+            content.len(),
+            (LOG_ROTATE_BYTES + 1) as usize,
+            "new rotation must replace old backup"
         );
-    }
 
-    /// 全量成功时，启动同步把硬件实际生效的量化值（WMI 85→80）回写进配置。
-    #[test]
-    fn test_full_apply_syncs_quantized_hardware() {
-        let backend = QuantSyncBackend;
-        let config = AppConfig {
-            auto_apply_on_startup: true,
-            battery_care_enabled: true,
-            battery_charge_limit: 85,
-            ..Default::default()
-        };
-        let outcome = apply_startup_config(&backend, &config);
-        assert!(outcome.charge_limit_ok && outcome.battery_care_ok);
+        // 缺失文件：无操作不报错。
+        let missing = dir.join("missing.log");
+        rotate_log_if_large(&missing);
+        assert!(!missing.exists());
 
-        let mut cfg = config;
-        sync_startup_config(&backend, &mut cfg, &outcome);
-        assert!(cfg.battery_care_enabled);
-        assert_eq!(cfg.battery_charge_limit, 80);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
-
