@@ -1,11 +1,11 @@
+use windows::core::{BSTR, GUID, PCWSTR};
 use windows::Win32::Foundation::VARIANT_BOOL;
 use windows::Win32::System::Com::{
     CoCreateInstance, CoSetProxyBlanket, CLSCTX_INPROC_SERVER, EOAC_NONE, RPC_C_AUTHN_LEVEL_CALL,
     RPC_C_IMP_LEVEL_IMPERSONATE,
 };
 use windows::Win32::System::Variant::VARIANT;
-use windows::Win32::System::Wmi::{IWbemContext, IWbemLocator, IWbemServices};
-use windows::core::{BSTR, GUID, PCWSTR};
+use windows::Win32::System::Wmi::{IWbemClassObject, IWbemContext, IWbemLocator, IWbemServices};
 
 /// CLSID_WbemAdministrativeLocator ({CB8555CC-9128-11D1-AD9B-00C04FD8FDFF}).
 /// The classic CLSID_WbemLocator ({DC12A687-...}) is missing on newer
@@ -56,6 +56,56 @@ pub fn connect_root_wmi() -> Result<IWbemServices, String> {
     };
 
     Ok(services)
+}
+
+/// VARIANT 的 RAII 包装：Drop 时自动释放（委托给 VARIANT 自身的 Drop）。
+///
+/// windows-rs 0.62 的 `VARIANT` **实现了 Drop**（扩展模块中自动
+/// `VariantClear`，见 windows-rs 源码 `extensions/Win32/System/Variant.rs`）。
+/// 历史实现误以为它"不实现 Drop"，于是包一层 `OwnedVariant` 再手动
+/// `VariantClear`——同一 VARIANT 被清两次：先由本包装清、再把（此时已为
+/// VT_EMPTY 的）VARIANT 交给其自身 Drop 清一次。第二次清空是 no-op，无害，
+/// 但重复清理掩盖了真实语义、且错误注释会诱导后续维护者"补一个
+/// ManuallyDrop"或误删清理。修复：本包装**不再手动清零**，只依赖 VARIANT
+/// 自带的 Drop（唯一清理路径），注释与实现一致。持有者只管借用读取。
+pub struct OwnedVariant(VARIANT);
+
+impl OwnedVariant {
+    pub fn new(v: VARIANT) -> Self {
+        Self(v)
+    }
+}
+
+impl std::ops::Deref for OwnedVariant {
+    type Target = VARIANT;
+    fn deref(&self) -> &VARIANT {
+        &self.0
+    }
+}
+
+// 无需显式 impl Drop：VARIANT 自身 Drop 会 VariantClear，此处保持默认。
+
+/// 从 WMI 对象按名读取属性值（`IWbemClassObject::Get`）。
+///
+/// fnkey.rs 与 wmi.rs 各自重复实现过同样的样板（to_pcwstr → Get → 取
+/// VARIANT），统一收敛到此处。返回的 VARIANT 由 `OwnedVariant` 在 Drop 时
+/// 自动释放，调用方无需手动 `VariantClear`。属性缺失时返回 None。
+pub fn get_property(obj: &IWbemClassObject, name: &str) -> Option<OwnedVariant> {
+    let name = crate::util::WideString::new(name);
+    let mut val = VARIANT::default();
+    let mut _type = 0i32;
+    let mut _flavor = 0i32;
+    unsafe {
+        obj.Get(
+            name.as_pcwstr(),
+            0,
+            &mut val,
+            Some(&mut _type as *mut i32),
+            Some(&mut _flavor as *mut i32),
+        )
+        .ok()?;
+    }
+    Some(OwnedVariant::new(val))
 }
 
 pub unsafe fn bstr_from_variant(val: &VARIANT) -> Option<String> {
