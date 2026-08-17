@@ -12,10 +12,6 @@ pub enum EcError {
     WmiCallFailed(u16),
     #[error("WMI 调用返回错误 (hr=0x{0:08X})")]
     WmiCallHResult(u32),
-    #[error("EC 读取失败 (地址: {0:#x})")]
-    ReadFailed(u16),
-    #[error("EC 写入失败 (地址: {0:#x})")]
-    WriteFailed(u16),
     #[error("EC 操作超时 (地址: {0:#x})")]
     Timeout(u16),
     #[error("后端不可用: {0}")]
@@ -66,18 +62,6 @@ mod tests {
     fn test_display_timeout() {
         let err = EcError::Timeout(0x66);
         assert_eq!(err.to_string(), "EC 操作超时 (地址: 0x66)");
-    }
-
-    #[test]
-    fn test_display_read_failed() {
-        let err = EcError::ReadFailed(0xA4);
-        assert_eq!(err.to_string(), "EC 读取失败 (地址: 0xa4)");
-    }
-
-    #[test]
-    fn test_display_write_failed() {
-        let err = EcError::WriteFailed(0x68);
-        assert_eq!(err.to_string(), "EC 写入失败 (地址: 0x68)");
     }
 
     #[test]

@@ -19,7 +19,6 @@ use std::sync::Mutex;
 use super::backend::EcBackend;
 use super::battery;
 use super::error::EcError;
-use super::addr as ec_addr;
 
 use windows::Win32::System::Com::{
     CoInitializeEx, CoSetProxyBlanket, CoCreateInstance, CLSCTX_INPROC_SERVER,
@@ -146,8 +145,6 @@ fn latch_into(state: &mut Option<EcError>, hr: Option<u32>, err: EcError) -> EcE
 // ---------------------------------------------------------------------------
 
 enum WmiCmd {
-    ReadByte(u16),
-    WriteByte(u16, u8),
     GetBatteryState,
     SetBatteryCare(bool),
     SetChargeLimit(u8),
@@ -157,7 +154,6 @@ enum WmiCmd {
 }
 
 enum WmiReply {
-    Byte(Result<u8, EcError>),
     Unit(Result<(), EcError>),
     BatteryState(Result<(bool, u8), EcError>),
     PerfMode(Result<u8, EcError>),
@@ -222,8 +218,6 @@ impl WmiWorker {
         while let Ok(cmd) = rx.recv() {
             let reply = match cmd {
                 WmiCmd::Quit => break,
-                WmiCmd::ReadByte(addr) => WmiReply::Byte(self.read_byte_impl(addr)),
-                WmiCmd::WriteByte(addr, val) => WmiReply::Unit(self.write_byte_impl(addr, val)),
                 WmiCmd::GetBatteryState => WmiReply::BatteryState(self.get_battery_state_impl()),
                 WmiCmd::SetBatteryCare(en) => WmiReply::Unit(self.set_battery_care_impl(en)),
                 WmiCmd::SetChargeLimit(pct) => WmiReply::Unit(self.set_charge_limit_impl(pct)),
@@ -698,55 +692,6 @@ impl WmiWorker {
         Ok(())
     }
 
-    fn read_byte_impl(&mut self, addr: u16) -> Result<u8, EcError> {
-        match addr {
-            ec_addr::PERF_MODE => {
-                let buf = self.read_perf()?;
-                Ok(buf[4]) // Data0
-            }
-            ec_addr::CHARGE_LIMIT => {
-                let buf = self.read_battery()?;
-                // Data1 = 充电上限 raw code（如 0=100%、1=80%）。read_byte 对
-                // 该地址的约定语义是百分比（与 write_byte(CHARGE_LIMIT) 接收
-                // 百分比、以及 WinRing0 后端该地址读写均为百分比保持一致），
-                // 必须换算后再返回，否则读写不对称。
-                Ok(battery::wmi_rawcode_to_percent(buf[6]).unwrap_or(100))
-            }
-            ec_addr::BATTERY_CARE => {
-                let buf = self.read_battery()?;
-                // WMI 没有独立的电池养护位；充电上限 < 100% 表示已启用
-                let raw = buf[6]; // Data1 = 充电上限 raw code
-                let percent = battery::wmi_rawcode_to_percent(raw).unwrap_or(100);
-                Ok(if percent < 100 { 0x01 } else { 0x00 })
-            }
-            _ => Err(EcError::ReadFailed(addr)),
-        }
-    }
-
-    fn write_byte_impl(&mut self, addr: u16, value: u8) -> Result<(), EcError> {
-        match addr {
-            ec_addr::PERF_MODE => self.write_perf(value),
-            // WMI 没有独立的电池养护位（read_byte(BATTERY_CARE) 由充电上限
-            // <100% 推导，返回 0x01/0x00）。写入侧必须与 set_battery_care 保持
-            // 同一语义：0x00 = 关闭养护（上限提到 100%），非 0 = 启用养护——
-            // 上限由调用方通过 set_charge_limit 单独设置。绝不能把养护位原值
-            // 直接当作充电上限 raw code 写入，否则 write_byte(BATTERY_CARE,
-            // 0x01) 会把充电上限静默改成 80%，覆盖用户设置。
-            ec_addr::BATTERY_CARE => {
-                if value == 0 {
-                    self.set_charge_limit_impl(100)
-                } else {
-                    Ok(())
-                }
-            }
-            // read_byte(CHARGE_LIMIT) 返回的是百分比，写入侧保持一致：
-            // 先把百分比换算成 WMI raw code 再写入，避免读写语义不一致
-            // （否则按 raw code 直接写入，读回时按百分比解析会完全错位）。
-            ec_addr::CHARGE_LIMIT => self.write_battery(wmi_rawcode_for_percent(value)),
-            _ => Err(EcError::WriteFailed(addr)),
-        }
-    }
-
     fn get_battery_state_impl(&mut self) -> Result<(bool, u8), EcError> {
         // B-WMI-1: 养护位与上限来自同一条读命令的同一响应字段（Data1），
         // 一次往返同时返回两者；默认实现会发起两次相同的 WMI 往返。
@@ -798,10 +743,11 @@ pub struct WmiBackend {
     res: Mutex<mpsc::Receiver<WmiReply>>,
 }
 
-// SAFETY: WmiBackend 不含任何 COM 指针——所有 COM 对象归 worker 线程独占；
-// 共享状态仅 mpsc 通道（Sender 为 Sync），Receiver 经 Mutex 保护。
-unsafe impl Send for WmiBackend {}
-unsafe impl Sync for WmiBackend {}
+// `WmiBackend` 不含任何 COM 指针——所有 COM 对象归 worker 线程独占；
+// 共享状态仅 mpsc 通道（`Sender<WmiCmd>` 为 Send+Sync）与
+// `Mutex<Receiver<WmiReply>>`（`Receiver` 为 Send，`Mutex` 使其满足 Sync），
+// 因此 `Send + Sync` 由字段自动推导，无需 unsafe 实现（历史 unsafe impl
+// 是冗余的——见下方 test_wmi_backend_is_send_sync 的编译期断言）。
 
 impl Drop for WmiBackend {
     fn drop(&mut self) {
@@ -863,18 +809,8 @@ impl EcBackend for WmiBackend {
         "WMI (MICommonInterface)"
     }
 
-    fn read_byte(&self, addr: u16) -> Result<u8, EcError> {
-        match self.call(WmiCmd::ReadByte(addr)) {
-            WmiReply::Byte(r) => r,
-            _ => Err(EcError::BackendUnavailable("WMI worker 响应异常".into())),
-        }
-    }
-
-    fn write_byte(&self, addr: u16, value: u8) -> Result<(), EcError> {
-        match self.call(WmiCmd::WriteByte(addr, value)) {
-            WmiReply::Unit(r) => r,
-            _ => Err(EcError::BackendUnavailable("WMI worker 响应异常".into())),
-        }
+    fn preference(&self) -> super::config::BackendPreference {
+        super::config::BackendPreference::Wmi
     }
 
     fn get_battery_care_enabled(&self) -> Result<bool, EcError> {
@@ -934,6 +870,15 @@ impl EcBackend for WmiBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 编译期断言：WmiBackend 必须是 Send + Sync（无需 unsafe 实现，
+    /// 由字段自动推导）。`Box<dyn EcBackend>` 要求该约束；若未来字段
+    /// 类型变化导致约束不满足，此处会直接编译失败。
+    #[test]
+    fn test_wmi_backend_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<WmiBackend>();
+    }
 
     /// 实例名转义：WMI 对象路径中反斜杠与引号必须加倍，
     /// 否则路径解析失败（Meow-Box 同款路径格式）。

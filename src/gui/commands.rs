@@ -256,6 +256,60 @@ impl XiaomiApp {
     }
 
     pub fn try_switch_backend(&mut self, pref: BackendPreference) -> bool {
+        // 目标偏好与当前实际后端一致时直接确认，不重建：create_backend(WinRing0)
+        // 会先 cleanup_service 停/删驱动服务，而当前活动后端正依赖它——重建失败
+        // 会让工作正常的后端立即失效（见 winring0.rs）。
+        if pref != BackendPreference::Auto && self.backend.preference() == pref {
+            log::info!("Backend '{}' already active; no re-init needed", self.backend.name());
+            self.current_pref = pref;
+            self.config.backend = pref;
+            if let Err(e) = self.config.save() {
+                log::error!("save config: {}", e);
+            }
+            return true;
+        }
+        // Auto：优先 WMI，失败才回退 WinRing0。这里**不能**直接 create_backend(Auto)
+        // 重建——当 WMI 不可用且当前已是 WinRing0 时，create_backend(Auto) 会创建
+        // 一个新的 WinRing0 后端，随后 apply_backend_switch 丢弃旧实例、触发
+        // DeinitializeOls 卸载驱动，而新后端依赖的正是这个驱动——卸载后其端口读写
+        // 全部失效，工作正常的后端被自己搞坏（只能重启恢复）。Auto 的语义是
+        // "探测并选最优"，因此：
+        //   - 当前已是 WMI：Auto 的探测结果必然还是 WMI，直接确认，不重建；
+        //   - 当前是 WinRing0：先探测 WMI，可用则切过去；不可用则**保留**现有
+        //     WinRing0 后端（不再重新创建），避免卸载活驱动；
+        //   - 其余（无后端等）：走下方 create_backend(Auto) 的完整探测。
+        if pref == BackendPreference::Auto {
+            match self.backend.preference() {
+                BackendPreference::Wmi => {
+                    log::info!("Backend already matches Auto preference (WMI); no re-init needed");
+                    self.current_pref = pref;
+                    self.config.backend = pref;
+                    if let Err(e) = self.config.save() {
+                        log::error!("save config: {}", e);
+                    }
+                    return true;
+                }
+                BackendPreference::WinRing0 => match ec::backend::create_backend(BackendPreference::Wmi) {
+                    Ok(wmi) => {
+                        log::info!("Auto: WMI available; switching from WinRing0 to WMI");
+                        return self.apply_backend_switch(wmi, pref);
+                    }
+                    Err(e) => {
+                        log::info!(
+                            "Auto: WMI unavailable ({}); keeping active WinRing0 backend",
+                            e
+                        );
+                        self.current_pref = pref;
+                        self.config.backend = pref;
+                        if let Err(e) = self.config.save() {
+                            log::error!("save config: {}", e);
+                        }
+                        return true;
+                    }
+                },
+                _ => {}
+            }
+        }
         match ec::backend::create_backend(pref) {
             Ok(new_backend) => self.apply_backend_switch(new_backend, pref),
             Err(e) => {
@@ -350,12 +404,6 @@ mod tests {
         fn name(&self) -> &'static str {
             "mock"
         }
-        fn read_byte(&self, _addr: u16) -> Result<u8, EcError> {
-            Err(EcError::BackendUnavailable("mock".into()))
-        }
-        fn write_byte(&self, _addr: u16, _value: u8) -> Result<(), EcError> {
-            Ok(())
-        }
         fn get_battery_care_enabled(&self) -> Result<bool, EcError> {
             Ok(self.battery_care.load(std::sync::atomic::Ordering::Relaxed))
         }
@@ -407,6 +455,153 @@ mod tests {
         std::env::set_var("XIAOMI_PC_MANAGER_CONFIG_DIR", dir);
     }
 
+    /// 声称自己是 WMI 的后端（读取/写入全部失败）：用于验证"切换到已激活的
+    /// 同种后端"是 no-op——若触发 create_backend 会访问真实硬件（并失败）。
+    struct PrefWmiBackend;
+
+    impl EcBackend for PrefWmiBackend {
+        fn name(&self) -> &'static str {
+            "pref-wmi"
+        }
+        fn get_battery_care_enabled(&self) -> Result<bool, EcError> {
+            Err(EcError::BackendUnavailable("pref-wmi".into()))
+        }
+        fn get_charge_limit(&self) -> Result<u8, EcError> {
+            Err(EcError::BackendUnavailable("pref-wmi".into()))
+        }
+        fn set_battery_care(&self, _enabled: bool) -> Result<(), EcError> {
+            Err(EcError::BackendUnavailable("pref-wmi".into()))
+        }
+        fn set_charge_limit(&self, _percent: u8) -> Result<(), EcError> {
+            Err(EcError::BackendUnavailable("pref-wmi".into()))
+        }
+        fn get_performance_mode(&self) -> Result<u8, EcError> {
+            Err(EcError::BackendUnavailable("pref-wmi".into()))
+        }
+        fn set_performance_mode(&self, _mode: u8) -> Result<(), EcError> {
+            Err(EcError::BackendUnavailable("pref-wmi".into()))
+        }
+        fn preference(&self) -> BackendPreference {
+            BackendPreference::Wmi
+        }
+    }
+
+    /// 声称自己是 WinRing0 的后端（读取/写入全部失败）：用于验证从 WinRing0
+    /// 切换到 Auto 时**不会**重建 WinRing0（重建会先卸载活驱动，见
+    /// try_switch_backend 注释）。
+    struct PrefWinRing0Backend;
+
+    impl EcBackend for PrefWinRing0Backend {
+        fn name(&self) -> &'static str {
+            "pref-winring0"
+        }
+        fn get_battery_care_enabled(&self) -> Result<bool, EcError> {
+            Err(EcError::BackendUnavailable("pref-winring0".into()))
+        }
+        fn get_charge_limit(&self) -> Result<u8, EcError> {
+            Err(EcError::BackendUnavailable("pref-winring0".into()))
+        }
+        fn set_battery_care(&self, _enabled: bool) -> Result<(), EcError> {
+            Err(EcError::BackendUnavailable("pref-winring0".into()))
+        }
+        fn set_charge_limit(&self, _percent: u8) -> Result<(), EcError> {
+            Err(EcError::BackendUnavailable("pref-winring0".into()))
+        }
+        fn get_performance_mode(&self) -> Result<u8, EcError> {
+            Err(EcError::BackendUnavailable("pref-winring0".into()))
+        }
+        fn set_performance_mode(&self, _mode: u8) -> Result<(), EcError> {
+            Err(EcError::BackendUnavailable("pref-winring0".into()))
+        }
+        fn preference(&self) -> BackendPreference {
+            BackendPreference::WinRing0
+        }
+    }
+
+    /// 回归测试：当前后端已是 WMI（Auto 探测的必然结果）时，切换到 Auto 必须
+    /// 是 no-op——历史实现会 create_backend(Auto) 重建一个 WMI 代理（每次请求
+    /// 都多一次完整连接握手），此处校验不触发任何重建。
+    #[test]
+    fn test_try_switch_backend_auto_when_already_wmi_is_noop() {
+        redirect_config_dir();
+        let mut app = XiaomiApp::new(
+            Box::new(PrefWmiBackend),
+            AppConfig::default(),
+            BackendPreference::Wmi,
+            None,
+            false,
+        );
+        // 构造时的启动刷新会产生读取错误，先清空以便聚焦本用例。
+        app.error_msg = None;
+        let backend_before = app.backend_name.clone();
+
+        let ok = app.try_switch_backend(BackendPreference::Auto);
+        assert!(ok, "Auto switch on an already-WMI backend must succeed");
+        assert_eq!(app.backend_name, backend_before, "backend must not be recreated");
+        assert_eq!(app.current_pref, BackendPreference::Auto);
+        assert_eq!(app.config.backend, BackendPreference::Auto);
+        assert!(app.error_msg.is_none(), "no-op switch must not produce errors");
+    }
+
+    /// 回归测试：当前后端是 WinRing0 时切换到 Auto。WMI 不可用时必须**保留**
+    /// 现有 WinRing0 后端而不是重建——重建会创建新实例后再 drop 旧实例，
+    /// 触发 DeinitializeOls 卸载驱动，使新 WinRing0 后端的端口读写全部失效
+    /// （只能重启恢复）。WMI 可用时按 Auto 语义切到 WMI。两条路径都不得
+    /// 留下损坏的后端或产生错误。
+    #[test]
+    fn test_try_switch_backend_auto_from_winring0_keeps_or_switches() {
+        redirect_config_dir();
+        let mut app = XiaomiApp::new(
+            Box::new(PrefWinRing0Backend),
+            AppConfig::default(),
+            BackendPreference::WinRing0,
+            None,
+            false,
+        );
+        app.error_msg = None;
+        let backend_before = app.backend_name.clone();
+
+        let ok = app.try_switch_backend(BackendPreference::Auto);
+        assert!(ok, "Auto switch must never leave a broken backend");
+        if app.backend_name == backend_before {
+            // WMI 不可用：现有 WinRing0 后端必须被原样保留（未被重建）。
+            assert_eq!(app.backend.preference(), BackendPreference::WinRing0);
+        } else {
+            // WMI 可用：Auto 优先 WMI，应切换到 WMI 后端。
+            assert_eq!(app.backend.preference(), BackendPreference::Wmi);
+        }
+        assert_eq!(app.current_pref, BackendPreference::Auto);
+        assert_eq!(app.config.backend, BackendPreference::Auto);
+        assert!(app.error_msg.is_none(), "switch must not leave errors");
+    }
+
+    /// 回归测试：请求切换到"当前已经激活的同种后端"必须是 no-op。
+    /// 历史实现会重建后端：WinRing0 的重建路径先 cleanup_service 停/删当前
+    /// 驱动服务，若后续 InitializeOls 失败，正在工作的后端立即失效。
+    /// no-op 分支不创建新后端（不触碰真实硬件），因此这里的 WMI 偏好切换
+    /// 必须返回 true 且后端实例保持不变。
+    #[test]
+    fn test_try_switch_backend_same_kind_is_noop() {
+        redirect_config_dir();
+        let mut app = XiaomiApp::new(
+            Box::new(PrefWmiBackend),
+            AppConfig::default(),
+            BackendPreference::Wmi,
+            None,
+            false,
+        );
+        // 构造时的启动刷新会产生读取错误，先清空以便聚焦本用例。
+        app.error_msg = None;
+        let backend_before = app.backend_name.clone();
+
+        let ok = app.try_switch_backend(BackendPreference::Wmi);
+        assert!(ok, "same-kind switch must be a no-op that succeeds");
+        assert_eq!(app.backend_name, backend_before, "backend must not be recreated");
+        assert_eq!(app.current_pref, BackendPreference::Wmi);
+        assert_eq!(app.config.backend, BackendPreference::Wmi);
+        assert!(app.error_msg.is_none(), "no-op switch must not produce errors");
+    }
+
     /// Backend that fails every operation, used to verify that failed writes
     /// never corrupt the UI state or the persisted config.
     struct FailingBackend;
@@ -414,12 +609,6 @@ mod tests {
     impl EcBackend for FailingBackend {
         fn name(&self) -> &'static str {
             "failing"
-        }
-        fn read_byte(&self, _addr: u16) -> Result<u8, EcError> {
-            Err(EcError::BackendUnavailable("failing".into()))
-        }
-        fn write_byte(&self, _addr: u16, _value: u8) -> Result<(), EcError> {
-            Err(EcError::BackendUnavailable("failing".into()))
         }
         fn get_battery_care_enabled(&self) -> Result<bool, EcError> {
             Err(EcError::BackendUnavailable("failing".into()))
@@ -925,12 +1114,6 @@ mod tests {
         fn name(&self) -> &'static str {
             "partial-care"
         }
-        fn read_byte(&self, _addr: u16) -> Result<u8, EcError> {
-            Err(EcError::BackendUnavailable("partial-care".into()))
-        }
-        fn write_byte(&self, _addr: u16, _value: u8) -> Result<(), EcError> {
-            Ok(())
-        }
         fn get_battery_care_enabled(&self) -> Result<bool, EcError> {
             Err(EcError::BackendUnavailable("partial-care".into()))
         }
@@ -1014,12 +1197,6 @@ mod tests {
     impl EcBackend for QuantizingBackend {
         fn name(&self) -> &'static str {
             "quantizing"
-        }
-        fn read_byte(&self, _addr: u16) -> Result<u8, EcError> {
-            Err(EcError::BackendUnavailable("quantizing".into()))
-        }
-        fn write_byte(&self, _addr: u16, _value: u8) -> Result<(), EcError> {
-            Ok(())
         }
         fn get_battery_care_enabled(&self) -> Result<bool, EcError> {
             Ok(self.charge_limit.load(std::sync::atomic::Ordering::Relaxed) < 100)

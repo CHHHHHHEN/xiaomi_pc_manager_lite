@@ -68,8 +68,7 @@ impl XiaomiApp {
     }
 }
 
-pub fn run_app(backend: Box<dyn ec::backend::EcBackend>, config: ec::config::AppConfig, init_error: Option<String>, start_minimized: bool) {
-    let pref = config.backend;
+pub fn run_app(backend: Box<dyn ec::backend::EcBackend>, config: ec::config::AppConfig, pref: BackendPreference, init_error: Option<String>, start_minimized: bool) {
     let app = XiaomiApp::new(backend, config, pref, init_error, start_minimized);
     let cmd_tx = app.cmd_tx.clone();
 

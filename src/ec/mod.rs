@@ -22,23 +22,3 @@ pub mod addr {
     /// EC data port (I/O 0x62)
     pub const EC_DATA: u16 = 0x62;
 }
-
-#[cfg(test)]
-mod tests {
-    use super::addr;
-
-    #[test]
-    fn test_perf_mode_addr() {
-        assert_eq!(addr::PERF_MODE, 0x68);
-    }
-
-    #[test]
-    fn test_battery_care_addr() {
-        assert_eq!(addr::BATTERY_CARE, 0xA4);
-    }
-
-    #[test]
-    fn test_charge_limit_addr() {
-        assert_eq!(addr::CHARGE_LIMIT, 0xA7);
-    }
-}

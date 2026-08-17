@@ -4,10 +4,6 @@ use super::error::EcError;
 pub trait EcBackend: Send + Sync {
     fn name(&self) -> &'static str;
 
-    /// Low-level EC byte access (port I/O for WinRing0)
-    fn read_byte(&self, addr: u16) -> Result<u8, EcError>;
-    fn write_byte(&self, addr: u16, value: u8) -> Result<(), EcError>;
-
     // ── High-level battery operations ──
     fn get_battery_care_enabled(&self) -> Result<bool, EcError>;
     fn get_charge_limit(&self) -> Result<u8, EcError>;
@@ -33,6 +29,28 @@ pub trait EcBackend: Send + Sync {
     /// WinRing0 supports 0–100, WMI only supports a fixed set.
     fn supports_continuous_charge_limit(&self) -> bool {
         true
+    }
+
+    /// The backend preference this backend corresponds to.
+    ///
+    /// Used to detect "already on this backend" so a switch can be a no-op
+    /// (recreating the same backend would tear down the driver that is in
+    /// active use, see winring0.rs) and to let the GUI reflect the backend
+    /// that is actually running after a fallback.
+    fn preference(&self) -> BackendPreference {
+        BackendPreference::Auto
+    }
+
+    /// Whether this backend is the null placeholder (created when no real
+    /// backend could be initialized).
+    ///
+    /// Callers use this instead of comparing `name()` strings (which is
+    /// fragile — a renamed display name silently breaks the check): when the
+    /// backend is null, the *user's configured* preference is still the
+    /// authoritative one (it will be retried on next startup), while for a
+    /// live backend the actual `preference()` is shown.
+    fn is_null(&self) -> bool {
+        false
     }
 }
 
@@ -78,8 +96,6 @@ macro_rules! null_err {
 
 impl EcBackend for NullBackend {
     fn name(&self) -> &'static str { "无后端" }
-    fn read_byte(&self, _addr: u16) -> Result<u8, EcError> { null_err!() }
-    fn write_byte(&self, _addr: u16, _value: u8) -> Result<(), EcError> { null_err!() }
     fn get_battery_care_enabled(&self) -> Result<bool, EcError> { null_err!() }
     fn get_charge_limit(&self) -> Result<u8, EcError> { null_err!() }
     fn set_battery_care(&self, _enabled: bool) -> Result<(), EcError> { null_err!() }
@@ -87,6 +103,7 @@ impl EcBackend for NullBackend {
     fn get_performance_mode(&self) -> Result<u8, EcError> { null_err!() }
     fn set_performance_mode(&self, _mode: u8) -> Result<(), EcError> { null_err!() }
     fn supports_continuous_charge_limit(&self) -> bool { false }
+    fn is_null(&self) -> bool { true }
 }
 
 #[cfg(test)]
@@ -101,8 +118,6 @@ mod tests {
     #[test]
     fn test_null_backend_all_methods_return_error() {
         let backend = NullBackend;
-        assert!(backend.read_byte(0x68).is_err());
-        assert!(backend.write_byte(0x68, 0x09).is_err());
         assert!(backend.get_battery_care_enabled().is_err());
         assert!(backend.get_charge_limit().is_err());
         assert!(backend.set_battery_care(true).is_err());
@@ -114,6 +129,11 @@ mod tests {
     #[test]
     fn test_null_backend_supports_continuous_charge_limit() {
         assert!(!NullBackend.supports_continuous_charge_limit());
+    }
+
+    #[test]
+    fn test_null_backend_is_null() {
+        assert!(NullBackend.is_null());
     }
 
     #[test]

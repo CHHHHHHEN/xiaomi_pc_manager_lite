@@ -109,8 +109,8 @@ fn main() {
     // config 副本上并已落盘；若不把该副本交还给 GUI，GUI 的 save_state()
     // 会把未同步的旧值（如 care=true+limit=100、85% 非预设值）重新写回
     // 磁盘，覆盖启动时验证过的配置，导致磁盘配置反复"复活"矛盾组合。
-    let (backend, config, init_error) =
-        std::thread::spawn(move || -> (Box<dyn EcBackend>, AppConfig, Option<String>) {
+    let (backend, config, init_error, effective_pref) =
+        std::thread::spawn(move || -> (Box<dyn EcBackend>, AppConfig, Option<String>, BackendPreference) {
         let mut config = thread_config;
         let (backend, mut init_error): (Box<dyn EcBackend>, Option<String>) =
             match ec::backend::create_backend(config.backend) {
@@ -172,7 +172,17 @@ fn main() {
             }
         }
 
-        (backend, config, init_error)
+        // 实际生效的后端偏好：后端创建失败、用 NullBackend 兜底时，config.backend
+        // 仍是用户偏好（合理——下次启动还会重试），GUI 的"EC 后端偏好"单选应显示
+        // 用户偏好；回退成功时则显示**实际运行**的后端，避免 GUI 显示"偏好选中了
+        // 一个不可用后端、而状态栏显示另一个"的矛盾（F-ERR-03 的一致性）。
+        let effective_pref = if backend.is_null() {
+            config.backend
+        } else {
+            backend.preference()
+        };
+
+        (backend, config, init_error, effective_pref)
     })
     .join()
     .expect("EC backend init thread panicked");
@@ -181,7 +191,7 @@ fn main() {
     // 用 args_os 而非 args：Windows 允许非 UTF-8 的命令行参数，args()
     // 在遇到非 UTF-8 参数时会 panic，args_os 则只做逐字节比较。
     let autostart = std::env::args_os().any(|a| a == std::ffi::OsStr::new("--autostart"));
-    gui::run_app(backend, config, init_error, autostart);
+    gui::run_app(backend, config, effective_pref, init_error, autostart);
 }
 
 /// 优先后端不可用时，应回退到的"另一个"后端。
@@ -335,12 +345,6 @@ mod tests {
         fn name(&self) -> &'static str {
             "charge-limit-fails"
         }
-        fn read_byte(&self, _addr: u16) -> Result<u8, EcError> {
-            Err(EcError::BackendUnavailable("mock".into()))
-        }
-        fn write_byte(&self, _addr: u16, _value: u8) -> Result<(), EcError> {
-            Ok(())
-        }
         fn get_battery_care_enabled(&self) -> Result<bool, EcError> {
             Ok(false)
         }
@@ -367,12 +371,6 @@ mod tests {
     impl EcBackend for QuantSyncBackend {
         fn name(&self) -> &'static str {
             "quant-sync"
-        }
-        fn read_byte(&self, _addr: u16) -> Result<u8, EcError> {
-            Err(EcError::BackendUnavailable("mock".into()))
-        }
-        fn write_byte(&self, _addr: u16, _value: u8) -> Result<(), EcError> {
-            Ok(())
         }
         fn get_battery_care_enabled(&self) -> Result<bool, EcError> {
             Ok(true)

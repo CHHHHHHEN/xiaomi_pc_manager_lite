@@ -40,6 +40,15 @@ fn ec_wait_read(rp: ReadPort) -> Result<(), EcError> {
     Err(EcError::Timeout(ec_addr::EC_CMD))
 }
 
+/// 本进程当前存活的 WinRing0 后端实例数（驱动已由成功创建的实例加载）。
+///
+/// cleanup_service 的语义是清理**跨进程残留**的陈旧驱动服务（上次运行崩溃/
+/// 未正常卸载遗留）。当本进程已有一个存活的后端在用它时，删除该服务会同时
+/// 拆掉正在使用的驱动：随后的 InitializeOls 一旦失败（Defender 锁文件、
+/// 服务清理时序等已知瞬态），现有后端立刻失效、所有端口读写报错，直到重启。
+/// 因此仅在无存活实例时执行清理。
+static WINRING0_INSTANCES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 pub struct WinRing0Backend {
     rp: ReadPort,
     wp: WritePort,
@@ -53,6 +62,7 @@ impl Drop for WinRing0Backend {
             let deinit: unsafe extern "system" fn() = *deinit;
             unsafe { deinit() };
         }
+        WINRING0_INSTANCES.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -82,16 +92,40 @@ fn try_load(dll_path: &str) -> Result<(Library, ReadPort, WritePort), EcError> {
 
     // Clean up any stale service from a previous run so that
     // InitializeOls's internal ManageDriver can create a fresh one.
-    cleanup_service();
+    // 注意：仅当本进程**没有存活**的 WinRing0 后端时才清理——若当前活动后端
+    // 正是 WinRing0，这里停/删的是它正在使用的驱动服务；随后 InitializeOls
+    // 一旦失败（重试也失败），活动后端立即失效（端口读写全部报错，直到重启）。
+    if WINRING0_INSTANCES.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        cleanup_service();
+    } else {
+        log::info!("WinRing0: live backend in this process; skipping service cleanup");
+    }
 
     let init: unsafe extern "system" fn() -> i32 =
         *unsafe { lib.get(b"InitializeOls") }
             .map_err(|e| EcError::DllLoad(e.to_string()))?;
 
+    // **符号必须在 InitializeOls 之前全部解析。** InitializeOls 成功会加载驱动，
+    // 而驱动一旦加载，本进程就必须靠 DeinitializeOls 卸载（只能由 WinRing0Backend
+    // 的 Drop 触发）。若在此之后再出现任何可失败的步骤（如缺失
+    // ReadIoPortByte/WriteIoPortByte 符号）返回 Err，会留下三种互相耦合的坏状态：
+    //   1. 驱动保持加载、从未 DeinitializeOls（本函数没有 WinRing0Backend 可 drop）；
+    //   2. WINRING0_INSTANCES 已递增、无人递减，cleanup_service 在剩余进程生命周期
+    //      内被永久跳过——后续每次 WinRing0Backend::new() 都不会清理陈旧服务；
+    //   3. 第二次 try_load 对已加载的驱动再调 InitializeOls 会因服务名冲突失败，
+    //      把"一次符号缺失"放大成"后端永久不可用"。
+    // 把全部符号解析提前到 init 之前后，init 之后不再有任何可失败步骤，计数器
+    // 的递增与后端的成功构造一一对应。
+    let rp: ReadPort = *unsafe { lib.get(b"ReadIoPortByte") }
+        .map_err(|e| EcError::DllLoad(e.to_string()))?;
+
+    let wp: WritePort = *unsafe { lib.get(b"WriteIoPortByte") }
+        .map_err(|e| EcError::DllLoad(e.to_string()))?;
+
     // Let InitializeOls handle driver installation (like the C version).
     // 失败重试：驱动的安装/加载可能因时序问题首次失败（例如刚解压的文件
     // 被 Defender 实时扫描锁定、服务清理尚未完成、驱动卸载未结束），
-    // 稍作延时重试即可成功——历史实现只尝试一次，导致"首次切换 WinRing0
+    // 稍作延时重试即可成功——历史实现只尝试一次，导致"首次 InitializeOls
     // 显示失败、反复切换多次后才成功"。
     let mut init_error = 0u32;
     let mut init_ok = false;
@@ -113,12 +147,7 @@ fn try_load(dll_path: &str) -> Result<(Library, ReadPort, WritePort), EcError> {
         return Err(EcError::InitFailed(format!("错误码: {:#x}", init_error)));
     }
     log::info!("WinRing0: InitializeOls succeeded");
-
-    let rp: ReadPort = *unsafe { lib.get(b"ReadIoPortByte") }
-        .map_err(|e| EcError::DllLoad(e.to_string()))?;
-
-    let wp: WritePort = *unsafe { lib.get(b"WriteIoPortByte") }
-        .map_err(|e| EcError::DllLoad(e.to_string()))?;
+    WINRING0_INSTANCES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
     Ok((lib, rp, wp))
 }
@@ -248,12 +277,10 @@ impl WinRing0Backend {
     }
 }
 
-impl EcBackend for WinRing0Backend {
-    fn name(&self) -> &'static str {
-        "WinRing0 (I/O Port)"
-    }
-
-    fn read_byte(&self, addr: u16) -> Result<u8, EcError> {
+impl WinRing0Backend {
+    /// 低层 EC 寄存器访问（端口 I/O）。仅本后端使用——WMI 后端没有
+    /// 寄存器语义，通过 MiInterface 协议映射反而是误导，故不放在 trait 上。
+    pub fn read_byte(&self, addr: u16) -> Result<u8, EcError> {
         let _guard = self.lock.lock().unwrap_or_else(|e| {
             log::warn!("WinRing0 mutex was poisoned, recovering");
             e.into_inner()
@@ -266,7 +293,7 @@ impl EcBackend for WinRing0Backend {
         Ok(unsafe { (self.rp)(ec_addr::EC_DATA) })
     }
 
-    fn write_byte(&self, addr: u16, value: u8) -> Result<(), EcError> {
+    pub fn write_byte(&self, addr: u16, value: u8) -> Result<(), EcError> {
         let _guard = self.lock.lock().unwrap_or_else(|e| {
             log::warn!("WinRing0 mutex was poisoned, recovering");
             e.into_inner()
@@ -279,6 +306,16 @@ impl EcBackend for WinRing0Backend {
         unsafe { (self.wp)(ec_addr::EC_DATA, value) };
         ec_wait_write(self.rp)?;
         Ok(())
+    }
+}
+
+impl EcBackend for WinRing0Backend {
+    fn name(&self) -> &'static str {
+        "WinRing0 (I/O Port)"
+    }
+
+    fn preference(&self) -> super::config::BackendPreference {
+        super::config::BackendPreference::WinRing0
     }
 
     // ── High-level battery ──
