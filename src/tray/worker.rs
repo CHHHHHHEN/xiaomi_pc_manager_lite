@@ -163,17 +163,20 @@ fn toggle_main_window() {
     }
 }
 
-/// 托盘直接退出：向主窗口投递 WM_QUIT，winit 消息循环收到后退出，
-/// eframe run_native 返回、进程正常结束（窗口隐藏时同样有效，
-/// 不依赖 GUI update 循环）。
-///
 /// 兜底：WM_QUIT 未生效（GUI 线程被阻塞）时强制退出。宽限期必须大于
-/// WMI 后端单次调用的最坏阻塞时长（GET_RESULT_TIMEOUT_MS = 3000，见
-/// ec/wmi.rs）：否则 GUI 线程正阻塞在 `recv()` 等待 WMI worker 回复时
-/// 根本来不及处理 WM_QUIT，过早的 `process::exit` 会把进程硬杀在一次
-/// 尚未完成的硬件调用中途。正常退出路径不经过此睡眠——主线程退出后
+/// GUI 线程**处理完一整条命令**的最坏阻塞时长，而不只是 WMI 单次调用的
+/// 时长（GET_RESULT_TIMEOUT_MS = 3000，见 ec/wmi.rs）：GUI 线程只有在
+/// 进入消息循环后才会处理 WM_QUIT，而 process_commands 每帧会一次性
+/// 排空整个命令队列，每条命令（如 ToggleBatteryCare）含多次顺序 WMI
+/// 往返（写限值 + 写养护 + 读回，ReapplyConfig 可达 4 次），每次最坏
+/// 阻塞 3000ms——单条命令最坏约 9000ms。若宽限期只覆盖单次调用，GUI
+/// 正处理一条慢速 WMI 命令时过早 `process::exit` 会把进程硬杀在一次
+/// 尚未完成的硬件调用中途，EC 状态可能撕裂。取 5×3000 覆盖单条命令
+/// 的最坏情况并留余量（下方测试用编译期断言锁定该关系）；多条命令的
+/// 批量排空发生在 WMI 每条调用都超时的极端故障下，此时超过宽限期强制
+/// 退出仍是可接受的兜底。正常退出路径不经过此睡眠——主线程退出后
 /// 进程随即终止，本线程的兜底睡眠由进程结束一并终结。
-const QUIT_FALLBACK_MS: u64 = 5000;
+const QUIT_FALLBACK_MS: u64 = 15000;
 
 fn quit_app() {
     if let Some(hwnd) = crate::platform::window::find_main_window_handle() {
@@ -357,8 +360,12 @@ fn load_icon(bytes: &[u8]) -> Result<windows::Win32::UI::WindowsAndMessaging::HI
     let e = 6;
     let off = u32::from_le_bytes([bytes[e + 12], bytes[e + 13], bytes[e + 14], bytes[e + 15]]) as usize;
     let sz = u32::from_le_bytes([bytes[e + 8], bytes[e + 9], bytes[e + 10], bytes[e + 11]]) as usize;
-    if off + sz > bytes.len() {
-        return Err("OOB".into());
+    // checked_add: 恶意/损坏的 ICO 可能使 off+sz 溢出（32 位平台 usize 溢出
+    // 会 panic 或回绕），进而绕过 OOB 检查、`&bytes[off..off+sz]` 越界 panic。
+    // 用 checked_add 先验证区间落在字节缓冲内再切取。
+    match off.checked_add(sz) {
+        Some(end) if end <= bytes.len() => {}
+        _ => return Err("OOB".into()),
     }
     unsafe {
         CreateIconFromResourceEx(&bytes[off..off + sz], true, 0x00030000, 0, 0, LR_DEFAULTCOLOR)
@@ -398,7 +405,32 @@ mod tests {
         assert!(nid.szTip[expected.len()..].iter().all(|&c| c == 0));
     }
 
-    /// 回归测试：TaskbarCreated 注册消息必须可用且稳定，且位于注册消息
+    /// 回归测试：恶意/损坏的 ICO 声明越界或溢出的图像偏移时，load_icon 必须
+    /// 返回 Err 而不是构造越界切片 panic（32 位平台 off+sz 可能回绕，绕过
+    /// 旧的 off+sz > len 检查后 `&bytes[off..off+sz]` 越界崩溃）。
+    #[test]
+    fn test_load_icon_rejects_malformed_offsets() {
+        // 合法头部（1 个条目），但图像偏移/长度声明超出缓冲。
+        fn ico_with_entry(off: u32, sz: u32) -> Vec<u8> {
+            let mut b = vec![0u8; 6 + 16];
+            b[4] = 1;
+            b[5] = 0;
+            b[6 + 8..6 + 12].copy_from_slice(&sz.to_le_bytes());
+            b[6 + 12..6 + 16].copy_from_slice(&off.to_le_bytes());
+            b
+        }
+        // off+sz 在 u32 内回绕为小值，若用未检查加法会绕过 OOB 校验。
+        let wrapped = ico_with_entry(u32::MAX, 2);
+        assert_eq!(wrapped.len(), 22);
+        // off+sz 计算（u64 不溢出）：0x100000001 > 22 → 必须拒绝。
+        assert!(load_icon(&ico_with_entry(u32::MAX, 2)).is_err());
+        // 偏移正常但超出缓冲。
+        assert!(load_icon(&ico_with_entry(1000, 10)).is_err());
+        // 偏移合法但长度越界。
+        assert!(load_icon(&ico_with_entry(6, 10_000)).is_err());
+    }
+
+    /// 回归测试：TraybarCreated 注册消息必须可用且稳定，且位于注册消息
     /// 区间（0xC000-0xFFFF），不与 WM_APP 区间的 WM_TRAY 冲突。
     #[test]
     fn test_taskbar_created_message_registers() {
@@ -445,19 +477,21 @@ mod tests {
         assert_eq!(sz_tip[127], 0);
     }
 
-    /// 回归测试（BUG B）：托盘退出的兜底强制退出时长必须大于 WMI 后端单次
-    /// 调用的最坏阻塞时长（GET_RESULT_TIMEOUT_MS=3000，ec/wmi.rs）。否则
-    /// GUI 线程正阻塞在 `recv()` 等待 WMI worker 回复时（最长 3000ms）根本
-    /// 来不及处理托盘线程投递的 WM_QUIT，过早的 `process::exit` 会把进程
-    /// 硬杀在一次尚未完成的硬件调用中途。若 WMI 侧的等待上限被调高到
-    /// 超过本常量，必须同步调高 QUIT_FALLBACK_MS。
+    /// 回归测试（BUG B）：托盘退出的兜底强制退出时长必须大于 GUI 线程处理
+    /// **一整条命令**的最坏阻塞时长——而非仅 WMI 单次调用。GUI 线程处理
+    /// WM_QUIT 必须先完成当前命令批次的排空：单条命令（如 ToggleBatteryCare）
+    /// 最坏含 3 次顺序 WMI 调用（写限值 + 写养护 + 读回），每次调用的最坏
+    /// 阻塞为 GET_RESULT_TIMEOUT_MS=3000（ec/wmi.rs）；ReapplyConfig 可达
+    /// 4 次。过早的 `process::exit` 会把进程硬杀在一次尚未完成的硬件调用
+    /// 中途。若 WMI 侧的等待上限被调高到超过本常量/3，必须同步调高
+    /// QUIT_FALLBACK_MS。
     #[test]
     fn test_quit_fallback_exceeds_wmi_call_timeout() {
-        // 编译期断言：QUIT_FALLBACK_MS 恒 ≥ WMI 单次调用超时（3000ms）。
+        // 编译期断言：QUIT_FALLBACK_MS 恒 ≥ 3 × WMI 单次调用超时（3000ms）。
         // 若未来调高 GET_RESULT_TIMEOUT_MS，此断言会直接导致编译失败，
         // 强制同步调高 QUIT_FALLBACK_MS（避免进程被硬杀在一次未完成的
         // 硬件调用中途）。
-        const _: () = assert!(QUIT_FALLBACK_MS >= 3000);
+        const _: () = assert!(QUIT_FALLBACK_MS >= 3 * 3000);
     }
 
     /// 回归测试：tray_nid_snapshot 必须返回保存的 NID 副本（NOTIFYICONDATAW
