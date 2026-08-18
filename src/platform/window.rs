@@ -11,6 +11,7 @@
 use std::sync::Mutex;
 
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateIconFromResourceEx, FindWindowW, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect,
     IsWindowVisible, SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
@@ -253,15 +254,29 @@ struct IconHandle(HICON);
 unsafe impl Send for IconHandle {}
 unsafe impl Sync for IconHandle {}
 
-/// 从多尺寸 ICO 字节构建「目标尺寸最接近的单帧」HICON。
+/// 托盘图标的目标物理像素尺寸（逻辑 16px，按系统 DPI 缩放）。
+///
+/// 任务栏通知区以 16 逻辑像素绘制小图标，但高 DPI 缩放（125%/150%/200%…）
+/// 时实际渲染像素为 16 × DPI/96。若取 16px 单帧，系统把小位图放大
+/// 托盘图标发糊。这里换算成物理尺寸，让调用方取不小于它的单帧（只缩小
+/// 不放大，清晰）。GetDpiForSystem 返回 0（异常/老系统）时回退 96。
+pub fn tray_icon_size_px() -> u32 {
+    let dpi = unsafe { GetDpiForSystem().max(1) }.max(96);
+    // round(16 × dpi / 96)
+    (16 * dpi + 48) / 96
+}
+
+/// 从多尺寸 ICO 字节构建「不小于目标尺寸的最小帧」HICON。
 ///
 /// **为什么不能把整份 ICO 直接交给 CreateIconFromResourceEx**：实测
 /// （2025 RedmiBook Pro 14，Windows 11）：传整份多帧 ICO（含 ICONDIR 头）
 /// 返回 `HRESULT 0x80070006`（INVALID_HANDLE），单帧 PNG 块则可正常创建。
-/// 因此这里解析 ICONDIR 各帧，取像素尺寸最接近目标的一帧交给
-/// `CreateIconFromResourceEx`。窗口/托盘图标是**单尺寸渲染**（任务栏/标题栏
-/// 16~32px、托盘 16px），单帧 HICON 足以覆盖；高 DPI 缩放由系统对单帧
-/// 完成，质量与多帧 ICO 无实质差别。
+/// 因此这里解析 ICONDIR 各帧，取不小于目标尺寸的最小一帧（所有帧都小于
+/// 目标时取最大帧）交给 `CreateIconFromResourceEx`。选择策略有意用"不小于
+/// 目标的最小帧"而非"最接近目标"：若选比目标小的帧，高 DPI 下系统需要
+/// 把小位图放大，图标发糊（历史实现硬编码 16px 的 L1 回归）；取比目标
+/// 大的帧只会被缩小，清晰度不受影响。窗口/托盘图标是**单尺寸渲染**（任务栏/
+/// 标题栏 16~32px、托盘 16 逻辑 px），单帧 HICON 足以覆盖。
 ///
 /// 调用方负责持有句柄直到不再需要（本函数不缓存，由各缓存点决定）。
 pub fn create_hicon_from_ico(ico: &[u8], preferred_size: u32) -> Result<HICON, String> {
@@ -287,9 +302,12 @@ pub fn create_hicon_from_ico(ico: &[u8], preferred_size: u32) -> Result<HICON, S
         }
         frames.push((px, off, sz));
     }
+    // 不小于目标的最小帧；全部小于目标时取最大帧（宁大勿小：只会被缩小）。
     let (_, off, sz) = frames
         .iter()
-        .min_by_key(|(px, _, _)| (*px as i32 - preferred_size as i32).abs())
+        .filter(|(px, _, _)| *px >= preferred_size)
+        .min_by_key(|(px, _, _)| *px)
+        .or_else(|| frames.iter().max_by_key(|(px, _, _)| *px))
         .expect("frames is non-empty (count checked above)");
     let block = &ico[*off..*off + *sz];
     unsafe {
@@ -503,8 +521,8 @@ mod tests {
         assert!(create_hicon_from_ico(&[0u8; 6], 16).is_err());
     }
 
-    /// 多尺寸 ICO 构建不依赖目标尺寸的具体值：任何非零尺寸都从可用的
-    /// 16/32/48/256 帧中取最接近者。
+    /// 多尺寸 ICO 构建不依赖目标尺寸的具体值：任何非零尺寸都能构建
+    /// （不小于目标的最小帧；全部小于目标时取最大帧）。
     #[test]
     fn create_hicon_from_ico_any_size_ok() {
         let ico = build_multi_size_ico();
@@ -512,5 +530,49 @@ mod tests {
             let h = create_hicon_from_ico(&ico, size).expect("must create HICON");
             let _ = unsafe { windows::Win32::UI::WindowsAndMessaging::DestroyIcon(h) };
         }
+    }
+
+    /// 帧选择策略（L1 回归）：高 DPI 下取不小于目标的帧（宁缩小不放大，
+    /// 避免历史实现硬编码 16px 把 16 帧放大发糊）。
+    #[test]
+    fn create_hicon_from_ico_prefers_frame_at_or_above_target() {
+        fn select_frame(target: u32) -> u32 {
+            let ico = build_multi_size_ico();
+            let count = u16::from_le_bytes([ico[4], ico[5]]) as usize;
+            let mut frames = Vec::new();
+            for i in 0..count {
+                let e = 6 + i * 16;
+                frames.push(if ico[e] == 0 { 256u32 } else { ico[e] as u32 });
+            }
+            frames
+                .iter()
+                .filter(|&&px| px >= target)
+                .min()
+                .copied()
+                .unwrap_or_else(|| frames.iter().max().copied().expect("non-empty"))
+        }
+        // 100% 取 16 帧（历史行为不变）。
+        assert_eq!(select_frame(16), 16);
+        // 150%（目标约 24px）取 32px，而不是 16px（放大）。
+        assert_eq!(select_frame(24), 32);
+        // 目标 48px 时精确命中。
+        assert_eq!(select_frame(48), 48);
+        // 目标超过最大帧时取最大帧。
+        assert_eq!(select_frame(300), 256);
+    }
+
+    /// 托盘图标尺寸换算：16 逻辑 px × 系统 DPI，四舍五入到物理像素。
+    #[test]
+    fn tray_icon_size_scales_with_dpi() {
+        // round(16 × dpi / 96)：与实机换算一致（进程 DPI 无法在测试中
+        // 控制，直接对换算公式的纯算术部分断言）。
+        fn scaled(dpi: u32) -> u32 {
+            (16 * dpi.max(96) + 48) / 96
+        }
+        assert_eq!(scaled(96), 16);
+        assert_eq!(scaled(144), 24);
+        assert_eq!(scaled(192), 32);
+        // 异常 DPI（0）回退 96。
+        assert_eq!(scaled(0), 16);
     }
 }

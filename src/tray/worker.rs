@@ -647,15 +647,18 @@ fn show_tray_menu(hwnd: HWND) {
     let _ = unsafe { DestroyMenu(hmenu) };
 }
 
-/// 从托盘 ICO 字节构建 HICON：解析多尺寸 ICO，取最接近 16px（托盘标准
-/// 尺寸）的单帧交给 `CreateIconFromResourceEx`。
+/// 从托盘 ICO 字节构建 HICON：解析多尺寸 ICO，取不小于 DPI 缩放后目标
+/// 尺寸（16 逻辑 px × DPI/96）的最小单帧交给 `CreateIconFromResourceEx`。
 ///
 /// **为什么不能把整份 ICO 直接传**：实测整份多帧 ICO 会返回
 /// `0x80070006`（INVALID_HANDLE），单帧 PNG 块才能创建（见
 /// `platform::window::create_hicon_from_ico` 的注释）。恶意/损坏 ICO 的
 /// 越界/溢出区间由该 helper 统一校验。
 fn load_icon(bytes: &[u8]) -> Result<windows::Win32::UI::WindowsAndMessaging::HICON, String> {
-    crate::platform::window::create_hicon_from_ico(bytes, 16)
+    crate::platform::window::create_hicon_from_ico(
+        bytes,
+        crate::platform::window::tray_icon_size_px(),
+    )
 }
 
 #[cfg(test)]
