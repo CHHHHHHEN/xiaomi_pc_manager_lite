@@ -26,6 +26,23 @@ fn classify_acline(ac_line_status: u8) -> PowerStatus {
     }
 }
 
+/// 未知电源状态告警的**去重**：`power_status`/`power_snapshot` 被 GUI 每帧
+/// 与托盘每 2s 轮询，若某台机器 `ACLineStatus` 恒为 255（无电池/驱动异常），
+/// 未去重的实现会在每个调用点刷一条 warn——每秒几十条重复日志，把真实告警
+/// 淹没并加速日志轮转（M2 回归，修订 1.30）。只在**状态值变化**时记录：
+/// 首次出现未知值告警一次，之后同样的未知值静默。
+static LAST_WARNED_UNKNOWN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 记录未知电源状态告警（首次出现时）。返回是否实际记录了本次告警。
+fn warn_unknown_once() -> bool {
+    let first = !LAST_WARNED_UNKNOWN.swap(true, std::sync::atomic::Ordering::Relaxed);
+    if first {
+        log::warn!("ACLineStatus unknown; power state unknown (won't repeat)");
+    }
+    first
+}
+
 /// 一次查询 `GetSystemPowerStatus`，失败时返回 None 并记录错误。
 ///
 /// `power_status` / `power_snapshot` 共用此函数，避免各自重复错误日志。
@@ -49,10 +66,7 @@ pub fn power_status() -> PowerStatus {
     };
     let power = classify_acline(status.ACLineStatus);
     if power == PowerStatus::Unknown {
-        log::warn!(
-            "ACLineStatus = {}; power state unknown",
-            status.ACLineStatus
-        );
+        warn_unknown_once();
     }
     power
 }
@@ -76,7 +90,7 @@ pub fn power_snapshot() -> PowerSnapshot {
     };
     let status = classify_acline(s.ACLineStatus);
     if status == PowerStatus::Unknown {
-        log::warn!("ACLineStatus = {}; power state unknown", s.ACLineStatus);
+        warn_unknown_once();
     }
     // MSDN BatteryLifePercent：0-100 有效，255=未知/未装。255 返回 None，
     // 由调用方显示"未知"而非荒谬的 255%。
@@ -105,5 +119,19 @@ mod tests {
     #[test]
     fn test_power_status_does_not_panic() {
         let _ = power_status();
+    }
+
+    /// 未知电源状态告警去重（M2 回归，修订 1.30）：首次告警返回 true，
+    /// 之后同状态的重复告警返回 false——GUI 每帧 + 托盘每 2s 轮询下
+    /// 不会每秒刷几十条重复日志。
+    #[test]
+    fn test_warn_unknown_once_deduplicates() {
+        // 该静态量被生产路径共享：把已知的当前值记下，测试结束后恢复，
+        // 避免污染其它测试或真实轮询的状态。
+        let prev = LAST_WARNED_UNKNOWN.load(std::sync::atomic::Ordering::Relaxed);
+        LAST_WARNED_UNKNOWN.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(warn_unknown_once(), "first unknown must be reported");
+        assert!(!warn_unknown_once(), "repeated unknown must be silenced");
+        LAST_WARNED_UNKNOWN.store(prev, std::sync::atomic::Ordering::Relaxed);
     }
 }

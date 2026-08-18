@@ -602,16 +602,19 @@ mod tests {
                     class: "".into(),
                     prefix: "012801".into(),
                     action: crate::ec::fnkey::FnAction::CyclePerfMode,
+                    command: None,
                 },
                 crate::ec::fnkey::FnKeyBinding {
                     class: "HID_EVENT20".into(),
                     prefix: "   ".into(),
                     action: crate::ec::fnkey::FnAction::None,
+                    command: None,
                 },
                 crate::ec::fnkey::FnKeyBinding {
                     class: "HID_EVENT20".into(),
                     prefix: "0107".into(),
                     action: crate::ec::fnkey::FnAction::ReapplyConfig,
+                    command: None,
                 },
             ],
             ..Default::default()

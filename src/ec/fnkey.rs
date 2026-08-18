@@ -30,6 +30,9 @@ use windows::Win32::System::Variant::{VARENUM, VT_ARRAY, VT_UI1};
 
 use crate::command::UiCommand;
 
+/// 进程级"最后执行的自定义命令"防抖表（见 `debounce_duplicate`）。
+use std::collections::HashMap;
+
 /// Fn+K 所在的 OEM ACPI 事件类（F-FNK-01）。
 pub const FN_K_WMI_CLASS: &str = "HID_EVENT20";
 
@@ -47,7 +50,11 @@ pub enum FnAction {
     ToggleBatteryCare,
     /// 把持久化配置整份重新应用到硬件（与"电源切换时自动重设"同一路径）。
     ReapplyConfig,
-    /// 绑定保留但禁用（事件命中时被消费、不派发命令）。
+    /// 运行用户自定义命令（脚本 / 打开程序，见 `FnKeyBinding.command`）。
+    /// 命令在**独立进程**中执行（`std::process::Command`），不阻塞 WMI
+    /// 事件监听循环（修订 1.26 规划的功能，本轮实现）。
+    RunCommand,
+    /// 绑定保留但禁用（无动作时被消费、不派发命令）。
     None,
 }
 
@@ -57,6 +64,7 @@ impl FnAction {
             Self::CyclePerfMode => "循环切换性能模式",
             Self::ToggleBatteryCare => "切换电池养护",
             Self::ReapplyConfig => "重新应用设置",
+            Self::RunCommand => "运行自定义命令",
             Self::None => "无动作",
         }
     }
@@ -66,11 +74,13 @@ impl FnAction {
             Self::CyclePerfMode,
             Self::ToggleBatteryCare,
             Self::ReapplyConfig,
+            Self::RunCommand,
             Self::None,
         ]
     }
 
-    /// 动作对应的 UI 命令；`None` 时返回 None（绑定仅消费事件，不派发）。
+    /// 动作对应的 UI 命令；`RunCommand`/`None` 时返回 None（绑定仅消费
+    /// 事件，不派发——前者直接执行命令，后者无动作）。
     /// 按 Rust 惯例命名：`as_*` 表示"便宜的借用读取"（`&self`），而 `to_*`
     /// 保留给消耗型转换——这里返回轻量 `Option<UiCommand>`，用 `as_` 前缀
     /// 顺带消除 clippy 的 `wrong_self_convention` 告警。
@@ -78,13 +88,16 @@ impl FnAction {
         match self {
             Self::CyclePerfMode => Some(UiCommand::CyclePerfMode),
             Self::ToggleBatteryCare => Some(UiCommand::ToggleBatteryCare),
-            Self::ReapplyConfig => Some(UiCommand::ReapplyConfig),
-            Self::None => None,
+            // 用户主动绑定"重新应用设置"是手动动作，不应受"电源切换时自动
+            // 重设"开关门控——开关关闭时被动重设（电源广播）静默忽略是对的，
+            // 但用户按下绑定的功能键却毫无反应是不可接受（修订 1.30 M3 回归）。
+            Self::ReapplyConfig => Some(UiCommand::ReapplyConfigManual),
+            Self::RunCommand | Self::None => None,
         }
     }
 }
 
-/// 一条 Fn 功能键绑定：事件类 + 报告前缀 → 动作。
+/// 一条 Fn 功能键绑定：事件类 + 报告前缀 → 动作（可能带自定义命令）。
 ///
 /// 前缀匹配（`normalize_hex` 后 starts_with）：绑定的 `prefix` 是归一化
 /// 十六进制（如 `012801`），事件报告归一化后以此为前缀即命中。
@@ -96,6 +109,10 @@ pub struct FnKeyBinding {
     pub prefix: String,
     /// 命中后派发的动作。
     pub action: FnAction,
+    /// `RunCommand` 动作的命令行（其余动作忽略）。`None`/空串 = 未配置；
+    /// 配置向后兼容：旧配置文件无此字段时反序列化为 `None`（`#[serde(default)]`）。
+    #[serde(default)]
+    pub command: Option<String>,
 }
 
 impl FnKeyBinding {
@@ -105,6 +122,7 @@ impl FnKeyBinding {
             class: FN_K_WMI_CLASS.to_string(),
             prefix: FN_K_PRESS_PREFIX.to_string(),
             action: FnAction::CyclePerfMode,
+            command: None,
         }
     }
 
@@ -514,6 +532,11 @@ fn dispatch_bindings(
             continue;
         }
         log::info!("Fn: matched {} -> {}", binding.label(), normalized);
+        // 自定义命令：以独立进程执行（不阻塞监听线程），无 UiCommand。
+        if binding.action == FnAction::RunCommand {
+            run_external_command(binding.command.as_deref());
+            return true;
+        }
         if let Some(cmd) = binding.action.as_ui_command() {
             send_watcher_command(cmd_tx, cmd);
         } else {
@@ -522,6 +545,102 @@ fn dispatch_bindings(
         return true;
     }
     false
+}
+
+/// 以**独立进程**执行自定义命令（`RunCommand` 动作），不阻塞 WMI 事件
+/// 监听循环（修订 1.26 规划：`std::process::Command` 独立启动）。
+///
+/// 实现细节：
+/// - 命令未配置（None/空白）时仅告警，不产生任何动作（空命令无意义，
+///   且以空字符串启动进程属编程错误）；
+/// - `cmd.exe /C <command>` 承载（Windows 惯例的进程启动器，天然支持
+///   带引号路径 / 参数 / 批处理 / `start` 内建命令）；
+/// - `CREATE_NO_WINDOW` 隐藏控制台窗口：本应用是 GUI 程序，直接启动
+///   cmd.exe 会闪现黑框，影响体验；
+/// - 以 `CreationFlags` 隐藏窗口 + 后台线程执行：`Command::spawn` 返回
+///   后不等待子进程退出（detached 语义），长时间运行的脚本不会阻塞应用；
+/// - **同命令防抖**（L2 回归，修订 1.30）：固件可能对一次物理按键重复
+///   上报（或用户在系统设置开启键自动重复），每条事件各起一个线程 +
+///   cmd.exe 会瞬间堆积进程。对**相同命令**在
+///   `RUN_COMMAND_DEBOUNCE` 时间窗内的重复派发直接丢弃（不同命令仍可并发）。
+///
+/// **防抖状态是进程级全局的**：设计上每条命令对应的防抖窗口独立，简单
+/// 的"全局最后命令"哈希表即可满足，且无需清理（键数量 = 绑定数，有界）。
+/// `HashMap<String, Instant>` + `Mutex`，跨线程安全。
+/// `RunCommand` 防抖窗口：同一命令在此窗口内不重复启动（毫秒）。
+const RUN_COMMAND_DEBOUNCE_MS: u64 = 1000;
+
+static LAST_RUN_COMMANDS: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<String, std::time::Instant>>,
+> = std::sync::OnceLock::new();
+
+fn last_run_commands() -> &'static std::sync::Mutex<HashMap<String, std::time::Instant>> {
+    LAST_RUN_COMMANDS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// 判断命令是否处于防抖窗口（相同命令在 `RUN_COMMAND_DEBOUNCE_MS` 内的
+/// 重复派发）。首次调用返回 false 并记录时间；窗口内重复返回 true。
+/// 防抖锁毒化（罕见）时放行（不阻断命令执行）。
+fn debounce_duplicate(command: &str) -> bool {
+    let now = std::time::Instant::now();
+    let duplicate = std::sync::Mutex::lock(last_run_commands())
+        .map(|mut m| {
+            if let Some(last) = m.get(command) {
+                if now.duration_since(*last)
+                    < std::time::Duration::from_millis(RUN_COMMAND_DEBOUNCE_MS)
+                {
+                    return true;
+                }
+            }
+            m.insert(command.to_string(), now);
+            false
+        })
+        .unwrap_or_else(|_| {
+            log::warn!("Fn: last-run-command lock poisoned; proceeding");
+            false
+        });
+    if duplicate {
+        log::debug!(
+            "Fn: external command debounced (repeated within {}ms)",
+            RUN_COMMAND_DEBOUNCE_MS
+        );
+    }
+    duplicate
+}
+
+fn run_external_command(command: Option<&str>) {
+    let Some(command) = command.map(str::trim).filter(|c| !c.is_empty()) else {
+        log::warn!("Fn: RunCommand binding with empty command; skipped");
+        return;
+    };
+    log::info!("Fn: running external command: {}", command);
+    // 转换为拥有所有权的 String 再移入线程（闭包参数 Option<&str> 借用
+    // 自调用方，跨线程 move 会触发 E0521；所有权的 String 无生命周期约束）。
+    let command = command.to_owned();
+
+    // 防抖：相同命令在 RUN_COMMAND_DEBOUNCE 内重复触发时丢弃。
+    if debounce_duplicate(&command) {
+        return;
+    }
+
+    std::thread::spawn(move || {
+        // CREATE_NO_WINDOW = 0x08000000：不创建控制台窗口。
+        let mut cmd = std::process::Command::new("cmd.exe");
+        cmd.arg("/C");
+        cmd.arg(&command);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000);
+        }
+        match cmd.spawn() {
+            Ok(_child) => {
+                // 分离执行，不等待子进程。
+                log::debug!("Fn: external command spawned");
+            }
+            Err(e) => log::warn!("Fn: external command spawn failed: {}", e),
+        }
+    });
 }
 
 /// 事件 hex 统一归一化：剔除所有非字母数字字符（如 "01-28-01" 的分隔符）
@@ -650,6 +769,7 @@ mod tests {
             class: "HID_EVENT20".into(),
             prefix: "0107".into(),
             action: FnAction::None,
+            command: None,
         }]));
         let (tx, rx) = mpsc::channel();
         assert!(dispatch_bindings("HID_EVENT20", "010701", &bindings, &tx));
@@ -663,6 +783,7 @@ mod tests {
             class: "HID_EVENT20".into(),
             prefix: "0123".into(),
             action: FnAction::ToggleBatteryCare,
+            command: None,
         }]));
         let (tx, rx) = mpsc::channel();
         assert!(dispatch_bindings("HID_EVENT20", "012301", &bindings, &tx));
@@ -670,6 +791,86 @@ mod tests {
             Ok(UiCommand::ToggleBatteryCare) => {}
             other => panic!("Expected ToggleBatteryCare, got {:?}", other),
         }
+    }
+
+    /// RunCommand 动作：命中后不派发 UiCommand（命令走独立进程），
+    /// 空命令被跳过且不崩溃。非空命令不在此处验证（会真实启动进程），
+    /// 由真实功能键事件在实机上验证。
+    #[test]
+    fn test_dispatch_run_command_consumes_without_ui_command() {
+        let bindings: SharedBindings = std::sync::Arc::new(RwLock::new(vec![FnKeyBinding {
+            class: "HID_EVENT20".into(),
+            prefix: "0128".into(),
+            action: FnAction::RunCommand,
+            command: None,
+        }]));
+        let (tx, rx) = mpsc::channel();
+        assert!(dispatch_bindings("HID_EVENT20", "012801", &bindings, &tx));
+        assert!(
+            rx.try_recv().is_err(),
+            "RunCommand must not send a UiCommand"
+        );
+
+        // 空/空白命令：跳过且不崩溃（不启动进程）。
+        let empty: SharedBindings = std::sync::Arc::new(RwLock::new(vec![FnKeyBinding {
+            class: "HID_EVENT20".into(),
+            prefix: "0107".into(),
+            action: FnAction::RunCommand,
+            command: Some("   ".into()),
+        }]));
+        let (tx2, _rx2) = mpsc::channel();
+        assert!(dispatch_bindings("HID_EVENT20", "010701", &empty, &tx2));
+    }
+
+    /// 防抖（L2 回归，修订 1.30）：相同命令在防抖窗口内的重复派发必须被
+    /// 丢弃，不同命令可并发；窗口过后同一命令再次放行。
+    #[test]
+    fn test_debounce_duplicate_same_command() {
+        // 测试会污染进程级防抖表：清空后测，测完清空。
+        if let Ok(mut m) = last_run_commands().lock() {
+            m.clear();
+        }
+        assert!(!debounce_duplicate("echo a"), "first run must pass");
+        assert!(
+            debounce_duplicate("echo a"),
+            "same command within window must be debounced"
+        );
+        assert!(
+            !debounce_duplicate("echo b"),
+            "different command must not be debounced"
+        );
+        // 不同前缀不互相干扰（等长/子串前缀）。
+        assert!(
+            !debounce_duplicate("echo ab"),
+            "prefix-distinct command must pass"
+        );
+
+        // 清理防抖表，避免影响其它用例与真机运行。
+        if let Ok(mut m) = last_run_commands().lock() {
+            m.clear();
+        }
+    }
+
+    /// FnKeyBinding 序列化向后兼容：旧配置（无 command 字段）反序列化为
+    /// command=None；新配置含 command 时往返一致。
+    #[test]
+    fn test_binding_command_serde_backward_compat() {
+        let old = r#"class = "HID_EVENT20"
+prefix = "012801"
+action = "CyclePerfMode""#;
+        let b: FnKeyBinding = toml::from_str(old).expect("legacy binding must parse");
+        assert_eq!(b.action, FnAction::CyclePerfMode);
+        assert_eq!(b.command, None);
+
+        let new = FnKeyBinding {
+            class: "HID_EVENT20".into(),
+            prefix: "012801".into(),
+            action: FnAction::RunCommand,
+            command: Some(r#"start "" "C:\path with space\tool.exe""#.into()),
+        };
+        let s = toml::to_string(&new).expect("serialize");
+        let parsed: FnKeyBinding = toml::from_str(&s).expect("deserialize");
+        assert_eq!(parsed, new);
     }
 
     /// 绑定事件类型去重。
@@ -681,11 +882,13 @@ mod tests {
                 class: "HID_EVENT20".into(),
                 prefix: "0107".into(),
                 action: FnAction::None,
+                command: None,
             },
             FnKeyBinding {
                 class: "HID_EVENT21".into(),
                 prefix: "FF".into(),
                 action: FnAction::ReapplyConfig,
+                command: None,
             },
         ];
         assert_eq!(
@@ -720,6 +923,7 @@ mod tests {
             class: "HID_EVENT21".into(),
             prefix: "FF".into(),
             action: FnAction::ReapplyConfig,
+            command: None,
         }];
         let cap = capture_classes(&bindings);
         // 绑定中的类 + 已知类的类（HID_EVENT20）都被覆盖。
@@ -770,6 +974,37 @@ mod tests {
         for k in KNOWN_FN_KEYS {
             assert!(!k.prefix.is_empty());
             assert!(set.insert((k.class, k.prefix)));
+        }
+    }
+
+    /// 真机验证（手动运行，非 CI）：`run_external_command` 实际启动一个
+    /// 进程并把输出写到临时文件，验证 `cmd.exe /C` + `CREATE_NO_WINDOW`
+    /// 的完整 spawn 路径可用。运行：`cargo test -- --ignored
+    /// run_command_spawns_real_process`。
+    #[test]
+    #[ignore = "spawns a real child process (manual hardware verification)"]
+    fn run_command_spawns_real_process() {
+        let marker = std::env::temp_dir().join(format!("xmpl-fn-cmd-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let cmd = format!("echo FNK_OK> {}", marker.to_string_lossy());
+        run_external_command(Some(&cmd));
+        // 子进程是分离的：轮询等待其创建文件（上限 5s）。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if marker.exists() {
+                let content = std::fs::read_to_string(&marker).unwrap_or_default();
+                assert!(
+                    content.trim().contains("FNK_OK"),
+                    "unexpected marker content: {:?}",
+                    content
+                );
+                let _ = std::fs::remove_file(&marker);
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("external command did not produce marker file within 5s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
     }
 }

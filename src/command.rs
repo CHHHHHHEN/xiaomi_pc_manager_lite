@@ -7,7 +7,16 @@ pub enum UiCommand {
     CyclePerfMode,
     /// 直接切换到指定性能模式（托盘子菜单/热键按值设置）。
     SetPerfMode(u8),
+    /// 把持久化配置整份重新应用到硬件（**受 `auto_reapply_on_power_change`
+    /// 门控**）：由电源广播（插拔/唤醒）这类被动场景发送——开关关闭时
+    /// 静默忽略（用户主动关闭了"电源切换自动重设"，此时被动重设不应覆盖
+    /// 硬件状态）。
     ReapplyConfig,
+    /// 把持久化配置整份重新应用到硬件（**不受门控**）：由用户**主动**动作
+    /// 发送（Fn 绑定"重新应用设置"）。与 `ReapplyConfig` 的语义区别见
+    /// `gui::commands` 的 `reapply_config`/`apply_config_and_sync`——用户
+    /// 明确请求重设时，开关关闭不应让命令静默无效（M3 回归，修订 1.30）。
+    ReapplyConfigManual,
     /// Fn 捕获模式（`FnKeyBindings` 设置的"捕获功能键"）下收到的事件：
     /// 参数为 (事件类, 归一化报告 hex)。
     FnEventSeen {
@@ -42,6 +51,7 @@ impl std::fmt::Debug for UiCommand {
             Self::CyclePerfMode => f.write_str("CyclePerfMode"),
             Self::SetPerfMode(mode) => write!(f, "SetPerfMode({})", mode),
             Self::ReapplyConfig => f.write_str("ReapplyConfig"),
+            Self::ReapplyConfigManual => f.write_str("ReapplyConfigManual"),
             Self::FnEventSeen { class, hex } => {
                 write!(
                     f,

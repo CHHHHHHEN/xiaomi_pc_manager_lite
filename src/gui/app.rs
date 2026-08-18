@@ -90,6 +90,13 @@ pub struct XiaomiApp {
     pub(crate) fn_add_preset_index: usize,
     /// "Fn 功能键 → 添加绑定"中动作下拉的当前选中动作（同上，跨帧保持）。
     pub(crate) fn_add_action: ec::fnkey::FnAction,
+    /// "Fn 功能键 → 添加绑定"中 RunCommand 动作的命令草稿（跨帧保持，
+    /// 添加成功后清空）。
+    pub(crate) fn_add_command: String,
+    /// "Fn 捕获 → 绑定为"中动作下拉的当前选中动作（跨帧保持。egui UI
+    /// 每帧重建，局部变量会被重置回默认——若用局部变量，用户选中的动作
+    /// 在下一帧即丢失，点击"使用此键"时恒绑定默认动作，见 view.rs）。
+    pub(crate) fn_capture_action: ec::fnkey::FnAction,
     /// 托盘 tooltip/菜单共享的运行时状态（GUI 写入，托盘线程周期读取）。
     pub(crate) tray_status: SharedTrayStatus,
     /// egui Context 的线程安全克隆：供托盘/Fn 监听/自启动 worker 线程在
@@ -151,6 +158,8 @@ impl XiaomiApp {
             last_fn_event: None,
             fn_add_preset_index: 0,
             fn_add_action: ec::fnkey::FnAction::CyclePerfMode,
+            fn_add_command: String::new(),
+            fn_capture_action: ec::fnkey::FnAction::CyclePerfMode,
             tray_status,
             // 占位 Context：真正的实例在 run_app 的 eframe 创建闭包中注入
             //（cc.egui_ctx.clone()），供托盘/Fn worker 唤醒隐藏事件循环。
@@ -455,6 +464,10 @@ mod tests {
         );
         assert_eq!(format!("{:?}", UiCommand::CyclePerfMode), "CyclePerfMode");
         assert_eq!(format!("{:?}", UiCommand::ReapplyConfig), "ReapplyConfig");
+        assert_eq!(
+            format!("{:?}", UiCommand::ReapplyConfigManual),
+            "ReapplyConfigManual"
+        );
         // 其余变体：每个变体至少一条 Debug 断言，防止枚举演进时漏测。
         assert_eq!(
             format!("{:?}", UiCommand::SetPerfMode(0x04)),

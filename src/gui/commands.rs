@@ -34,6 +34,9 @@ impl XiaomiApp {
                     }
                 }
                 UiCommand::ReapplyConfig => self.reapply_config(),
+                // Fn 绑定"重新应用设置"：用户主动动作，不受自动重设开关门控
+                //（见 ReapplyConfigManual 的注释，修订 1.30 M3 回归）。
+                UiCommand::ReapplyConfigManual => self.apply_config_and_sync(),
                 UiCommand::SetAutostart(enabled) => self.set_autostart(enabled),
                 UiCommand::FnEventSeen { class, hex } => {
                     // 捕获模式（Fn 功能键设置中开启）下收到的实时事件：
@@ -272,13 +275,36 @@ impl XiaomiApp {
         self.commit_fn_bindings();
     }
 
+    /// 修改某条绑定为 `RunCommand` 时的自定义命令行。
+    ///
+    /// 仅在动作切换为 `RunCommand` 时展示/保存命令文本；其余动作保留已有
+    /// 命令不动（避免用户在动作下拉间切换时误清空配置好的命令）。空/纯空白
+    /// 命令仍可保存——监听线程遇 `RunCommand` + 空命令会跳过并告警
+    /// （见 `ec::fnkey::run_external_command`）。
+    pub(crate) fn set_fn_binding_command(&mut self, index: usize, command: &str) {
+        let Some(binding) = self.config.fn_key_bindings.get_mut(index) else {
+            log::warn!("set_fn_binding_command: index {} out of range", index);
+            return;
+        };
+        if binding.command.as_deref() == Some(command) {
+            return;
+        }
+        log::info!("Fn binding {} command -> {:?}", binding.label(), command);
+        binding.command = Some(command.to_string());
+        self.commit_fn_bindings();
+    }
+
     /// 按已知功能键目录添加绑定（GUI"添加绑定"下拉）。
     /// 相同 (class, prefix) 已存在时只更新动作，不重复添加。
+    /// `command`：`RunCommand` 动作的命令行草稿（其余动作忽略，传 `""` 即可）；
+    /// 仅在动作确实为 `RunCommand` 时写入（避免把用户之前输入的草稿误存进
+    /// 其它动作的绑定）。
     pub(crate) fn add_fn_binding(
         &mut self,
         class: &str,
         prefix: &str,
         action: ec::fnkey::FnAction,
+        command: &str,
     ) {
         if class.trim().is_empty() || prefix.trim().is_empty() {
             log::warn!("add_fn_binding: empty class/prefix ignored");
@@ -289,6 +315,12 @@ impl XiaomiApp {
             log::warn!("add_fn_binding: non-hex prefix ignored: {:?}", prefix);
             return;
         }
+        // 只有 RunCommand 动作会携带命令文本；其余动作恒为 None。
+        let command = if action == ec::fnkey::FnAction::RunCommand {
+            Some(command.to_string())
+        } else {
+            None
+        };
         let existing = self
             .config
             .fn_key_bindings
@@ -302,6 +334,7 @@ impl XiaomiApp {
                 action.name()
             );
             b.action = action;
+            b.command = command;
         } else {
             log::info!(
                 "Fn:: add binding {} / {} -> {}",
@@ -313,6 +346,7 @@ impl XiaomiApp {
                 class: class.to_string(),
                 prefix,
                 action,
+                command,
             });
         }
         self.commit_fn_bindings();
@@ -1255,6 +1289,39 @@ mod tests {
         );
     }
 
+    /// 回归测试（M3，修订 1.30）：Fn 绑定"重新应用设置"（ReapplyConfigManual）
+    /// 必须**不受** `auto_reapply_on_power_change` 开关门控——用户主动按下
+    /// 绑定的功能键时应无条件重设，开关关闭时静默忽略是电源广播被动路径
+    /// 的语义，不该作用在用户手动动作上。历史实现 Fn 动作复用
+    /// `UiCommand::ReapplyConfig`，开关关闭时按键毫无反应（仅 debug 日志）。
+    #[test]
+    fn test_fn_reapply_manual_ignores_reapply_switch() {
+        let store = test_store();
+        let mock = MockBackend::default();
+        let hw_perf = mock.perf_mode.clone();
+        let mut app = XiaomiApp::new(
+            store,
+            Box::new(mock.clone()),
+            AppConfig::default(),
+            crate::ec::config::BackendPreference::Auto,
+            None,
+            false,
+        );
+        // 重设开关关闭：电源路径会忽略，但 Fn 手动路径必须仍生效。
+        app.config.auto_reapply_on_power_change = false;
+        app.config.performance_mode = 0x04; // 狂暴
+        hw_perf.store(0x09, std::sync::atomic::Ordering::Relaxed);
+
+        let ctx = egui::Context::default();
+        app.cmd_tx.send(UiCommand::ReapplyConfigManual).unwrap();
+        app.process_commands(&ctx);
+
+        assert!(
+            hw_perf.load(std::sync::atomic::Ordering::Relaxed) != 0x09,
+            "manual Fn reapply must rewrite hardware despite reapply switch off"
+        );
+    }
+
     /// 回归测试：`apply_config_and_sync`（用户主动重设，如勾选自动切节能）
     /// 必须**不受** `auto_reapply_on_power_change` 开关约束——主动操作无条件
     /// 应用。历史实现把两者绑在一起，开关关闭时用户勾选"电池供电自动切节能"
@@ -1614,12 +1681,41 @@ mod tests {
         assert_eq!(app.config.fn_key_bindings.len(), 1);
     }
 
+    /// Fn 绑定：RunCommand 命令文本保存与同步共享状态；越界安全忽略。
+    #[test]
+    fn test_set_fn_binding_command_updates_shared_state() {
+        let mut app = test_app();
+        app.set_fn_binding_command(0, r#"start "" "C:\Program Files\tool.exe""#);
+        assert_eq!(
+            app.config.fn_key_bindings[0].command.as_deref(),
+            Some(r#"start "" "C:\Program Files\tool.exe""#)
+        );
+        let snapshot = app.fn_bindings.read().unwrap().clone();
+        assert_eq!(
+            snapshot[0].command.as_deref(),
+            Some(r#"start "" "C:\Program Files\tool.exe""#)
+        );
+
+        // 空白命令允许保存（监听线程遇空白命令跳过并告警，见 run_external_command）。
+        app.set_fn_binding_command(0, "");
+        assert_eq!(app.config.fn_key_bindings[0].command.as_deref(), Some(""));
+
+        // 越界 index 安全忽略。
+        app.set_fn_binding_command(99, "ignored");
+        assert_eq!(app.config.fn_key_bindings.len(), 1);
+    }
+
     /// Fn 绑定：add 相同 (class,prefix) 不重复，只更新动作。
     #[test]
     fn test_add_fn_binding_dedup_and_normalize() {
         let mut app = test_app();
         // 带分隔符/小写输入归一化后与默认 Fn+K 相同 → 只更新动作。
-        app.add_fn_binding("HID_EVENT20", "01-28-01", crate::ec::fnkey::FnAction::None);
+        app.add_fn_binding(
+            "HID_EVENT20",
+            "01-28-01",
+            crate::ec::fnkey::FnAction::None,
+            "",
+        );
         assert_eq!(app.config.fn_key_bindings.len(), 1);
         assert_eq!(
             app.config.fn_key_bindings[0].action,
@@ -1631,9 +1727,36 @@ mod tests {
             "HID_EVENT20",
             "0107",
             crate::ec::fnkey::FnAction::ReapplyConfig,
+            "",
         );
         assert_eq!(app.config.fn_key_bindings.len(), 2);
         assert_eq!(app.config.fn_key_bindings[1].prefix, "0107");
+    }
+
+    /// Fn 绑定：RunCommand 动作添加时携带命令；非 RunCommand 动作不存命令。
+    #[test]
+    fn test_add_fn_binding_run_command_carries_command() {
+        let mut app = test_app();
+        app.add_fn_binding(
+            "HID_EVENT20",
+            "0107",
+            crate::ec::fnkey::FnAction::RunCommand,
+            r#"start "" "C:\Tools\app.exe""#,
+        );
+        assert_eq!(app.config.fn_key_bindings.len(), 2);
+        assert_eq!(
+            app.config.fn_key_bindings[1].command.as_deref(),
+            Some(r#"start "" "C:\Tools\app.exe""#)
+        );
+
+        // 非 RunCommand 动作：即使传了命令也不保存（避免误存）。
+        app.add_fn_binding(
+            "HID_EVENT20",
+            "0123",
+            crate::ec::fnkey::FnAction::ToggleBatteryCare,
+            "should-not-stick",
+        );
+        assert_eq!(app.config.fn_key_bindings[2].command, None);
     }
 
     /// Fn 绑定：删除与共享状态同步。

@@ -12,9 +12,9 @@ pub const APP_NAME: &str = "Xiaomi PC Manager Lite";
 /// 面向用户展示的版本号。
 ///
 /// Cargo 的 `CARGO_PKG_VERSION` 是 semver 三段号，无法表达四段的
-/// `1.0.0.5`；Windows FileVersion/ProductVersion 与 GUI 展示、日志首行
+/// `1.0.0.6`；Windows FileVersion/ProductVersion 与 GUI 展示、日志首行
 /// 均以此为唯一事实来源，`Cargo.toml` 的 `version` 保持 `1.0.0`。
-pub const APP_VERSION: &str = "1.0.0.5";
+pub const APP_VERSION: &str = "1.0.0.6";
 
 /// 日志文件路径（唯一事实来源）。
 ///

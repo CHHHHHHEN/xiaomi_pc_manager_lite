@@ -15,9 +15,9 @@ fn main() {
         // 自带的图标，窗口创建后由 set_main_window_icon 覆盖为同源图像。
         res.set_icon("icons/tray_icon.ico");
         // FileVersion/ProductVersion 与展示版本号 `src/util.rs::APP_VERSION`
-        // 保持同步（Windows 支持四段 `1.0.0.5`；Cargo.toml 的 semver 为 `1.0.0`）。
-        res.set("FileVersion", "1.0.0.5");
-        res.set("ProductVersion", "1.0.0.5");
+        // 保持同步（Windows 支持四段 `1.0.0.6`；Cargo.toml 的 semver 为 `1.0.0`）。
+        res.set("FileVersion", "1.0.0.6");
+        res.set("ProductVersion", "1.0.0.6");
         // 需要管理员权限（WritePort 提权）：版本信息里带 requestedExecutionLevel，
         // 与启动时 elevate_self() 的 UAC 弹窗语义一致（不在此处强制嵌入清单，
         // 保留运行时提权逻辑的单一事实来源）。

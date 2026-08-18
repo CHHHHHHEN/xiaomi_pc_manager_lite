@@ -531,12 +531,18 @@ impl XiaomiApp {
                 }
                 // 防御：归一化后至少 2 字符（1 字节）才可作为前缀，否则空
                 // 前缀会"匹配一切"，属于危险配置（见 config.rs 绑定消毒）。
+                // 极端单字符输入（长度 1）时回退到**偶数长度**（0）而非
+                // 保留整个奇数串——单 hex 字符（如 "A"）会匹配所有以 A
+                // 开头的事件，与空前缀同属危险配置。
                 let prefix = if prefix_len >= 2 {
                     &hex[..prefix_len]
                 } else {
-                    &hex[..]
+                    &hex[..hex.len() - hex.len() % 2]
                 };
-                let mut action = crate::ec::fnkey::FnAction::CyclePerfMode;
+                // 动作选择必须保存在 self 上（每帧 UI 重建，局部变量会
+                // 重置回默认——历史实现用局部变量导致用户选中的动作在
+                // 下一帧丢失，"使用此键"恒绑定默认动作，H1 回归）。
+                let mut action = self.fn_capture_action;
                 ui.horizontal(|ui| {
                     ui.label("绑定为:");
                     egui::ComboBox::from_id_salt("fn_capture_action")
@@ -546,8 +552,12 @@ impl XiaomiApp {
                                 ui.selectable_value(&mut action, *a, a.name());
                             }
                         });
+                    self.fn_capture_action = action;
+                    // 捕获流程仅支持预设动作（无命令草稿输入）：RunCommand
+                    // 可从"添加绑定"预设流程配置命令。
+                    let command = "";
                     if ui.button("使用此键").clicked() {
-                        self.add_fn_binding(&class, prefix, action);
+                        self.add_fn_binding(&class, prefix, action, command);
                     }
                 });
             } else {
@@ -566,9 +576,14 @@ impl XiaomiApp {
             }
             let binding_snapshot = {
                 let b = &self.config.fn_key_bindings[i];
-                (b.class.clone(), b.prefix.clone(), b.action)
+                (
+                    b.class.clone(),
+                    b.prefix.clone(),
+                    b.action,
+                    b.command.clone(),
+                )
             };
-            let (class, prefix, action) = &binding_snapshot;
+            let (class, prefix, action, command) = &binding_snapshot;
             let label = format!(
                 "{}. {}",
                 i + 1,
@@ -576,6 +591,7 @@ impl XiaomiApp {
                     class: class.clone(),
                     prefix: prefix.clone(),
                     action: *action,
+                    command: None,
                 }
                 .label()
             );
@@ -591,6 +607,20 @@ impl XiaomiApp {
                     });
                 if selected_action != *action {
                     self.set_fn_binding_action(i, selected_action);
+                }
+                // RunCommand 动作：展示命令行输入框（其余动作不展示）。
+                // 输入框宽度有限，放在下一行水平组避免挤爆当前行；失去焦点
+                // 时若内容有变化才落盘（避免每帧都触发 save_state）。
+                if selected_action == ec::fnkey::FnAction::RunCommand {
+                    let mut cmd_text = command.clone().unwrap_or_default();
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut cmd_text)
+                            .hint_text("例如 start notepad 或 C:\\tools\\app.exe")
+                            .desired_width(240.0),
+                    );
+                    if resp.lost_focus() && cmd_text != command.as_deref().unwrap_or_default() {
+                        self.set_fn_binding_command(i, &cmd_text);
+                    }
                 }
                 if ui.small_button("删除").clicked() {
                     self.remove_fn_binding(i);
@@ -623,9 +653,23 @@ impl XiaomiApp {
                     }
                 });
             self.fn_add_action = add_action;
+            // RunCommand 动作：附带命令行输入框（草稿跨帧保持，见
+            // app.rs 的 fn_add_command 注释）；其余动作不展示。
+            if add_action == ec::fnkey::FnAction::RunCommand {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.fn_add_command)
+                        .hint_text("例如 start notepad 或 C:\\tools\\app.exe")
+                        .desired_width(200.0),
+                );
+            }
             if ui.button("添加绑定").clicked() {
                 let k = &crate::ec::fnkey::KNOWN_FN_KEYS[selected];
-                self.add_fn_binding(k.class, k.prefix, add_action);
+                // 先克隆命令文本（闭包内 &mut self.add_fn_binding 与
+                // &self.fn_add_command 无法共存借用）。
+                let command = self.fn_add_command.clone();
+                self.add_fn_binding(k.class, k.prefix, add_action, &command);
+                // 添加成功后清空命令草稿（避免下次添加残留上次的命令）。
+                self.fn_add_command.clear();
             }
         });
     }

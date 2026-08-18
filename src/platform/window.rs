@@ -254,16 +254,32 @@ struct IconHandle(HICON);
 unsafe impl Send for IconHandle {}
 unsafe impl Sync for IconHandle {}
 
+/// 系统 DPI（进程按 PerMonitorV2 DPI 感知运行，见下文），回退 96。
+///
+/// **为什么 GetDpiForSystem 可用**：eframe/winit 在事件循环初始化时调用
+/// `SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)`
+/// （winit 0.30 platform_impl/windows/dpi.rs），进程实际是 PerMonitorV2 感知
+/// 的——因此 `GetDpiForSystem` 返回真实系统缩放（125%/150%/200%…），而非
+/// DPI 不可知进程被虚拟化出的 96。返回值 0（异常/老系统）时回退 96。
+fn system_dpi() -> u32 {
+    unsafe { GetDpiForSystem().max(1) }.max(96)
+}
+
+/// 逻辑像素 → 物理像素换算（四舍五入）：`round(logical × dpi / 96)`。
+///
+/// 纯算术（无系统调用），供各图标目标尺寸换算与单测共用。
+fn scaled_px_at_dpi(logical_px: u32, dpi: u32) -> u32 {
+    (logical_px * dpi.max(96) + 48) / 96
+}
+
 /// 托盘图标的目标物理像素尺寸（逻辑 16px，按系统 DPI 缩放）。
 ///
 /// 任务栏通知区以 16 逻辑像素绘制小图标，但高 DPI 缩放（125%/150%/200%…）
 /// 时实际渲染像素为 16 × DPI/96。若取 16px 单帧，系统把小位图放大
 /// 托盘图标发糊。这里换算成物理尺寸，让调用方取不小于它的单帧（只缩小
-/// 不放大，清晰）。GetDpiForSystem 返回 0（异常/老系统）时回退 96。
+/// 不放大，清晰）。
 pub fn tray_icon_size_px() -> u32 {
-    let dpi = unsafe { GetDpiForSystem().max(1) }.max(96);
-    // round(16 × dpi / 96)
-    (16 * dpi + 48) / 96
+    scaled_px_at_dpi(16, system_dpi())
 }
 
 /// 从多尺寸 ICO 字节构建「不小于目标尺寸的最小帧」HICON。
@@ -320,8 +336,11 @@ pub fn create_hicon_from_ico(ico: &[u8], preferred_size: u32) -> Result<HICON, S
 ///
 /// eframe 的 `with_icon` 对 512×512 PNG 的缩小渲染到任务栏效果差
 /// （糊成纯色块）。这里从**多尺寸 ICO** 按目标尺寸各取最清晰单帧构建
-/// HICON：`ICON_SMALL`（标题栏/任务栏小图标 ~16px）取 16px 帧、
-/// `ICON_BIG`（任务栏/Alt-Tab ~32px）取 32px 帧，再经 `WM_SETICON` 设置。
+/// HICON：`ICON_SMALL`（标题栏/任务栏小图标 ~16 逻辑 px）与 `ICON_BIG`
+/// （任务栏/Alt-Tab ~32 逻辑 px）的物理尺寸按系统 DPI 缩放
+/// （`scaled_px_at_dpi`），再经 `WM_SETICON` 设置——高 DPI 下系统把
+/// 16/32 逻辑 px 图标放大到物理像素（200% 时为 32/64px），取不小于物理
+/// 尺寸的帧避免小位图放大发糊（与托盘图标的 DPI 修复同源，L1 回归）。
 /// HICON 进程生命周期内缓存（Mutex 包装以满足 Sync），由系统使用、
 /// 进程退出时释放。
 pub fn set_main_window_icon() {
@@ -349,8 +368,9 @@ pub fn set_main_window_icon() {
         *guard = Some(IconHandle(h));
         h
     };
-    let small = cached(&CACHED_SMALL, 16, "small");
-    let big = cached(&CACHED_BIG, 32, "big");
+    // ICON_SMALL=16 逻辑 px、ICON_BIG=32 逻辑 px，按系统 DPI 换算为物理像素。
+    let small = cached(&CACHED_SMALL, scaled_px_at_dpi(16, system_dpi()), "small");
+    let big = cached(&CACHED_BIG, scaled_px_at_dpi(32, system_dpi()), "big");
     unsafe {
         if !small.0.is_null() {
             let _ = SendMessageW(
@@ -566,13 +586,12 @@ mod tests {
     fn tray_icon_size_scales_with_dpi() {
         // round(16 × dpi / 96)：与实机换算一致（进程 DPI 无法在测试中
         // 控制，直接对换算公式的纯算术部分断言）。
-        fn scaled(dpi: u32) -> u32 {
-            (16 * dpi.max(96) + 48) / 96
-        }
-        assert_eq!(scaled(96), 16);
-        assert_eq!(scaled(144), 24);
-        assert_eq!(scaled(192), 32);
+        assert_eq!(scaled_px_at_dpi(16, 96), 16);
+        assert_eq!(scaled_px_at_dpi(16, 144), 24);
+        assert_eq!(scaled_px_at_dpi(16, 192), 32);
         // 异常 DPI（0）回退 96。
-        assert_eq!(scaled(0), 16);
+        assert_eq!(scaled_px_at_dpi(16, 0), 16);
+        // 大图标：32 逻辑 px → 200% 为 64px（对应 256 帧，宁缩不放大）。
+        assert_eq!(scaled_px_at_dpi(32, 192), 64);
     }
 }
