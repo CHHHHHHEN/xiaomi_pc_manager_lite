@@ -237,8 +237,25 @@ pub fn spawn(
         // 循环），正常情况下只有进程退出才结束。记录 start/end 两端的
         // 时间点，"Fn 静默失效"时能确认线程是否还活着。
         log::info!("Fn watcher thread started");
-        if let Err(e) = run_watcher(&cmd_tx, &bindings, &capture) {
-            log::error!("Fn watcher: {}", e);
+        // catch_unwind（修订 1.33）：release 已移除 panic=abort（1.32），
+        // 本线程若 panic 只会静默终止该线程——Fn 监听失效而应用仍存活，
+        // 用户毫无感知。兜底：panic 被捕获并记录语义化错误（含消息），
+        // 与 M4（后端 init 线程 catch_unwind）设计一致；run_watcher 本身
+        // 已有错误重试，这里只兜住 panic 级故障。
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_watcher(&cmd_tx, &bindings, &capture)
+        }));
+        match result {
+            Ok(Err(e)) => log::error!("Fn watcher: {}", e),
+            Ok(Ok(())) => {}
+            Err(panic) => {
+                let payload = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| panic.downcast_ref::<String>().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "unknown panic".into());
+                log::error!("Fn watcher panicked: {}", payload);
+            }
         }
         log::info!("Fn watcher thread exited");
     });

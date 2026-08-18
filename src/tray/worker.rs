@@ -146,7 +146,22 @@ fn taskbar_created_msg() -> u32 {
 }
 
 pub fn spawn(cmd_tx: mpsc::Sender<UiCommand>, status: SharedTrayStatus, ctx: egui::Context) {
-    std::thread::spawn(move || worker_thread(cmd_tx, status, ctx));
+    // catch_unwind（修订 1.33）：release 已移除 panic=abort（1.32），本线程
+    // panic 会静默终止托盘功能（图标消失/热键失效）而应用仍存活。兜底捕获
+    // 并记录语义化错误，与 fnkey 监听线程的 catch_unwind 设计一致。
+    std::thread::spawn(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            worker_thread(cmd_tx, status, ctx)
+        }));
+        if let Err(panic) = result {
+            let payload = panic
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| panic.downcast_ref::<String>().map(|s| s.to_string()))
+                .unwrap_or_else(|| "unknown panic".into());
+            log::error!("Tray worker panicked: {}", payload);
+        }
+    });
 }
 
 fn worker_thread(cmd_tx: mpsc::Sender<UiCommand>, status: SharedTrayStatus, ctx: egui::Context) {
