@@ -139,9 +139,9 @@ fn run_watcher_once(
     bindings: &SharedBindings,
     capture: &AtomicBool,
 ) -> Result<(), WatcherError> {
-    // COM 公寓初始化/退出的配对统一交给 wmi_util::ComScope 的 RAII 作用域
+    // COM 公寓初始化/退出的配对统一交给 win::com::ComScope 的 RAII 作用域
     //（Drop 时自动 CoUninitialize）。
-    crate::wmi_util::ComScope::init()
+    crate::win::ComScope::init()
         .map_err(|e| WatcherError::Reconnect(format!("COM init: {}", e)))?;
     run_watcher_loop(sink, bindings, capture)
 }
@@ -151,7 +151,7 @@ fn run_watcher_loop(
     bindings: &SharedBindings,
     capture: &AtomicBool,
 ) -> Result<(), WatcherError> {
-    let services = crate::wmi_util::connect_root_wmi().map_err(WatcherError::Reconnect)?;
+    let services = crate::win::connect_root_wmi().map_err(WatcherError::Reconnect)?;
 
     log::info!("Fn watcher connected to root\\wmi");
 
@@ -197,8 +197,8 @@ fn run_watcher_loop(
 
         let mut resubscribe = false;
         for (class_name, SafeEnumerator(ref enumerator)) in &enumerators {
-            // 单槽 Next 统一收敛在 wmi_util::next_instance。
-            match unsafe { crate::wmi_util::next_instance(enumerator, 100) } {
+            // 单槽 Next 统一收敛在 win::com::next_instance。
+            match unsafe { crate::win::next_instance(enumerator, 100) } {
                 Ok(Some(obj)) => process_event(&obj, class_name, bindings, capture, sink),
                 Ok(None) => continue,
                 Err(e) => {
@@ -268,7 +268,7 @@ fn process_event(
     sink: &dyn CommandSink,
 ) {
     let Some(report_hex) =
-        get_detail_hex(obj).or_else(|| crate::wmi_util::get_string_prop(obj, "ReportHex"))
+        get_detail_hex(obj).or_else(|| crate::win::get_string_prop(obj, "ReportHex"))
     else {
         log::debug!("Fn [{}]: no EventDetail/ReportHex", class_name);
         return;
@@ -461,7 +461,7 @@ fn bytes_to_hex(data: *const u8, len: usize) -> Option<String> {
 fn get_detail_hex(obj: &IWbemClassObject) -> Option<String> {
     // 属性值由 OwnedVariant 在 Drop 时自动释放（VARIANT 及它持有的
     // SAFEARRAY/BSTR），无需手动 VariantClear。
-    let val = crate::wmi_util::get_property(obj, "EventDetail")?;
+    let val = crate::win::get_property(obj, "EventDetail")?;
     let vt = unsafe { val.Anonymous.Anonymous.vt };
 
     if vt == VARENUM(VT_ARRAY.0 | VT_UI1.0) {
@@ -474,7 +474,7 @@ fn get_detail_hex(obj: &IWbemClassObject) -> Option<String> {
             return None;
         }
         // 边界查询失败（真实 COM 错误）时显式回退：先解除访问再返回 None。
-        let len = match unsafe { crate::wmi_util::safe_array_len(sa) } {
+        let len = match unsafe { crate::win::safe_array_len(sa) } {
             Ok(l) => l,
             Err(e) => {
                 unsafe { SafeArrayUnaccessData(sa).ok() };
@@ -486,7 +486,7 @@ fn get_detail_hex(obj: &IWbemClassObject) -> Option<String> {
         unsafe { SafeArrayUnaccessData(sa).ok() };
         hex_str
     } else {
-        unsafe { crate::wmi_util::bstr_from_variant(&val) }
+        unsafe { crate::win::bstr_from_variant(&val) }
     }
 }
 
@@ -500,7 +500,7 @@ mod tests {
     struct RecordingSink(Arc<Mutex<Vec<UiCommand>>>);
 
     impl CommandSink for RecordingSink {
-        fn send(&self, command: UiCommand) -> Result<(), ()> {
+        fn send(&self, command: UiCommand) -> Result<(), std::sync::mpsc::SendError<UiCommand>> {
             self.0.lock().unwrap().push(command);
             Ok(())
         }

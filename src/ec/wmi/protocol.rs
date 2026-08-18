@@ -4,14 +4,62 @@
 //! ⇔ raw code 映射、实例名转义、实例选择策略与熔断判定全部是与 WMI 对象
 //! 无关的纯逻辑，可脱离 COM 单独测试。状态（`WmiWorker`）与线程（代理）
 //! 留在 `mod.rs`。
+//!
+//! 本模块还承载 `app::battery` 中原有的 **WMI 充电上限 raw code ⇔ 百分比**
+//! 映射（`WMI_CHARGE_LIMITS`/`WMI_PRESET_PERCENTS` 及三个转换函数）——它们
+//! 是 WMI 适配器的协议知识，领域层（`app`）不应了解具体后端的线格式。迁移
+//! 后 `app::battery` 不再依赖本协议的细节，`ec::wmi` 自洽地拥有该映射。
 
-use crate::app::battery;
 use crate::app::ec::EcError;
 
 use windows::Win32::System::Wmi::{
     WBEM_E_INVALID_CLASS, WBEM_E_INVALID_METHOD, WBEM_E_INVALID_METHOD_PARAMETERS,
     WBEM_E_INVALID_PARAMETER, WBEM_E_NOT_FOUND, WBEM_E_NOT_SUPPORTED, WBEM_E_PROVIDER_FAILURE,
 };
+
+/// WMI rawCode ⇔ 充电限制百分比映射。
+/// WMI 仅支持预设值，WinRing0 支持 0-100 连续值。
+pub const WMI_CHARGE_LIMITS: &[(u8, u8)] = &[
+    (0, 100),
+    (1, 80),
+    (4, 90),
+    (5, 70),
+    (6, 60),
+    (7, 50),
+    (8, 40),
+];
+
+/// GUI 以固定档位按钮展示的 WMI 预设充电上限（升序）。
+///
+/// 与 `WMI_CHARGE_LIMITS` 的 percent 集合完全一致（一致性由测试锁定），
+/// 但显式给出 GUI 展示顺序。历史实现把同一份档位列表硬编码在 view.rs，
+/// 与映射表重复为两个事实来源——统一收敛到此处。
+pub const WMI_PRESET_PERCENTS: &[u8] = &[40, 50, 60, 70, 80, 90, 100];
+
+/// 将 WMI 充电上限 raw code 映射为百分比。
+pub fn wmi_rawcode_to_percent(rawcode: u8) -> Option<u8> {
+    WMI_CHARGE_LIMITS
+        .iter()
+        .find(|(r, _)| *r == rawcode)
+        .map(|(_, p)| *p)
+}
+
+/// 将百分比映射为 WMI 充电上限 raw code（仅预设值可精确映射）。
+pub fn percent_to_wmi_rawcode(percent: u8) -> Option<u8> {
+    WMI_CHARGE_LIMITS
+        .iter()
+        .find(|(_, p)| *p == percent)
+        .map(|(r, _)| *r)
+}
+
+/// 找到最接近的 WMI 预设值。
+pub fn nearest_wmi_percent(percent: u8) -> u8 {
+    WMI_CHARGE_LIMITS
+        .iter()
+        .map(|(_, p)| *p)
+        .min_by_key(|p| (*p as i16 - percent as i16).abs())
+        .expect("WMI_CHARGE_LIMITS is a non-empty compile-time constant")
+}
 
 /// MiInterface 命令缓冲长度（字节）。`put_*`/`mi_interface_call`/
 /// `SafeArrayCreateVector` 等 10 余处曾散落字面量 `32`，一处修改其余漂移——
@@ -111,7 +159,7 @@ pub(super) fn write_perf_cmd(mode: u8) -> [u8; CMD_BUF_LEN] {
 /// 打破不变量，这里如实返回 `None` 由调用方产生 `InvalidData` 错误，而不是
 /// 像历史实现那样 `.unwrap_or(0)` 静默把输入当成 100%（raw code 0）写入。
 pub(super) fn wmi_rawcode_for_percent(percent: u8) -> Option<u8> {
-    battery::percent_to_wmi_rawcode(battery::nearest_wmi_percent(percent))
+    percent_to_wmi_rawcode(nearest_wmi_percent(percent))
 }
 
 /// WMI 对象路径中的字符串值转义：反斜杠与引号需加倍（Meow-Box 的实例路径
@@ -166,4 +214,123 @@ pub(super) fn latch_into(state: &mut Option<EcError>, hr: Option<u32>, err: EcEr
         *state = Some(err.clone());
     }
     err
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// WMI raw code → 百分比：预设代码全部命中。
+    #[test]
+    fn test_wmi_rawcode_to_percent_valid() {
+        assert_eq!(wmi_rawcode_to_percent(0), Some(100));
+        assert_eq!(wmi_rawcode_to_percent(1), Some(80));
+        assert_eq!(wmi_rawcode_to_percent(4), Some(90));
+        assert_eq!(wmi_rawcode_to_percent(5), Some(70));
+        assert_eq!(wmi_rawcode_to_percent(6), Some(60));
+        assert_eq!(wmi_rawcode_to_percent(7), Some(50));
+        assert_eq!(wmi_rawcode_to_percent(8), Some(40));
+    }
+
+    /// WMI raw code → 百分比：未定义代码返回 None。
+    #[test]
+    fn test_wmi_rawcode_to_percent_invalid() {
+        assert_eq!(wmi_rawcode_to_percent(2), None);
+        assert_eq!(wmi_rawcode_to_percent(3), None);
+        assert_eq!(wmi_rawcode_to_percent(9), None);
+        assert_eq!(wmi_rawcode_to_percent(10), None);
+        assert_eq!(wmi_rawcode_to_percent(0xFF), None);
+    }
+
+    /// 百分比 → WMI raw code：仅预设值可精确映射。
+    #[test]
+    fn test_percent_to_wmi_rawcode_valid() {
+        assert_eq!(percent_to_wmi_rawcode(100), Some(0));
+        assert_eq!(percent_to_wmi_rawcode(80), Some(1));
+        assert_eq!(percent_to_wmi_rawcode(90), Some(4));
+        assert_eq!(percent_to_wmi_rawcode(70), Some(5));
+        assert_eq!(percent_to_wmi_rawcode(60), Some(6));
+        assert_eq!(percent_to_wmi_rawcode(50), Some(7));
+        assert_eq!(percent_to_wmi_rawcode(40), Some(8));
+    }
+
+    /// 百分比 → WMI raw code：非预设值返回 None。
+    #[test]
+    fn test_percent_to_wmi_rawcode_invalid() {
+        assert_eq!(percent_to_wmi_rawcode(0), None);
+        assert_eq!(percent_to_wmi_rawcode(10), None);
+        assert_eq!(percent_to_wmi_rawcode(30), None);
+        assert_eq!(percent_to_wmi_rawcode(55), None);
+        assert_eq!(percent_to_wmi_rawcode(85), None);
+        assert_eq!(percent_to_wmi_rawcode(95), None);
+        assert_eq!(percent_to_wmi_rawcode(100), Some(0));
+    }
+
+    /// 就近映射到预设值：精确命中。
+    #[test]
+    fn test_nearest_wmi_percent_exact() {
+        assert_eq!(nearest_wmi_percent(40), 40);
+        assert_eq!(nearest_wmi_percent(50), 50);
+        assert_eq!(nearest_wmi_percent(60), 60);
+        assert_eq!(nearest_wmi_percent(70), 70);
+        assert_eq!(nearest_wmi_percent(80), 80);
+        assert_eq!(nearest_wmi_percent(90), 90);
+        assert_eq!(nearest_wmi_percent(100), 100);
+    }
+
+    /// 就近预设到预设值：四舍五入行为。
+    #[test]
+    fn test_nearest_wmi_percent_rounding() {
+        assert_eq!(nearest_wmi_percent(85), 80);
+        assert_eq!(nearest_wmi_percent(84), 80);
+        assert_eq!(nearest_wmi_percent(86), 90);
+        assert_eq!(nearest_wmi_percent(45), 50);
+        assert_eq!(nearest_wmi_percent(55), 60);
+        assert_eq!(nearest_wmi_percent(65), 70);
+        assert_eq!(nearest_wmi_percent(75), 80);
+        assert_eq!(nearest_wmi_percent(95), 100);
+    }
+
+    /// 就近映射边界：0 与超上限值。
+    #[test]
+    fn test_nearest_wmi_percent_boundary() {
+        assert_eq!(nearest_wmi_percent(0), 40);
+        assert_eq!(nearest_wmi_percent(200), 100);
+    }
+
+    /// 映射表完整性：7 个 raw code 与 7 个百分比，均互不重复。
+    #[test]
+    fn test_wmi_charge_limits_table_completeness() {
+        assert_eq!(WMI_CHARGE_LIMITS.len(), 7);
+        let codes: std::collections::HashSet<u8> =
+            WMI_CHARGE_LIMITS.iter().map(|(r, _)| *r).collect();
+        assert_eq!(codes.len(), 7);
+        let percents: std::collections::HashSet<u8> =
+            WMI_CHARGE_LIMITS.iter().map(|(_, p)| *p).collect();
+        assert_eq!(percents.len(), 7);
+    }
+
+    /// 双向映射一致性：每个 (raw code, percent) 对两个方向都命中。
+    #[test]
+    fn test_wmi_rawcode_to_percent_bidirectional() {
+        for (rawcode, percent) in WMI_CHARGE_LIMITS {
+            assert_eq!(percent_to_wmi_rawcode(*percent), Some(*rawcode));
+            assert_eq!(wmi_rawcode_to_percent(*rawcode), Some(*percent));
+        }
+    }
+
+    /// 回归测试：GUI 展示的 WMI 预设档位（WMI_PRESET_PERCENTS）必须与
+    /// 映射表（WMI_CHARGE_LIMITS）的 percent 集合完全一致。历史实现把
+    /// 同一份档位列表硬编码在 view.rs，与映射表重复为两个事实来源，
+    /// 一处修改另一处漂移。
+    #[test]
+    fn test_wmi_preset_percents_match_mapping_table() {
+        let table: std::collections::HashSet<u8> =
+            WMI_CHARGE_LIMITS.iter().map(|(_, p)| *p).collect();
+        let presets: std::collections::HashSet<u8> = WMI_PRESET_PERCENTS.iter().copied().collect();
+        assert_eq!(
+            presets, table,
+            "view presets must equal mapping table percents"
+        );
+    }
 }

@@ -340,7 +340,7 @@ impl XiaomiApp {
                 ui.horizontal(|ui| {
                     ui.label("充电上限:")
                         .on_hover_text("充满即停的充电阈值，数值越低对电池越友好");
-                    for &limit in crate::app::battery::WMI_PRESET_PERCENTS {
+                    for &limit in crate::ec::wmi::protocol::WMI_PRESET_PERCENTS {
                         let selected = self.runtime.charge_limit == limit;
                         if ui
                             .selectable_label(selected, format!("{}%", limit))

@@ -39,7 +39,7 @@ use windows::Win32::System::Wmi::*;
 
 // MiInterface 线协议（命令构造/常量/熔断判定等纯逻辑）在 `protocol`
 // 子模块，经 `use protocol::*` 对本模块可见（`pub(super)`）。
-mod protocol;
+pub(crate) mod protocol;
 use protocol::*;
 
 /// GetResultObject 等待上限。健康固件上单次调用 5~16ms 即可返回。
@@ -219,8 +219,8 @@ impl WmiWorker {
     /// 单次连接尝试：连接 root\wmi 并解析 MiInterface 调用目标实例。
     fn connect_once() -> Result<Self, EcError> {
         // 连接样板（CoCreateInstance → ConnectServer → CoSetProxyBlanket）
-        // 与 fnkey.rs 共用，见 wmi_util::connect_root_wmi。
-        let services = crate::wmi_util::connect_root_wmi().map_err(EcError::WmiConnect)?;
+        // 与 fnkey.rs 共用，见 `win::com::connect_root_wmi`。
+        let services = crate::win::connect_root_wmi().map_err(EcError::WmiConnect)?;
         let mut worker = Self {
             services,
             target: None,
@@ -275,25 +275,23 @@ impl WmiWorker {
         if let Some(t) = &self.target {
             return Ok(t.clone());
         }
-        let enumerator =
-            crate::wmi_util::exec_query(&self.services, "SELECT * FROM MICommonInterface")
-                .map_err(|e| EcError::WmiConnect(format!("ExecQuery instances: {}", e)))?;
+        let enumerator = crate::win::exec_query(&self.services, "SELECT * FROM MICommonInterface")
+            .map_err(|e| EcError::WmiConnect(format!("ExecQuery instances: {}", e)))?;
 
         // (instance_name, active, is_mifs)：收集全部实例后按 Meow-Box 的
         // 选择策略挑选：active 且含 MIFS 优先，否则取第一个。
         let mut instances: Vec<(String, bool, bool)> = Vec::new();
         loop {
-            // 统一收敛在 wmi_util::next_instance（单槽 Next 样板）；枚举耗尽
+            // 统一收敛在 `win::com::next_instance`（单槽 Next 样板）；枚举耗尽
             // 或 Next 失败（与历史一致）都结束收集。
-            let Ok(Some(obj)) = (unsafe { crate::wmi_util::next_instance(&enumerator, 500) })
-            else {
+            let Ok(Some(obj)) = (unsafe { crate::win::next_instance(&enumerator, 500) }) else {
                 break;
             };
             // InstanceName 缺失的实例必须**跳过**而非默认成空串：历史实现
             // `unwrap_or_default()` 会留下 `InstanceName=""` 的伪实例，若它
             // 恰好被选中（唯一实例 / first 回退），后续每个 EC 调用都因目标
             // 路径非法返回难以理解的 WMI 错误。跳过 + 显式告警更清晰。
-            let Some(name) = crate::wmi_util::get_string_prop(&obj, "InstanceName") else {
+            let Some(name) = crate::win::get_string_prop(&obj, "InstanceName") else {
                 log::warn!("WMI: MICommonInterface instance missing InstanceName; skipping");
                 continue;
             };
@@ -302,7 +300,7 @@ impl WmiWorker {
             // 但仍保留在 first 候选池——与 InstanceName 缺失直接跳过不同，
             // 这里若跳过会把唯一可用实例也丢弃（Active 不是路径构造成分）。
             // 显式告警让"选择逻辑异常"在日志可见，而不是静默吞掉。
-            let active = match crate::wmi_util::get_bool_prop(&obj, "Active") {
+            let active = match crate::win::get_bool_prop(&obj, "Active") {
                 Some(a) => a,
                 None => {
                     log::warn!(
@@ -371,7 +369,7 @@ impl WmiWorker {
         }
         // 边界查询失败是真实 COM 错误，不能静默当成"空数组"（历史实现
         // `unwrap_or((0,-1))` 会伪造 len=0 掩盖错误）——释放数组并回退。
-        let len = match unsafe { crate::wmi_util::safe_array_len(sa) } {
+        let len = match unsafe { crate::win::safe_array_len(sa) } {
             Ok(l) => l,
             Err(e) => {
                 let _ = SafeArrayDestroy(sa);
@@ -696,7 +694,7 @@ impl WmiWorker {
         // 把成功响应全部误判为失败。只要 ≥18 字节即可安全读取全部有效
         // 字段；超过 32 字节的部分忽略。
         // 边界查询失败是真实 COM 错误，显式报错而非伪造 (0,-1) 边界。
-        let len = match unsafe { crate::wmi_util::safe_array_len(out_sa) } {
+        let len = match unsafe { crate::win::safe_array_len(out_sa) } {
             Ok(l) => l,
             Err(e) => {
                 VariantClear(&mut out_val).ok();
@@ -780,7 +778,7 @@ impl WmiWorker {
         // 刷新路径收到该错误会显示"读取电池状态失败"而非荒谬的 100%。
         let buf = self.read_battery()?;
         let raw = buf[6]; // Data1 = 充电上限 raw code
-        let percent = match battery::wmi_rawcode_to_percent(raw) {
+        let percent = match wmi_rawcode_to_percent(raw) {
             Some(p) => p,
             None => {
                 return Err(EcError::InvalidData(format!(

@@ -1,9 +1,30 @@
+//! WinRing0 驱动的运行时提取与文件名校验（`ec` 适配器层内部）。
+//!
+//! 本模块承载驱动 DLL/SYS 的嵌入资源提取、原子写、EXE 目录副本与嵌入副本的
+//! 内容一致性校验，并提供架构文件名对 `arch_file_names` 作为唯一事实来源。
+//! 历史实现放在 crate 根的 `embed.rs`，与 `ec::winring0` 双向依赖（embed 取
+//! `arch_file_names`、winring0 取 `atomic_write`/`extract`）——收敛到 `ec`
+//! 内部后依赖方向单一：`ec::winring0` → `ec::embed`。
+
 use rust_embed::RustEmbed;
 use std::path::{Path, PathBuf};
 
 #[derive(RustEmbed)]
 #[folder = "bin"]
 struct WinRing0Binaries;
+
+/// 当前架构下的 WinRing0 驱动文件名对 (DLL, SYS)。
+///
+/// `embed` 的提取路径与 `winring0` 的加载路径都依赖同一组文件名，曾在两处
+/// 各自硬编码、漂移风险高——统一收敛到此处（驱动文件名的唯一事实来源），
+/// `winring0` 经 `super::embed::arch_file_names` 引用，不再互相依赖。
+pub fn arch_file_names() -> (&'static str, &'static str) {
+    if cfg!(target_pointer_width = "64") {
+        ("WinRing0x64.dll", "WinRing0x64.sys")
+    } else {
+        ("WinRing0.dll", "WinRing0.sys")
+    }
+}
 
 /// 嵌入式 WinRing0 DLL 的原始字节（按当前架构文件名，单一事实来源）。
 ///
@@ -12,7 +33,7 @@ struct WinRing0Binaries;
 /// 否则按嵌入副本重新提取——杜绝"EXE 目录被低权限用户塞入同名恶意 DLL"后
 /// 提权进程直接加载（修订 1.46 安全加固）。
 pub fn embedded_dll_bytes() -> Result<std::borrow::Cow<'static, [u8]>, String> {
-    let (dll_name, _) = crate::ec::winring0::arch_file_names();
+    let (dll_name, _) = arch_file_names();
     WinRing0Binaries::get(dll_name)
         .map(|f| f.data)
         .ok_or_else(|| format!("{} not found in embedded binaries", dll_name))
@@ -64,7 +85,7 @@ pub(crate) fn atomic_write(path: &Path, data: &[u8]) -> Result<(), String> {
 /// 一致 = 自上次提取以来未被外部改写（可信副本，直接加载）；不一致/缺失 =
 /// 可能被低权限用户在可写 EXE 目录替换为恶意 DLL——必须重新提取嵌入副本。
 pub fn exe_dir_dll_is_embedded() -> bool {
-    let (dll_name, _) = crate::ec::winring0::arch_file_names();
+    let (dll_name, _) = arch_file_names();
     let Some(exe_dir) = std::env::current_exe()
         .ok()
         .and_then(|e| e.parent().map(|p| p.to_path_buf()))
@@ -80,8 +101,9 @@ pub fn exe_dir_dll_is_embedded() -> bool {
 }
 
 pub fn extract_winring0() -> Result<PathBuf, String> {
-    // 文件名对（DLL, SYS）统一由 winring0.rs 提供，避免两处硬编码漂移。
-    let (dll_name, sys_name) = crate::ec::winring0::arch_file_names();
+    // 文件名对（DLL, SYS）统一由本模块的 arch_file_names 提供，避免两处
+    // 硬编码漂移（winring0 的加载路径经 `super::embed::arch_file_names` 引用）。
+    let (dll_name, sys_name) = arch_file_names();
 
     // 文件名对由 arch_file_names() 保证与当前架构一致（32 位：WinRing0.dll/.sys，
     // 64 位：WinRing0x64.dll/.sys）。**不得**回退到其它架构的文件名：64 位进程
@@ -164,7 +186,7 @@ mod tests {
     /// 且把"嵌入资源缺失"的打包错误掩盖成难以排查的 LoadLibrary 失败）。
     #[test]
     fn test_arch_file_names_match_pointer_width() {
-        let (dll, sys) = crate::ec::winring0::arch_file_names();
+        let (dll, sys) = arch_file_names();
         if cfg!(target_pointer_width = "64") {
             assert_eq!(dll, "WinRing0x64.dll");
             assert_eq!(sys, "WinRing0x64.sys");
@@ -178,7 +200,7 @@ mod tests {
     /// 而不是靠跨架构回退继续运行。
     #[test]
     fn test_current_arch_binaries_are_embedded() {
-        let (dll_name, sys_name) = crate::ec::winring0::arch_file_names();
+        let (dll_name, sys_name) = arch_file_names();
         assert!(
             WinRing0Binaries::get(dll_name).is_some(),
             "missing embedded {}",

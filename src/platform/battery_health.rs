@@ -215,9 +215,9 @@ fn run(sink: &dyn CommandSink) -> Result<(), String> {
 /// （COM/FFI 边界），历史实现 `poll_loop` 的 `CoUninitialize` 在 panic 展开
 /// 时被跳过——每轮 panic 泄漏一次公寓引用计数，且外层 catch_unwind 会继续
 /// 重连。RAII 保证 panic 展开也执行 CoUninitialize（与 autostart 的 ComScope
-/// 同源收敛于 `wmi_util`）。
+/// 同源收敛于 `win::com`）。
 fn poll_loop(sink: &dyn CommandSink) -> Result<(), String> {
-    let _com = crate::wmi_util::ComScope::init()?;
+    let _com = crate::win::ComScope::init()?;
     poll_connected(sink)
 }
 
@@ -240,7 +240,7 @@ fn send_or_finish(sink: &dyn CommandSink, cmd: UiCommand) -> bool {
 }
 
 fn poll_connected(sink: &dyn CommandSink) -> Result<(), String> {
-    let services = crate::wmi_util::connect_root_wmi()?;
+    let services = crate::win::connect_root_wmi()?;
     let mut last_health_sent: Option<(u32, u32)> = None;
     let mut last_eta_sent: Option<(u32, u32, u32, u32, bool, bool)> = None;
     // 无电池数据的告警去重：台式机/VM 上这些电池类**永久**不存在，逐次
@@ -381,7 +381,7 @@ fn query_first_instance(
     class: &str,
 ) -> Result<Option<IWbemClassObject>, String> {
     let query = format!("SELECT * FROM {}", class);
-    let enumerator = match crate::wmi_util::exec_query(services, &query) {
+    let enumerator = match crate::win::exec_query(services, &query) {
         Ok(e) => e,
         // 类不存在（本机没有其他 WMI 类，如台式机/VM 无电池类）= 正常无数据；
         // 其余错误（服务未就绪等瞬态错误）触发重连。
@@ -391,10 +391,10 @@ fn query_first_instance(
         Err(e) => return Err(format!("ExecQuery {}: {}", class, e)),
     };
     // 单次 Next：仅读取第一个实例即返回（无后续记录需要时）。统一收敛在
-    // wmi_util::next_instance（含"returned>0 但空槽"病态防御，修订 1.46）。
+    // win::com::next_instance（含"returned>0 但空槽"病态防御，修订 1.46）。
     // 枚举器真实失败（连接失效等瞬态）：触发外层重连——若按 Ok(None)
     // 处理会被降级为 60s 低频探测，连接坏死期间等一分钟才恢复。
-    match unsafe { crate::wmi_util::next_instance(&enumerator, 500) } {
+    match unsafe { crate::win::next_instance(&enumerator, 500) } {
         Ok(Some(obj)) => Ok(Some(obj)),
         // 枚举耗尽或病态空槽（next_instance 已告警）都视作"本轮无数据"。
         Ok(None) => Ok(None),
@@ -411,7 +411,7 @@ fn query_first_u32(
     let Some(obj) = query_first_instance(services, class)? else {
         return Ok(None);
     };
-    Ok(crate::wmi_util::uint_prop(&obj, prop))
+    Ok(crate::win::uint_prop(&obj, prop))
 }
 
 /// 充电/放电状态读数（`BatteryStatus`）。
@@ -449,11 +449,11 @@ fn read_battery_status(services: &IWbemServices) -> Result<Option<BatteryStatusI
     // 内部闭包返回 Option（任意属性缺失 → None）：BatteryStatus 是标准类，
     // 属性齐全时读取；个别属性缺失视作本机无完整数据（返回 Ok(None)）。
     let read = || -> Option<BatteryStatusInfo> {
-        let remaining = crate::wmi_util::uint_prop(&obj, PROP_REMAINING)?;
-        let charge_rate = crate::wmi_util::uint_prop(&obj, PROP_CHARGE_RATE)?;
-        let discharge_rate = crate::wmi_util::uint_prop(&obj, PROP_DISCHARGE_RATE)?;
-        let charging = crate::wmi_util::get_bool_prop(&obj, PROP_CHARGING)?;
-        let discharging = crate::wmi_util::get_bool_prop(&obj, PROP_DISCHARGING)?;
+        let remaining = crate::win::uint_prop(&obj, PROP_REMAINING)?;
+        let charge_rate = crate::win::uint_prop(&obj, PROP_CHARGE_RATE)?;
+        let discharge_rate = crate::win::uint_prop(&obj, PROP_DISCHARGE_RATE)?;
+        let charging = crate::win::get_bool_prop(&obj, PROP_CHARGING)?;
+        let discharging = crate::win::get_bool_prop(&obj, PROP_DISCHARGING)?;
         Some(BatteryStatusInfo {
             remaining_mwh: remaining,
             charge_rate_mw: charge_rate,
@@ -589,7 +589,7 @@ mod tests {
         std::thread::spawn(move || {
             // COM 需在本线程初始化（同生产路径的 poll_loop，经 ComScope RAII
             // 配对回收——panic/提前返回都不会泄漏公寓引用计数）。
-            let _com = match crate::wmi_util::ComScope::init() {
+            let _com = match crate::win::ComScope::init() {
                 Ok(com) => com,
                 Err(e) => {
                     let _ = tx.send(Err(e));
@@ -619,7 +619,7 @@ mod tests {
     }
 
     fn run_connected_test(tx: &mpsc::Sender<Result<(u32, u32), String>>) -> Result<(), String> {
-        let services = crate::wmi_util::connect_root_wmi()?;
+        let services = crate::win::connect_root_wmi()?;
         let h = read_health(&services)?.ok_or("no battery health data")?;
         // 充放电状态（修订 1.37）也必须能读到：本机 BatteryStatus 应返回
         // 完整的剩余容量/速率/标记集合（当前接 AC 停充时速率可为 0，但字段

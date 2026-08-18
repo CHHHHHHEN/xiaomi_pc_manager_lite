@@ -39,8 +39,8 @@ const HRESULT_TASK_NOT_FOUND: i32 = -2147024894; // 0x80070002
 /// "init 与 uninit 严格配对"约定矛盾（见其 run_watcher_once 注释）。配对后
 /// 每次操作引用计数回到 0，下轮操作重新初始化，行为确定。
 ///
-/// 与 battery_health 共用 `ec::wmi_util::ComScope`（修订 1.46 审计收敛）。
-type ComScope = crate::wmi_util::ComScope;
+/// 与 battery_health 共用 `win::com::ComScope`（修订 1.46 审计收敛）。
+type ComScope = crate::win::ComScope;
 
 fn task_service() -> Result<ITaskService, String> {
     // COM 已由调用方操作入口（task_state / enable / disable）的 ComScope

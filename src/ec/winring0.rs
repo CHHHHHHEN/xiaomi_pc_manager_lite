@@ -2,6 +2,7 @@ use std::sync::Mutex;
 
 use super::addr as ec_addr;
 use super::backend::EcBackend;
+use super::embed::{arch_file_names, atomic_write, exe_dir_dll_is_embedded, extract_winring0};
 use crate::app::ec::EcError;
 use libloading::Library;
 
@@ -137,18 +138,6 @@ impl Drop for WinRing0Backend {
 
 fn dll_name() -> &'static str {
     arch_file_names().0
-}
-
-/// 当前架构下的 WinRing0 驱动文件名对 (DLL, SYS)。
-///
-/// `embed.rs` 的提取路径与 WinRing0 的加载路径各自硬编码过同一组文件名，
-/// 存在漂移风险——统一收敛到此处作为唯一事实来源。
-pub fn arch_file_names() -> (&'static str, &'static str) {
-    if cfg!(target_pointer_width = "64") {
-        ("WinRing0x64.dll", "WinRing0x64.sys")
-    } else {
-        ("WinRing0.dll", "WinRing0.sys")
-    }
 }
 
 fn try_load(dll_path: &std::path::Path) -> Result<(Library, ReadPort, WritePort), EcError> {
@@ -329,7 +318,7 @@ fn ensure_sys_in_exe_dir(dll_path: &std::path::Path) {
                     return;
                 }
             };
-            match crate::embed::atomic_write(&sys_dst, &data) {
+            match atomic_write(&sys_dst, &data) {
                 Ok(()) => log::info!("WinRing0: copied .sys to {:?}", sys_dst),
                 Err(e) => log::warn!("WinRing0: copy .sys to EXE dir: {}", e),
             }
@@ -384,7 +373,7 @@ impl WinRing0Backend {
         // 一致**（自上次提取以来未被改写）才直接加载；不一致/缺失则走
         // 步骤 2 用嵌入副本重新提取后加载，杜绝加载未验证的同名文件。
         let exe_dll = exe_dir.join(name);
-        if crate::embed::exe_dir_dll_is_embedded() {
+        if exe_dir_dll_is_embedded() {
             match try_load_all(&exe_dll) {
                 Ok(backend) => return Ok(backend),
                 Err(e) => log::warn!("WinRing0: load from EXE dir failed: {}", e),
@@ -398,7 +387,7 @@ impl WinRing0Backend {
         // 2. Fall back to extracting the embedded binaries into the EXE
         //    directory and loading that copy (initialize behind it, so it
         //    finds the freshly written .sys next to it).
-        let extracted_path = match crate::embed::extract_winring0() {
+        let extracted_path = match extract_winring0() {
             Ok(p) => p,
             Err(e) => return Err(EcError::DllLoad(format!("{} 提取失败: {}", name, e))),
         };

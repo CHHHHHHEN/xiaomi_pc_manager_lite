@@ -190,7 +190,7 @@ impl EcBackend for MockBackend {
         // 针对"写入 0 必须失败"的测试在 CI 通过、真机上行为不同（测试漂移）。
         let pct = crate::app::battery::validate_charge_limit_write(percent)?;
         let pct = if self.quantize {
-            crate::app::battery::nearest_wmi_percent(pct)
+            crate::ec::wmi::protocol::nearest_wmi_percent(pct)
         } else {
             pct
         };

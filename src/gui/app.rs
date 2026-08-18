@@ -423,8 +423,8 @@ pub struct GuiCommandSink {
 }
 
 impl crate::app::sink::CommandSink for GuiCommandSink {
-    fn send(&self, command: UiCommand) -> Result<(), ()> {
-        self.tx.send(command).map_err(|_| ())
+    fn send(&self, command: UiCommand) -> Result<(), std::sync::mpsc::SendError<UiCommand>> {
+        self.tx.send(command)
     }
     fn wake(&self) {
         self.ctx.request_repaint();

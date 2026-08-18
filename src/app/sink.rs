@@ -18,11 +18,11 @@ use crate::app::command::UiCommand;
 /// 投递后不 `request_repaint` 则命令最长要等一个 500ms 定时帧才被消费）。
 /// 实现方把两者绑定在同一对象上，调用方无需关心唤醒细节。
 pub trait CommandSink: Send + Sync {
-    /// 投递命令。`Ok(())` = 已投递；`Err(())` = 通道已关闭（GUI 已销毁）。
+    /// 投递命令。`Ok(())` = 已投递；`Err(SendError)` = 通道已关闭（GUI 已销毁）。
     ///
     /// 返回结果供需要感知"GUI 是否仍存活"的生产者（如电池健康线程借此
     /// 停止轮询）使用；只投递不关心结果的调用方用 `CommandSinkExt::dispatch`。
-    fn send(&self, command: UiCommand) -> Result<(), ()>;
+    fn send(&self, command: UiCommand) -> Result<(), std::sync::mpsc::SendError<UiCommand>>;
     fn wake(&self);
 }
 
