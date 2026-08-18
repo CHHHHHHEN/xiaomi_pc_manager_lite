@@ -208,9 +208,7 @@ impl EcBackend for MockBackend {
     }
 
     fn get_performance_mode(&self) -> Result<u8, EcError> {
-        if self.read_fails.load(Ordering::Relaxed) {
-            return Err(self.fail());
-        }
+        self.ensure_readable()?;
         Ok(self.perf_mode.load(Ordering::Relaxed))
     }
 

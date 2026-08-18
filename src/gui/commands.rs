@@ -15,20 +15,15 @@ const HW_FAILURE_PAUSE_THRESHOLD: u32 = 3;
 
 /// 用户可见错误文案（修订 1.47 收敛）：同名字面量散落多处、各自手写，
 /// 修改措辞时容易漏改其一导致文案漂移（测试锁定这些文案的 contains 断言）。
-/// 统一收敛为单一来源——`format!` 要求格式串为字面量，故带占位符的文案用
-/// 函数承载；无占位符的 `ERR_SET_CARE` 用常量。
-fn err_set_charge_limit(e: impl std::fmt::Display) -> String {
-    format!("设置充电上限失败: {}", e)
+/// 统一收敛为单一来源——带占位符的文案共用同一 `format!("{label}: {e}")`
+/// 形状（修订 1.49 整理）；无占位符的 `ERR_SET_CARE` 用常量。
+fn err_fmt(label: &'static str, e: impl std::fmt::Display) -> String {
+    format!("{}: {}", label, e)
 }
-fn err_sync_care(e: impl std::fmt::Display) -> String {
-    format!("同步电池养护状态失败: {}", e)
-}
-fn err_backend_switch(e: impl std::fmt::Display) -> String {
-    format!("后端切换失败: {}", e)
-}
-fn err_autostart(e: impl std::fmt::Display) -> String {
-    format!("设置开机自启动失败: {}", e)
-}
+const ERR_SET_CHARGE_LIMIT: &str = "设置充电上限失败";
+const ERR_SYNC_CARE: &str = "同步电池养护状态失败";
+const ERR_BACKEND_SWITCH: &str = "后端切换失败";
+const ERR_AUTOSTART: &str = "设置开机自启动失败";
 const ERR_SET_CARE: &str = "设置电池养护失败";
 
 impl XiaomiApp {
@@ -424,7 +419,7 @@ impl XiaomiApp {
             self.config.auto_start_on_boot = false;
             self.save_state();
         }
-        self.push_error(err_autostart(detail));
+        self.push_error(err_fmt(ERR_AUTOSTART, detail));
     }
 
     /// 自启动 worker 的结果回执（UiCommand::SetAutostartResult）。
@@ -469,7 +464,7 @@ impl XiaomiApp {
                 // 问题：任务计划中残留的只是陈旧任务，sync 启动时对
                 // "配置关但任务在"采取保守不自动删除（autostart.rs
                 // sync），留给用户决定，故无回滚必要。
-                self.push_error(err_autostart(e));
+                self.push_error(err_fmt(ERR_AUTOSTART, e));
             }
         }
     }
@@ -751,7 +746,7 @@ impl XiaomiApp {
                 // 与 set_charge_limit_internal 的失败文案统一（附带错误详情，
                 // 修订 1.46 审计：历史在此只写"设置充电上限失败"，排查时
                 // 看不到具体原因）。
-                errs.push(err_set_charge_limit(e));
+                errs.push(err_fmt(ERR_SET_CHARGE_LIMIT, e));
                 if outcome.care.is_err() {
                     errs.push(ERR_SET_CARE.to_string());
                 }
@@ -774,7 +769,7 @@ impl XiaomiApp {
             Ok(applied) => applied,
             Err(e) => {
                 log::error!("Failed to set charge limit: {}", e);
-                self.push_error(err_set_charge_limit(e));
+                self.push_error(err_fmt(ERR_SET_CHARGE_LIMIT, e));
                 return;
             }
         };
@@ -800,7 +795,7 @@ impl XiaomiApp {
                     "Failed to sync battery care bit: {}; deriving care from charge limit",
                     e
                 );
-                self.push_error(err_sync_care(e));
+                self.push_error(err_fmt(ERR_SYNC_CARE, e));
             } else {
                 log::info!(
                     "Battery care {} (synced from charge limit)",
@@ -946,7 +941,7 @@ impl XiaomiApp {
             Err(e) => {
                 log::error!("Failed to spawn backend switch thread: {}", e);
                 self.pending_backend_switch = None;
-                self.push_error(err_backend_switch(e));
+                self.push_error(err_fmt(ERR_BACKEND_SWITCH, e));
                 false
             }
         }
@@ -991,7 +986,7 @@ impl XiaomiApp {
                     self.confirm_preference(BackendPreference::Auto);
                 } else {
                     log::error!("Failed to switch EC backend: {}", e);
-                    self.push_error(err_backend_switch(e));
+                    self.push_error(err_fmt(ERR_BACKEND_SWITCH, e));
                 }
             }
         }
@@ -1123,12 +1118,15 @@ impl XiaomiApp {
     /// 都应调用，使托盘悬停提示保持实时；未同步时托盘显示的仍是旧状态。
     pub(crate) fn sync_tray_status(&self) {
         // 毒锁恢复与托盘侧一致（util.rs 约定）：静默跳过会让 tooltip 长期
-        // 停留在旧状态且无日志，恢复毒锁更可排查。
+        // 停留在旧状态且无日志，恢复毒锁更可排查。字段赋值收敛在
+        // TrayStatus::sync_runtime（修订 1.49 整理）。
         let mut guard = self.with_tray_status();
-        guard.battery_care_enabled = self.runtime.battery_care_enabled;
-        guard.charge_limit = self.runtime.charge_limit;
-        guard.performance_mode = self.runtime.performance_mode;
-        guard.notify_on_charge_limit = self.config.notify_on_charge_limit;
+        guard.sync_runtime(
+            self.runtime.battery_care_enabled,
+            self.runtime.charge_limit,
+            self.runtime.performance_mode,
+            self.config.notify_on_charge_limit,
+        );
     }
 
     /// 合并错误信息而非覆盖：F-ERR-03 要求所有硬件操作失败都应在 GUI 中

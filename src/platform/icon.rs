@@ -21,10 +21,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 /// 由 `icons/icon.png` 构建多尺寸 ICO 数据（16/32/48/256，PNG 压缩块）。
 /// 现代 Windows（Vista+）支持含 PNG 块的 ICO。
 fn build_multi_size_ico() -> Vec<u8> {
-    let png = include_bytes!("../../icons/icon.png");
-    let img = match image::load_from_memory(png) {
-        Ok(img) => img.to_rgba8(),
-        Err(_) => return Vec::new(),
+    let Some(img) = app_icon_rgba() else {
+        return Vec::new();
     };
     const SIZES: &[u32] = &[16, 32, 48, 256];
     let mut blocks: Vec<Vec<u8>> = Vec::with_capacity(SIZES.len());
@@ -63,6 +61,21 @@ fn build_multi_size_ico() -> Vec<u8> {
         ico.extend_from_slice(block);
     }
     ico
+}
+
+/// 应用图标 `icons/icon.png` 解码为 RGBA 位图（进程内恒定，缓存一次）。
+///
+/// GUI（`egui::IconData`，gui/view.rs）与平台（多尺寸 ICO 构建，本模块）
+/// 各自 `include_bytes!` 并解码同一张嵌入 PNG——收敛到此处共享解码与缓存
+/// （修订 1.49 整理）。解码失败（资源损坏）返回 None，由调用方决定降级。
+pub(crate) fn app_icon_rgba() -> Option<image::RgbaImage> {
+    static CACHE: std::sync::OnceLock<Option<image::RgbaImage>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let png = include_bytes!("../../icons/icon.png");
+            image::load_from_memory(png).ok().map(|img| img.to_rgba8())
+        })
+        .clone()
 }
 
 /// HICON 句柄包装（裸指针非 Send/Sync）：图标由系统持有、进程退出时

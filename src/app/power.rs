@@ -41,3 +41,62 @@ pub struct PowerSnapshot {
 pub trait PowerSource: Send + Sync {
     fn snapshot(&self) -> PowerSnapshot;
 }
+
+/// 电源状态展示文案（GUI 状态栏"电源:"标签的措辞）。
+///
+/// 与 [`power_status_text_tray`] 共享同一 `(status, percent)` 判定形状；两份
+/// 措辞（GUI 较详细、托盘紧凑）收敛到本模块，`PowerStatus` 变体演进时只需
+/// 在此一处更新（修订 1.49 整理：两处调用点原本各自手写 5 分支 match）。
+pub fn power_status_text_gui(status: PowerStatus, percent: Option<u8>) -> String {
+    match (status, percent) {
+        (PowerStatus::OnAc, Some(pct)) => format!("交流电 · 电量 {}%", pct),
+        (PowerStatus::OnAc, None) => "交流电".to_string(),
+        (PowerStatus::OnBattery, Some(pct)) => format!("电池 · 电量 {}%", pct),
+        (PowerStatus::OnBattery, None) => "电池 · 电量未知".to_string(),
+        (PowerStatus::Unknown, _) => "未知".to_string(),
+    }
+}
+
+/// 电源状态展示文案（托盘 tooltip"电源:"段的紧凑措辞），见
+/// [`power_status_text_gui`] 的收敛说明。
+pub fn power_status_text_tray(status: PowerStatus, percent: Option<u8>) -> String {
+    match (status, percent) {
+        (PowerStatus::OnAc, Some(pct)) => format!("交流 {pct}%"),
+        (PowerStatus::OnAc, None) => "交流".to_string(),
+        (PowerStatus::OnBattery, Some(pct)) => format!("电池 {pct}%"),
+        (PowerStatus::OnBattery, None) => "电池".to_string(),
+        (PowerStatus::Unknown, _) => "未知".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// GUI 与托盘两种措辞的电源状态文案：5 种 (status, percent) 组合各自
+    /// 有确定输出（变体演进时此处强制更新全部组合）。
+    #[test]
+    fn test_power_status_texts() {
+        use PowerStatus::*;
+        let cases_gui = [
+            ((OnAc, Some(80)), "交流电 · 电量 80%"),
+            ((OnAc, None), "交流电"),
+            ((OnBattery, Some(42)), "电池 · 电量 42%"),
+            ((OnBattery, None), "电池 · 电量未知"),
+            ((Unknown, Some(50)), "未知"),
+        ];
+        for ((status, pct), expected) in cases_gui {
+            assert_eq!(power_status_text_gui(status, pct), expected);
+        }
+        let cases_tray = [
+            ((OnAc, Some(80)), "交流 80%"),
+            ((OnAc, None), "交流"),
+            ((OnBattery, Some(42)), "电池 42%"),
+            ((OnBattery, None), "电池"),
+            ((Unknown, Some(50)), "未知"),
+        ];
+        for ((status, pct), expected) in cases_tray {
+            assert_eq!(power_status_text_tray(status, pct), expected);
+        }
+    }
+}

@@ -5,21 +5,26 @@
 //! 保留在 `tray::notify`。本模块供 `tray::worker`（判定）与 `tray::notify`
 //! （文案）共用。
 
-/// 纯决策：性能模式变化且非首次采样时是否需要弹通知。
+/// 纯决策：状态值变化且非首次采样时是否需要弹通知。
 ///
 /// 首次采样（last 为 None）不弹：启动时托盘首次拿到状态只是基线，并非用户
 /// 操作导致的切换，弹通知会打扰。之后每次变化都视为真实切换（Fn+K/热键/
 /// 电池自动切节能/托盘菜单），返回 true 由调用方在窗口隐藏时弹气泡。
-pub fn should_notify_perf_change(last: Option<u8>, current: u8) -> bool {
+///
+/// 性能模式（`u8`）与电池养护（`bool`）两条通知判定语义一致，历史实现各写
+/// 一份同体函数（修订 1.49 整理）——收敛为泛型后两处调用点共享同一实现。
+pub fn should_notify_change<T: PartialEq>(last: Option<T>, current: T) -> bool {
     matches!(last, Some(prev) if prev != current)
 }
 
-/// 纯决策：电池养护状态变化且非上次采样时是否需要弹通知。
-///
-/// 与 `should_notify_perf_change` 语义一致（首次采样不弹、之后每次变化都
-/// 视为真实切换）。
+/// 性能模式变化通知判定（见 [`should_notify_change`]）。
+pub fn should_notify_perf_change(last: Option<u8>, current: u8) -> bool {
+    should_notify_change(last, current)
+}
+
+/// 电池养护状态变化通知判定（与性能模式同语义，见 [`should_notify_change`]）。
 pub fn should_notify_care_change(last: Option<bool>, current: bool) -> bool {
-    matches!(last, Some(prev) if prev != current)
+    should_notify_change(last, current)
 }
 
 /// 从上一次采样（携带判定时的上限）提取"当前上限对应的上次武装状态"。
@@ -91,7 +96,7 @@ pub fn charge_limit_notification_decision(
 
 /// 充电达到上限通知文案（展示层据此弹气泡）。
 pub fn charge_limit_notification_text(limit: u8) -> String {
-    if limit >= 100 {
+    if limit >= crate::app::limits::FULL_CHARGE_LIMIT {
         "电池已充满".to_string()
     } else {
         format!("电池已充至 {}% 养护上限", limit)

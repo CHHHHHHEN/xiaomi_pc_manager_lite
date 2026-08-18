@@ -171,41 +171,14 @@ impl ConfigStore {
         std::fs::create_dir_all(&self.dir).map_err(|e| e.to_string())?;
         let s = toml::to_string_pretty(cfg).map_err(|e| e.to_string())?;
 
-        // Atomic write: write to a temporary file, then rename (NFR-REL-04)。
-        // 临时文件名必须**唯一**（pid + 进程内自增序号）：固定名（如
-        // config.toml.tmp）在并发保存时存在撕裂重命名风险——写入者 A 完成
-        // write 后、rename 前，写入者 B 对同一 tmp 文件重新 truncate+write，
-        // A 的 rename 会把 B 尚未写完的 tmp 改名成 config，最终配置文件内容
-        // 被撕裂（下轮启动解析失败回退默认）。唯一名 + 原子 rename 保证目标
-        // 文件永远是某一次完整写入的产物。清理：write/rename 失败时删除
-        // 本次残留的临时文件。
-        //
-        // **落盘前 fsync**（修订 1.36）：`fs::write` 只关闭句柄，不保证数据
-        // 块先于目录项 rename 落盘——断电/强杀时可能出现"config.toml 目录项
-        // 已更新而数据块未写"的 0 长度/撕裂文件，下轮启动解析失败回退
-        // degraded_defaults()，用户设置（充电上限/性能模式）静默失效。写后
-        // `sync_all` 确保数据与元数据刷盘后再 rename。注：Windows NTFS 的
-        // rename 原子性由文件系统日志保证，目录项本身的持久化不需要额外
-        // 目录句柄 fsync（与 POSIX 语义不同），此处已覆盖本平台可实现性。
+        // Atomic write 统一收敛到 `util::fs::atomic_write`（修订 1.49 整理：
+        // 与 ec::embed 的驱动提取共用同一实现）。语义详见该函数注释——
+        // 唯一临时文件名（pid + 自增序号）+ fsync 落盘 + rename 覆盖，任一
+        // 失败清理本次残留临时文件。唯一命名保证并发保存时目标文件永远是
+        // 某一次完整写入的产物（NFR-REL-04）；fsync 保证断电/强杀不留下
+        // 空/撕裂的 config.toml（修订 1.36）。
         let path = self.path();
-        static SAVE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let seq = SAVE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tmp_path = path.with_extension(format!("toml.{}.{}.tmp", std::process::id(), seq));
-        let write_result = (|| -> std::io::Result<()> {
-            use std::io::Write;
-            let mut f = std::fs::File::create(&tmp_path)?;
-            f.write_all(s.as_bytes())?;
-            f.sync_all()?;
-            Ok(())
-        })();
-        if let Err(e) = write_result {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(e.to_string());
-        }
-        if let Err(e) = std::fs::rename(&tmp_path, &path) {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(e.to_string());
-        }
+        crate::util::atomic_write(&path, s.as_bytes())?;
 
         log::debug!("Config saved to {}", path.display());
         Ok(())
@@ -276,7 +249,7 @@ impl AppConfig {
         let before_limit = self.battery_charge_limit;
         self.battery_charge_limit =
             coherent_charge_limit(self.battery_care_enabled, self.battery_charge_limit);
-        if self.battery_care_enabled && before_limit >= 100 {
+        if self.battery_care_enabled && before_limit >= FULL_CHARGE_LIMIT {
             log::warn!(
                 "Config: battery care on with limit {}% (incoherent); using {}%",
                 orig_limit,
@@ -580,7 +553,7 @@ mod tests {
         let content = std::fs::read_to_string(&path).expect("config must exist");
         let parsed: AppConfig = toml::from_str(&content).expect("config must parse");
         assert!(
-            parsed.battery_charge_limit <= 100,
+            parsed.battery_charge_limit <= FULL_CHARGE_LIMIT,
             "parsed limit must be valid"
         );
 

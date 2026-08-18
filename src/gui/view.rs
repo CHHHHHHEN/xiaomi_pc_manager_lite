@@ -231,19 +231,8 @@ impl XiaomiApp {
         let power = crate::platform::power::power_snapshot();
         ui.horizontal(|ui| {
             ui.label("电源:");
-            let power_text = match (power.status, power.battery_percent) {
-                (crate::platform::power::PowerStatus::OnAc, Some(pct)) => {
-                    format!("交流电 · 电量 {}%", pct)
-                }
-                (crate::platform::power::PowerStatus::OnAc, None) => "交流电".to_string(),
-                (crate::platform::power::PowerStatus::OnBattery, Some(pct)) => {
-                    format!("电池 · 电量 {}%", pct)
-                }
-                (crate::platform::power::PowerStatus::OnBattery, None) => {
-                    "电池 · 电量未知".to_string()
-                }
-                (crate::platform::power::PowerStatus::Unknown, _) => "未知".to_string(),
-            };
+            let power_text =
+                crate::app::power::power_status_text_gui(power.status, power.battery_percent);
             ui.colored_label(BRAND_BLUE, power_text);
         });
         // 电量进度条：电量已知时按百分比填充（<20% 红色警示，交流供电绿色，
@@ -939,15 +928,15 @@ pub fn load_icon_data() -> Option<egui::IconData> {
     // 图标来自嵌入资源（include_bytes），内容进程内恒定——解码一次并缓存：
     // 历史实现每次调用都重新解码 PNG，run_app 的 with_icon 与首帧 update 的
     // 标题栏纹理各解一次。OnceLock 保证只解码一次，后续调用直接复用。
+    // 解码统一收敛到 `platform::icon::app_icon_rgba`（与多尺寸 ICO 构建共用
+    // 同一缓存，修订 1.49 整理）。
     static CACHE: std::sync::OnceLock<Option<egui::IconData>> = std::sync::OnceLock::new();
     CACHE
         .get_or_init(|| {
-            let png_bytes = include_bytes!("../../icons/icon.png");
-            let img = image::load_from_memory(png_bytes).ok()?;
-            let rgba = img.to_rgba8();
-            let (w, h) = rgba.dimensions();
+            let img = crate::platform::icon::app_icon_rgba()?;
+            let (w, h) = img.dimensions();
             Some(egui::IconData {
-                rgba: rgba.into_raw(),
+                rgba: img.into_raw(),
                 width: w,
                 height: h,
             })

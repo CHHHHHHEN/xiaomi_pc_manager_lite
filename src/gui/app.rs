@@ -168,15 +168,10 @@ impl XiaomiApp {
         let fn_bindings =
             std::sync::Arc::new(std::sync::RwLock::new(config.fn_key_bindings.clone()));
         // 托盘共享状态：以持久化配置初始化（随后被 refresh_from_backend
-        // 用硬件实际状态覆盖），与托盘线程共享。
-        let tray_status: SharedTrayStatus = Arc::new(std::sync::Mutex::new(TrayStatus {
-            battery_care_enabled: config.battery_care_enabled,
-            charge_limit: config.battery_charge_limit,
-            performance_mode: config.performance_mode,
-            battery_health_percent: None,
-            battery_eta_text: None,
-            notify_on_charge_limit: config.notify_on_charge_limit,
-        }));
+        // 用硬件实际状态覆盖），与托盘线程共享。字段赋值收敛在
+        // TrayStatus::from_config（修订 1.49 整理）。
+        let tray_status: SharedTrayStatus =
+            Arc::new(std::sync::Mutex::new(TrayStatus::from_config(&config)));
 
         let mut app = Self {
             store,

@@ -491,13 +491,7 @@ fn build_tooltip(status: &TrayStatus, snap: &crate::platform::power::PowerSnapsh
     } else {
         crate::app::battery::care_label(false).to_string()
     };
-    let power = match (snap.status, snap.battery_percent) {
-        (crate::platform::power::PowerStatus::OnAc, Some(pct)) => format!("交流 {pct}%"),
-        (crate::platform::power::PowerStatus::OnAc, None) => "交流".to_string(),
-        (crate::platform::power::PowerStatus::OnBattery, Some(pct)) => format!("电池 {pct}%"),
-        (crate::platform::power::PowerStatus::OnBattery, None) => "电池".to_string(),
-        (crate::platform::power::PowerStatus::Unknown, _) => "未知".to_string(),
-    };
+    let power = crate::app::power::power_status_text_tray(snap.status, snap.battery_percent);
     let mut parts = vec![
         crate::util::APP_NAME.to_string(),
         format!("性能:{perf}"),

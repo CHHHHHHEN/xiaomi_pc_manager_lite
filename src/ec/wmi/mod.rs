@@ -1076,32 +1076,48 @@ impl WmiBackend {
         EcError::BackendUnavailable(err_msg.into())
     }
 
-    /// 统一应答分派：把命令执行结果映射到 `EcBackend` 返回类型。
-    /// 应答类型与命令不符（worker 异常）时统一为 BackendUnavailable。
-    fn unit(&self, cmd: WmiCmd) -> Result<(), EcError> {
-        match self.call(cmd) {
-            WmiReply::Unit(r) => r,
-            _ => Err(EcError::BackendUnavailable("WMI worker 响应异常".into())),
+    /// 统一应答分派核心：期望应答变体由 `take` 提取。
+    ///
+    /// - `Unit(Err)`（熔断/通道关闭路径）**先于提取器**拦截并如实透传具体
+    ///   错误（如"无响应（超时熔断，请切换后端重试）"），不退化成语义
+    ///   掩盖可操作的提示（F3）；
+    /// - 提取器命中期望变体 → 返回其 `Result`；
+    /// - 其余类型不匹配（worker 异常）→ 统一 `BackendUnavailable`。
+    ///
+    /// 历史实现 `unit`/`battery`/`perf` 各自手写上述三件套，修订 1.49 收敛。
+    fn reply<T>(
+        &self,
+        reply: WmiReply,
+        take: impl FnOnce(WmiReply) -> Option<Result<T, EcError>>,
+    ) -> Result<T, EcError> {
+        match reply {
+            WmiReply::Unit(Err(e)) => Err(e),
+            r => match take(r) {
+                Some(res) => res,
+                None => Err(EcError::BackendUnavailable("WMI worker 响应异常".into())),
+            },
         }
+    }
+
+    fn unit(&self, cmd: WmiCmd) -> Result<(), EcError> {
+        self.reply(self.call(cmd), |r| match r {
+            WmiReply::Unit(r) => Some(r),
+            _ => None,
+        })
     }
 
     fn battery(&self, cmd: WmiCmd) -> Result<(bool, u8), EcError> {
-        match self.call(cmd) {
-            WmiReply::BatteryState(r) => r,
-            // 熔断/通道关闭路径返回 Unit(Err)：如实透传具体错误（如
-            // "无响应（超时熔断，请切换后端重试）"），不要退化成笼统的
-            // "响应异常"掩盖可操作的提示（F3）。
-            WmiReply::Unit(Err(e)) => Err(e),
-            _ => Err(EcError::BackendUnavailable("WMI worker 响应异常".into())),
-        }
+        self.reply(self.call(cmd), |r| match r {
+            WmiReply::BatteryState(r) => Some(r),
+            _ => None,
+        })
     }
 
     fn perf(&self, cmd: WmiCmd) -> Result<u8, EcError> {
-        match self.call(cmd) {
-            WmiReply::PerfMode(r) => r,
-            WmiReply::Unit(Err(e)) => Err(e),
-            _ => Err(EcError::BackendUnavailable("WMI worker 响应异常".into())),
-        }
+        self.reply(self.call(cmd), |r| match r {
+            WmiReply::PerfMode(r) => Some(r),
+            _ => None,
+        })
     }
 }
 

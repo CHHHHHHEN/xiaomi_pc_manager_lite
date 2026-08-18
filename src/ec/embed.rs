@@ -49,35 +49,10 @@ pub fn embedded_dll_bytes() -> Result<std::borrow::Cow<'static, [u8]>, String> {
 /// `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`）则**替换整个目录项**而非跟随
 /// 重解析点——目标若为链接，被整体替换为正常文件，不会写穿到链接目标。
 ///
-/// 临时文件名含 PID + 自增序号：同目录并发写入互不冲突（rename 原子性）；
-/// 残留临时文件在下次成功写入前可能堆积，但数量 = 并发写入次数、极小，
-/// 且写入成功路径必 rename（失败路径的临时文件由调用方清理）。
+/// 实现统一收敛到 `util::fs::atomic_write`（修订 1.49 整理：与
+/// `app::config` 的配置保存共用同一份实现，含 fsync 落盘）。
 pub(crate) fn atomic_write(path: &Path, data: &[u8]) -> Result<(), String> {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let dir = path
-        .parent()
-        .ok_or_else(|| format!("no parent for {:?}", path))?;
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| format!("no file name for {:?}", path))?;
-    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp_path = dir.join(format!(
-        ".{}.tmp.{}.{}",
-        file_name.to_string_lossy(),
-        std::process::id(),
-        seq
-    ));
-
-    let write_result =
-        std::fs::write(&tmp_path, data).and_then(|()| std::fs::rename(&tmp_path, path));
-    match write_result {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            // 失败时清理临时文件（尽力而为，避免残留）。
-            let _ = std::fs::remove_file(&tmp_path);
-            Err(format!("write {}: {}", path.to_string_lossy(), e))
-        }
-    }
+    crate::util::atomic_write(path, data)
 }
 
 /// 校验 EXE 目录中的 DLL 是否与嵌入副本**内容一致**（字节级）。
@@ -211,33 +186,6 @@ mod tests {
             "missing embedded {}",
             sys_name
         );
-    }
-
-    /// 原子写（临时文件 + rename）必须覆盖既有文件内容（修订 1.46 安全
-    /// 加固的写入语义：rename 替换目录项而非跟随重解析点）。
-    #[test]
-    fn test_atomic_write_replaces_existing() {
-        let dir = std::env::temp_dir().join(format!("xmpl-atomic-write-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        let path = dir.join("target.bin");
-        // 首次写入。
-        atomic_write(&path, b"first").expect("write must succeed");
-        assert_eq!(std::fs::read(&path).unwrap(), b"first");
-        // 覆盖既有文件。
-        atomic_write(&path, b"second-larger").expect("overwrite must succeed");
-        assert_eq!(std::fs::read(&path).unwrap(), b"second-larger");
-        // 没有残留临时文件（写入成功路径必 rename）。
-        let leftovers: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
-            .collect();
-        assert!(
-            leftovers.is_empty(),
-            "no temp files may remain: {:?}",
-            leftovers
-        );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 嵌入 DLL 字节可读且与嵌入资源一致（exe_dir_dll_is_embedded 的输入源）。

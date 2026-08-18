@@ -116,6 +116,14 @@ pub fn main_window_visible() -> bool {
         .unwrap_or(false)
 }
 
+/// 窗口矩形是否位于隐藏原点（-32000,-32000）。
+///
+/// hide/show 两侧各自内联书写过同一 `left == HIDDEN_POS.0 && top ==
+/// HIDDEN_POS.1` 判定（修订 1.49 整理），收敛为单一谓词。
+fn rect_at_hidden_pos(rect: &RECT) -> bool {
+    rect.left == HIDDEN_POS.0 && rect.top == HIDDEN_POS.1
+}
+
 /// 窗口是否位于隐藏原点（-32000,-32000）且未被最小化。
 fn window_at_hidden_pos(hwnd: HWND) -> bool {
     let mut rect = unsafe { std::mem::zeroed() };
@@ -127,7 +135,7 @@ fn window_at_hidden_pos(hwnd: HWND) -> bool {
     if unsafe { IsIconic(hwnd).as_bool() } {
         return false;
     }
-    rect.left == HIDDEN_POS.0 && rect.top == HIDDEN_POS.1
+    rect_at_hidden_pos(&rect)
 }
 
 /// 判断给定的窗口左上角（x, y）是否位于**虚拟屏幕**（所有监视器的并集，
@@ -172,9 +180,8 @@ pub fn hide_main_window() {
         }
         // 记录当前在屏位置（Show 时恢复，见 LAST_POS 注释）。
         let mut rect: RECT = unsafe { std::mem::zeroed() };
-        let on_screen = unsafe { GetWindowRect(hwnd, &mut rect).is_ok() }
-            && rect.left != HIDDEN_POS.0
-            && rect.top != HIDDEN_POS.1;
+        let on_screen =
+            unsafe { GetWindowRect(hwnd, &mut rect).is_ok() } && !rect_at_hidden_pos(&rect);
         if on_screen {
             // 与 EXSTYLE_LOCK 同一毒锁恢复约定：LAST_POS 的记录/读取
             // 在 hide/show 两处访问，持锁 panic 会毒化——恢复比永久
