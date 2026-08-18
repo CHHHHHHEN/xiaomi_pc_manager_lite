@@ -10,6 +10,16 @@ use crate::tray::{SharedTrayStatus, TrayStatus};
 
 use super::view;
 
+/// WMI 延迟恢复探测参数（见 `XiaomiApp::wmi_recover_*`）。
+///
+/// 首次启动（尤其随登录自启动）时 WinMgmt 服务/MICommonInterface 提供程序
+/// 可能尚未就绪，WMI 后端在启动握手预算（HANDSHAKE_TIMEOUT≈10s）内失败并
+/// 回退 WinRing0——用户看到的"WMI 总是不可用，手动切换却可用"（F-BUG）。
+/// 回退后按指数退避继续探测 WMI（20s→40s→80s→160s，最多 4 次），可用即
+/// 自动切换回 WMI，无需用户手动操作。探测在后台线程执行，不阻塞 GUI。
+const WMI_RECOVER_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_secs(20);
+const WMI_RECOVER_MAX_ATTEMPTS: u32 = 4;
+
 /// GUI 运行时硬件状态（与持久化配置解耦的独立事实来源）。
 ///
 /// 历史上这三个字段直接挂在 `XiaomiApp` 上、与 `config` 的同名字段并列，
@@ -90,6 +100,11 @@ pub struct XiaomiApp {
     /// 循环（保证 Drop 清理执行）。用户点击窗口关闭按钮时不置位，仍走
     /// "隐藏到托盘"路径（修订 1.21）。
     pub(crate) quitting: bool,
+    /// WMI 延迟恢复：下一次探测 WMI 后端可用性的时间点。
+    /// `None` = 无需探测（当前已是 WMI / 用户偏好非 WMI / 已达预算上限）。
+    pub(crate) wmi_recover_at: Option<std::time::Instant>,
+    /// 已发起的 WMI 延迟恢复探测次数（指数退避与上限用，见 WMI_RECOVER_*）。
+    pub(crate) wmi_recover_attempts: u32,
 }
 
 impl XiaomiApp {
@@ -141,7 +156,13 @@ impl XiaomiApp {
             //（cc.egui_ctx.clone()），供托盘/Fn worker 唤醒隐藏事件循环。
             egui_ctx: egui::Context::default(),
             quitting: false,
+            wmi_recover_at: None,
+            wmi_recover_attempts: 0,
         };
+
+        // WMI 延迟恢复探测初始化（首次启动 WMI 失败回退时启用，见
+        // arm_wmi_recovery 注释）。
+        app.arm_wmi_recovery();
 
         // AC-START-03: GUI 启动后应显示硬件当前实际状态，而非仅显示
         // 持久化的配置（auto_apply 关闭时两者可能不一致）。
@@ -166,6 +187,85 @@ impl XiaomiApp {
         }
 
         app
+    }
+
+    /// 初始化/复位 WMI 延迟恢复探测计划（F-BUG：启动时 WMI 服务未就绪）。
+    ///
+    /// 仅当"用户偏好仍是 WMI（Auto/Wmi，即希望 WMI 生效）且当前实际后端
+    /// 不是 WMI"时启用；首个探测点在 `WMI_RECOVER_INITIAL_DELAY` 之后。
+    /// 探测成功（`UiCommand::WmiAvailable` 应用切换）或用户改偏好为
+    /// WinRing0 时由对应路径置 `None` 停止。
+    fn arm_wmi_recovery(&mut self) {
+        let wants_wmi = matches!(
+            self.config.backend,
+            BackendPreference::Auto | BackendPreference::Wmi
+        );
+        if !wants_wmi || self.backend.preference() == BackendPreference::Wmi {
+            self.wmi_recover_at = None;
+            return;
+        }
+        self.wmi_recover_at = Some(std::time::Instant::now() + WMI_RECOVER_INITIAL_DELAY);
+        log::info!(
+            "WMI delayed recovery armed (backend '{}'); first probe in {}s",
+            self.backend.name(),
+            WMI_RECOVER_INITIAL_DELAY.as_secs()
+        );
+    }
+
+    /// 到期则发起一次 WMI 延迟恢复探测（指数退避，见 WMI_RECOVER_* 常量）。
+    ///
+    /// 探测在**后台线程**执行（`create_backend(Wmi)` 会创建 wmi-worker 并
+    /// 同步等待握手，放 GUI 线程会卡帧）；结果经 `UiCommand::WmiAvailable`
+    /// 回传，由 process_commands 校验偏好后应用切换。
+    fn maybe_probe_wmi_recovery(&mut self) {
+        let Some(due) = self.wmi_recover_at else {
+            return;
+        };
+        // 用户偏好改为非 WMI，或已恢复（如上层已切到 WMI）：停止探测。
+        let wants_wmi = matches!(
+            self.config.backend,
+            BackendPreference::Auto | BackendPreference::Wmi
+        );
+        if !wants_wmi || self.backend.preference() == BackendPreference::Wmi {
+            self.wmi_recover_at = None;
+            return;
+        }
+        if std::time::Instant::now() < due {
+            return;
+        }
+        if self.wmi_recover_attempts >= WMI_RECOVER_MAX_ATTEMPTS {
+            self.wmi_recover_at = None;
+            log::warn!(
+                "WMI delayed recovery: gave up after {} attempts",
+                self.wmi_recover_attempts
+            );
+            return;
+        }
+        self.wmi_recover_attempts += 1;
+        // 指数退避：首次探测后 20s→40s→80s→160s。
+        let backoff = WMI_RECOVER_INITIAL_DELAY * (1u32 << self.wmi_recover_attempts);
+        self.wmi_recover_at = Some(std::time::Instant::now() + backoff);
+        log::info!(
+            "WMI delayed recovery: probe #{}/{} started (next in {:?})",
+            self.wmi_recover_attempts,
+            WMI_RECOVER_MAX_ATTEMPTS,
+            backoff
+        );
+        let cmd_tx = self.cmd_tx.clone();
+        std::thread::spawn(
+            move || match ec::backend::create_backend(BackendPreference::Wmi) {
+                Ok(backend) => {
+                    if cmd_tx.send(UiCommand::WmiAvailable(backend)).is_err() {
+                        log::warn!(
+                            "WMI delayed recovery: GUI channel closed; probed backend dropped"
+                        );
+                    }
+                }
+                Err(e) => {
+                    log::warn!("WMI delayed recovery: probe failed: {}", e);
+                }
+            },
+        );
     }
 }
 
@@ -315,6 +415,9 @@ impl eframe::App for XiaomiApp {
         }
 
         self.process_commands(ctx);
+        // WMI 延迟恢复：首次启动时 WMI 服务未就绪而回退后，按指数退避
+        // 探测并自动切回 WMI（见 maybe_probe_wmi_recovery 注释）。
+        self.maybe_probe_wmi_recovery();
         // 窗口移到屏幕外（隐藏到托盘）后 update 循环仍以 500ms 间隔运行
         // （见 platform::window 的离屏隐藏设计，修订 1.19）；若间隔过大，
         // 托盘点击 / 全局快捷键 / Fn+K 命令最长要等一个间隔才会被处理
@@ -374,6 +477,13 @@ mod tests {
         assert_eq!(
             format!("{:?}", UiCommand::SetAutostartResult(true, Ok(()))),
             "SetAutostartResult(true, Ok(()))"
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                UiCommand::WmiAvailable(Box::new(crate::ec::backend::NullBackend))
+            ),
+            "WmiAvailable(_)"
         );
         assert_eq!(format!("{:?}", UiCommand::Quit), "Quit");
     }

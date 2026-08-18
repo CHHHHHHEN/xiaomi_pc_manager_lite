@@ -72,6 +72,39 @@ impl XiaomiApp {
                         self.push_error(format!("设置开机自启动失败: {}", e));
                     }
                 },
+                UiCommand::WmiAvailable(backend) => {
+                    // 延迟恢复探测结果（见 app.rs maybe_probe_wmi_recovery）：
+                    // 探测是后台异步的，期间用户可能手动切换了后端，必须校验
+                    // "当前仍期望 WMI 且尚未恢复"才应用，否则丢弃过期结果——
+                    // 误应用会把用户刚选的 WinRing0 覆盖回 WMI。
+                    let wants_wmi = matches!(
+                        self.config.backend,
+                        BackendPreference::Auto | BackendPreference::Wmi
+                    );
+                    if !wants_wmi {
+                        log::info!(
+                            "WMI delayed recovery: user preference no longer WMI; probed backend dropped"
+                        );
+                    } else if self.backend.preference() == BackendPreference::Wmi {
+                        log::info!(
+                            "WMI delayed recovery: WMI already active; probed backend dropped"
+                        );
+                    } else if backend.preference() != BackendPreference::Wmi {
+                        log::warn!(
+                            "WMI delayed recovery: probed backend is '{}' not WMI; dropped",
+                            backend.name()
+                        );
+                    } else {
+                        self.wmi_recover_at = None;
+                        log::info!(
+                            "WMI delayed recovery: WMI available; switching from '{}'",
+                            self.backend.name()
+                        );
+                        // pref 传用户偏好（Auto/Wmi）：apply_backend_switch
+                        // 会据此更新 config.backend 与 current_pref。
+                        self.apply_backend_switch(backend, self.config.backend);
+                    }
+                }
                 UiCommand::Quit => {
                     // 请求 eframe 正常退出事件循环：置位 quitting 后下一帧
                     // 的 close_requested 放行（不再取消/隐藏到托盘），
@@ -1639,5 +1672,153 @@ mod tests {
         app.toggle_fn_capture();
         assert!(!app.fn_capture.load(std::sync::atomic::Ordering::Relaxed));
         assert_eq!(app.last_fn_event, None, "capture off clears last event");
+    }
+
+    /// 延迟恢复探测结果（UiCommand::WmiAvailable）应用：用户偏好仍是
+    /// WMI/Auto（希望 WMI 生效）且当前是回退后端时，探测到的 WMI 后端被
+    /// 切换为活动后端。
+    #[test]
+    fn test_wmi_available_applies_when_preference_wants_wmi() {
+        let store = test_store();
+        // 构造时后端为 WinRing0（模拟首次启动 WMI 失败回退），偏好保持
+        // AppConfig 默认 Wmi（AUTO 语义下当前实例实际是 WinRing0）。
+        let mut app = XiaomiApp::new(
+            store,
+            Box::new(MockBackend::all_fail(
+                "pref-winring0",
+                BackendPreference::WinRing0,
+            )),
+            AppConfig::default(),
+            BackendPreference::WinRing0,
+            None,
+            false,
+        );
+        app.error_msg = None;
+        assert_eq!(app.config.backend, BackendPreference::Wmi);
+
+        let ctx = egui::Context::default();
+        app.cmd_tx
+            .send(UiCommand::WmiAvailable(Box::new(MockBackend::all_fail(
+                "pref-wmi",
+                BackendPreference::Wmi,
+            ))))
+            .unwrap();
+        app.process_commands(&ctx);
+
+        assert_eq!(app.backend.preference(), BackendPreference::Wmi);
+        // 偏好（config.backend）保持不变，仅活动后端切换为 WMI。
+        assert_eq!(app.config.backend, BackendPreference::Wmi);
+        assert_eq!(app.current_pref, BackendPreference::Wmi);
+        assert!(
+            app.wmi_recover_at.is_none(),
+            "recovery must stop after successful switch"
+        );
+    }
+
+    /// Auto 偏好下的延迟恢复：config.backend=Auto（实际后端 WinRing0）时，
+    /// 探测成功后活动后端切为 WMI，偏好仍保持 Auto（current_pref=Auto）。
+    #[test]
+    fn test_wmi_available_applies_keeping_auto_preference() {
+        let store = test_store();
+        let mut app = XiaomiApp::new(
+            store,
+            Box::new(MockBackend::all_fail(
+                "pref-winring0",
+                BackendPreference::WinRing0,
+            )),
+            AppConfig {
+                backend: BackendPreference::Auto,
+                ..Default::default()
+            },
+            BackendPreference::WinRing0,
+            None,
+            false,
+        );
+        app.error_msg = None;
+        assert_eq!(app.config.backend, BackendPreference::Auto);
+
+        let ctx = egui::Context::default();
+        app.cmd_tx
+            .send(UiCommand::WmiAvailable(Box::new(MockBackend::all_fail(
+                "pref-wmi",
+                BackendPreference::Wmi,
+            ))))
+            .unwrap();
+        app.process_commands(&ctx);
+
+        assert_eq!(app.backend.preference(), BackendPreference::Wmi);
+        assert_eq!(app.config.backend, BackendPreference::Auto);
+        assert_eq!(app.current_pref, BackendPreference::Auto);
+    }
+
+    /// 探测结果过期：探测期间用户手动把偏好切到 WinRing0，迟到的 WMI
+    /// 探测结果必须被丢弃，不得覆盖用户的最新选择。
+    #[test]
+    fn test_wmi_available_discarded_when_user_picked_winring0() {
+        let store = test_store();
+        let mut app = XiaomiApp::new(
+            store,
+            Box::new(MockBackend::all_fail(
+                "pref-winring0",
+                BackendPreference::WinRing0,
+            )),
+            AppConfig {
+                backend: BackendPreference::WinRing0,
+                ..Default::default()
+            },
+            BackendPreference::WinRing0,
+            None,
+            false,
+        );
+        app.error_msg = None;
+        let backend_before = app.backend.name();
+
+        let ctx = egui::Context::default();
+        app.cmd_tx
+            .send(UiCommand::WmiAvailable(Box::new(MockBackend::all_fail(
+                "pref-wmi",
+                BackendPreference::Wmi,
+            ))))
+            .unwrap();
+        app.process_commands(&ctx);
+
+        assert_eq!(
+            app.backend.name(),
+            backend_before,
+            "probed backend must be dropped when user switched preference"
+        );
+        assert_eq!(app.config.backend, BackendPreference::WinRing0);
+    }
+
+    /// 回归测试：当前后端已经是 WMI 时，迟到的探测结果必须被丢弃（避免
+    /// 重复切换把正在使用的后端重建一遍）。
+    #[test]
+    fn test_wmi_available_discarded_when_already_wmi() {
+        let store = test_store();
+        let mut app = XiaomiApp::new(
+            store,
+            Box::new(MockBackend::all_fail("pref-wmi", BackendPreference::Wmi)),
+            AppConfig::default(),
+            BackendPreference::Wmi,
+            None,
+            false,
+        );
+        app.error_msg = None;
+        let backend_before = app.backend.name();
+
+        let ctx = egui::Context::default();
+        app.cmd_tx
+            .send(UiCommand::WmiAvailable(Box::new(MockBackend::all_fail(
+                "pref-wmi",
+                BackendPreference::Wmi,
+            ))))
+            .unwrap();
+        app.process_commands(&ctx);
+
+        assert_eq!(
+            app.backend.name(),
+            backend_before,
+            "must not recreate an already-active WMI backend"
+        );
     }
 }

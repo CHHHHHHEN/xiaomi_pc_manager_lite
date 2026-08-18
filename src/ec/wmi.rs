@@ -51,6 +51,19 @@ pub(crate) const GET_RESULT_TIMEOUT_MS: i32 = 3000;
 /// 走既有回退路径（FallbackPreference / NullBackend）。
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// `WmiWorker::connect` 的连接重试上限（F-BUG 回归）。
+///
+/// 应用随登录自启动（F-AUTO）时，WinMgmt 服务可能尚未就绪、或
+/// `MICommonInterface` 提供程序还在注册加载——单次连接失败即返回错误，启动
+/// 直接回退 WinRing0，表现为"WMI 总是不可用、手动切换却能用"。在握手预算内
+/// 做有界重试，等服务就绪。fnkey 监听线程对同一瞬态已有无限重试
+/// （`run_watcher` 的 Reconnect 循环），此处补齐后端初始化这一处。
+const CONNECT_ATTEMPTS: u32 = 4;
+
+/// 连接重试间的固定退避。总退避 3×2s=6s，加上各次连接耗时仍明显小于
+/// `HANDSHAKE_TIMEOUT`（10s），不会突破上层的启动等待预算。
+const CONNECT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// 单次调用的应答等待上限（T1 熔断，见 `WmiBackend::recv_reply`）。
 /// worker 侧 WMI 调用自身有 GET_RESULT_TIMEOUT_MS=3000ms 上限，健康路径
 /// 应答在 5~16ms 内到达；本值只需显著大于 3s 即可容纳 worker 正常超时，
@@ -227,6 +240,34 @@ struct WmiWorker {
 impl WmiWorker {
     fn connect() -> Result<Self, EcError> {
         ensure_com()?;
+        // 连接 + 目标实例解析是可能因"服务/提供程序未就绪"而瞬态失败的整体
+        // （见 CONNECT_ATTEMPTS 注释）。确定性失败 `WmiInterfaceNotFound`
+        // 也纳入重试：提供程序尚未注册时 ExecQuery 同样返回空实例，与"本机
+        // 没有该接口"无法从错误本身区分；重试至预算的代价仅限启动期间，且
+        // 上限受 HANDSHAKE_TIMEOUT 约束。
+        let mut last_err = EcError::WmiConnect("WMI 连接未尝试".into());
+        for attempt in 1..=CONNECT_ATTEMPTS {
+            match Self::connect_once() {
+                Ok(worker) => return Ok(worker),
+                Err(e) => {
+                    log::warn!(
+                        "WMI: connect attempt {}/{} failed ({})",
+                        attempt,
+                        CONNECT_ATTEMPTS,
+                        e
+                    );
+                    last_err = e;
+                    if attempt < CONNECT_ATTEMPTS {
+                        std::thread::sleep(CONNECT_RETRY_DELAY);
+                    }
+                }
+            }
+        }
+        Err(last_err)
+    }
+
+    /// 单次连接尝试：连接 root\wmi 并解析 MiInterface 调用目标实例。
+    fn connect_once() -> Result<Self, EcError> {
         // 连接样板（CoCreateInstance → ConnectServer → CoSetProxyBlanket）
         // 与 fnkey.rs 共用，见 wmi_util::connect_root_wmi。
         let services = super::wmi_util::connect_root_wmi().map_err(EcError::WmiConnect)?;
@@ -1402,6 +1443,22 @@ mod tests {
             err.to_string().contains("handshake failed"),
             "unexpected: {}",
             err
+        );
+    }
+
+    /// 回归测试（F-BUG）：连接重试的总退避必须明显小于 HANDSHAKE_TIMEOUT，
+    /// 否则重试尚未结束父端已超时放弃，重试逻辑形同虚设。锁定常量值防漂移。
+    #[test]
+    fn test_connect_retry_budget_within_handshake_timeout() {
+        assert!(CONNECT_ATTEMPTS >= 2, "retry loop must be meaningful");
+        let total_backoff = (CONNECT_ATTEMPTS - 1) as u128 * CONNECT_RETRY_DELAY.as_millis();
+        // 预留单次连接（ConnectServer + ExecQuery）的耗时余量：总退避须小于
+        // 握手上限的 80%，避免极端情况下超时截止前连最后一试都轮不到。
+        assert!(
+            total_backoff * 10 < HANDSHAKE_TIMEOUT.as_millis() * 8,
+            "retry backoff {}ms too close to handshake timeout {}ms",
+            total_backoff,
+            HANDSHAKE_TIMEOUT.as_millis()
         );
     }
 }
