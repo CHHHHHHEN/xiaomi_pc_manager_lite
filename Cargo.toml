@@ -1,6 +1,6 @@
 [package]
 name = "xiaomi-pc-manager-lite"
-version = "0.2.0"
+version = "1.0.0"
 edition = "2021"
 description = "Xiaomi PC Manager Lite - Battery care / Performance mode"
 authors = ["opencode"]

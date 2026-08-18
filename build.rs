@@ -14,9 +14,10 @@ fn main() {
         // 任务栏在窗口创建前（如 UAC 弹窗、资源管理器文件视图）使用 exe
         // 自带的图标，窗口创建后由 set_main_window_icon 覆盖为同源图像。
         res.set_icon("icons/tray_icon.ico");
-        // FileVersion/ProductVersion 与 Cargo.toml version 保持同步（语义化版本）。
-        res.set("FileVersion", env!("CARGO_PKG_VERSION"));
-        res.set("ProductVersion", env!("CARGO_PKG_VERSION"));
+        // FileVersion/ProductVersion 与展示版本号 `src/util.rs::APP_VERSION`
+        // 保持同步（Windows 支持四段 `1.0.0.5`；Cargo.toml 的 semver 为 `1.0.0`）。
+        res.set("FileVersion", "1.0.0.5");
+        res.set("ProductVersion", "1.0.0.5");
         // 需要管理员权限（WritePort 提权）：版本信息里带 requestedExecutionLevel，
         // 与启动时 elevate_self() 的 UAC 弹窗语义一致（不在此处强制嵌入清单，
         // 保留运行时提权逻辑的单一事实来源）。

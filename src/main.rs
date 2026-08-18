@@ -63,8 +63,8 @@ fn init_logging() {
     // 排查问题时日志首行即告知日志落盘位置与版本号。
     log::info!(
         "===== {} v{} ====",
-        env!("CARGO_PKG_NAME"),
-        env!("CARGO_PKG_VERSION")
+        crate::util::APP_NAME,
+        crate::util::APP_VERSION
     );
     log::info!("Log file: {}", log_path.display());
 }

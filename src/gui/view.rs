@@ -459,7 +459,7 @@ impl XiaomiApp {
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.label(
-                egui::RichText::new(format!("版本 {}", env!("CARGO_PKG_VERSION")))
+                egui::RichText::new(format!("版本 {}", crate::util::APP_VERSION))
                     .color(Color32::GRAY)
                     .size(11.0),
             );
