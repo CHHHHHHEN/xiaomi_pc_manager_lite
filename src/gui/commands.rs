@@ -138,6 +138,10 @@ impl XiaomiApp {
                     // DeinitializeOls 卸载驱动等）。不能用 process::exit
                     // 跳过清理（修订 1.21）。
                     log::info!("Quit: setting quitting flag");
+                    // F-GUI-21（修订 1.33）：各变更路径本已即时持久化，退出时
+                    // 再兜底保存一次——防御未来新增的 config 变更路径遗漏
+                    // save_state 导致退出丢配置（与"增量落盘"设计不冲突）。
+                    self.save_state();
                     self.quitting = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
