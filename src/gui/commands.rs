@@ -85,13 +85,16 @@ impl XiaomiApp {
                         if enabled && self.config.auto_start_on_boot {
                             self.config.auto_start_on_boot = false;
                             self.save_state();
-                        } else if !enabled && !self.config.auto_start_on_boot {
-                            // disable 失败（任务仍存在）：配置若仍为关，回滚为
-                            // 勾选（true）更贴近实际；若已被更新的 enable 覆盖
-                            // 为 true 则保持（与最新意图一致）。
-                            self.config.auto_start_on_boot = true;
-                            self.save_state();
                         }
+                        // **删除失败不回滚**（F-AUTO-03，修订 1.32）：取消勾选
+                        // 时配置必须仍按用户选择保存（关），仅在 GUI 展示错误。
+                        // 历史实现把 disable 失败回滚为勾选（true），与需求
+                        // 文档"删除失败时配置仍按用户选择保存"直接冲突——用户
+                        // 明确要关闭，因临时权限/占用失败被翻回开启，下次启动
+                        // 反而继续自启。关闭侧没有"复选框与实际任务状态背离"
+                        // 问题：任务计划中残留的只是陈旧任务，sync 启动时对
+                        // "配置关但任务在"采取保守不自动删除（autostart.rs
+                        // sync），留给用户决定，故无回滚必要。
                         self.push_error(format!("设置开机自启动失败: {}", e));
                     }
                 },
@@ -1075,6 +1078,30 @@ mod tests {
             app.config.auto_start_on_boot,
             "stale disable failure must not revert the newer ON intent"
         );
+    }
+
+    /// 回归测试（修订 1.32/F-AUTO-03）：**删除失败不得回滚配置**——取消勾选
+    /// 后任务删除失败（临时权限/占用）时，配置必须仍按用户选择保存（关），
+    /// 仅在 GUI 展示错误。历史实现把 disable 失败回滚为勾选（true），与需求
+    /// 文档"删除失败时配置仍按用户选择保存"直接冲突，用户明确要关闭却因
+    /// 临时失败被翻回开启。
+    #[test]
+    fn test_autostart_disable_failure_keeps_user_choice() {
+        let mut app = test_app();
+        let ctx = egui::Context::default();
+
+        app.persist_autostart_request(false);
+        assert!(!app.config.auto_start_on_boot);
+        app.cmd_tx
+            .send(UiCommand::SetAutostartResult(false, Err("删除失败".into())))
+            .unwrap();
+        app.process_commands(&ctx);
+        assert!(
+            !app.config.auto_start_on_boot,
+            "disable failure must keep config at user's choice (off)"
+        );
+        let err = app.error_msg.as_deref().unwrap_or_default();
+        assert!(err.contains("设置开机自启动失败"), "unexpected: {}", err);
     }
 
     /// 回归测试：ToggleWindow 改为基于真实窗口可见性的隐藏/显示

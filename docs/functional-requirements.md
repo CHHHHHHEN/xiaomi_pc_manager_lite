@@ -472,7 +472,7 @@ graph TD
 #### 验收标准
 
 - **AC-HOTKEY-01**：App 后台运行时（窗口隐藏），按下 Ctrl+Alt+B 切换电池养护，再次按下恢复
-- **AC-HOTKEY-02**：按下 Fn+K 在五种模式间循环，每次切换后如果 GUI 窗口可见，状态立即更新
+- **AC-HOTKEY-02**：按下 Fn+K 在三种模式间循环（Smart→Quiet→Extreme，见 AC-PERF-04；历史版本误写"五种模式"），每次切换后如果 GUI 窗口可见，状态立即更新
 
 ---
 
