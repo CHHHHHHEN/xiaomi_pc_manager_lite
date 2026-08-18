@@ -1,9 +1,8 @@
 //! BatteryCare 状态与充电限制逻辑
 
-use super::backend::EcBackend;
-use super::config::AppConfig;
-use super::error::EcError;
-use super::limits::coherent_charge_limit;
+use crate::app::config::AppConfig;
+use crate::app::ec::{EcBackend, EcError};
+use crate::app::limits::{coherent_charge_limit, FULL_CHARGE_LIMIT};
 
 /// WMI rawCode ⇔ 充电限制百分比映射
 /// WMI 仅支持预设值，WinRing0 支持 0-100 连续值
@@ -58,7 +57,7 @@ pub fn validate_charge_limit_write(percent: u8) -> Result<u8, EcError> {
     if percent == 0 {
         return Err(EcError::InvalidData("充电上限 0% 非法".into()));
     }
-    Ok(percent.min(100))
+    Ok(percent.min(FULL_CHARGE_LIMIT))
 }
 
 /// 一次写入"充电上限 + 养护位"的结果。
@@ -76,7 +75,20 @@ pub struct BatteryApplyOutcome {
 /// 7 处各自书写 `< 100`（阈值若变需同步改全部落点）——统一收敛到此处，
 /// 任何修改只改这一处，全部路径同时生效。
 pub fn care_enabled_from_limit(limit: u8) -> bool {
-    limit < 100
+    limit < FULL_CHARGE_LIMIT
+}
+
+/// 电池养护状态的面向用户文案（唯一事实来源）。
+///
+/// GUI 状态区（"电池养护: 开启"）、托盘 tooltip（"养护:开启 (上限80%)"）、
+/// 托盘通知（"电池养护: 开启"）曾各自书写 "开启"/"关闭"/"已启用"/"已停用"
+/// 多套措辞，同一状态文案不一致——统一收敛到此处后任何展示处直接引用。
+pub fn care_label(enabled: bool) -> &'static str {
+    if enabled {
+        "开启"
+    } else {
+        "关闭"
+    }
 }
 
 /// 电池写入成功后的配置同步规则（限值是两种后端判定养护状态的权威依据）：
@@ -119,7 +131,7 @@ pub fn apply_battery_state(
     let limit = if care {
         coherent_charge_limit(true, desired_limit)
     } else {
-        100
+        FULL_CHARGE_LIMIT
     };
     let charge_limit = match backend.set_charge_limit(limit) {
         Ok(()) => {
@@ -128,9 +140,35 @@ pub fn apply_battery_state(
             // 见 apply_battery_state 文档）。读回失败时保留写入值并记录警告
             // ——不能静默当成读回成功：调用方会把读回值写回持久化配置，
             // 静默吞掉会使 config 与硬件实际值长期背离且无法排查。
-            match backend.get_charge_limit() {
+            //
+            // 读回契约（修订 1.46 审计）：后端 get_charge_limit 对非法值
+            // （0 / >100）返回 Err（见 winring0.rs / wmi.rs 的读回校验）。
+            // 合法范围由后端保证；万一某后端越界返回 Ok(0)/Ok(>100)，
+            // 在此显式拒绝（Err），由调用方走"保留写入值"的兜底，绝不冒充
+            // 成功（纵深防御，GarbageReadback 回归测试锁定）。
+            let readback = || -> Result<u8, EcError> {
+                let actual = backend.get_charge_limit()?;
+                // 读回契约（修订 1.46/1.47 审计）：后端 get_charge_limit 对非法值
+                // （0 / >100）返回 Err（见 winring0.rs / wmi.rs 的读回校验）。
+                // 0 同样是垃圾值（GUI 滑块下限 40、WMI 预设下限 40、配置消毒
+                // 把 0 归一为默认）——只判 >100 会让损坏的 0 被当作"合法 0%"
+                // 持久化进配置（care=true + limit=0）。此处显式拒绝（Err），
+                // 由调用方走"保留写入值"的兜底，绝不冒充成功（纵深防御，
+                // GarbageReadback 回归测试锁定）。
+                if actual == 0 || actual > FULL_CHARGE_LIMIT {
+                    log::warn!(
+                        "Charge limit readback out of range: {}%; treating as failure",
+                        actual
+                    );
+                    return Err(EcError::InvalidData(format!(
+                        "充电上限读回值 {}% 非法",
+                        actual
+                    )));
+                }
+                Ok(actual)
+            };
+            match readback() {
                 Ok(actual) => {
-                    let actual = actual.min(100);
                     // 量化读回结果：请求值与硬件实际生效值不一致（如 85→80）
                     // 是"UI 滑块/配置显示值与硬件不符"类问题的最直接线索，
                     // 必须记录请求值与读回值两者的关系。
@@ -152,13 +190,17 @@ pub fn apply_battery_state(
                         e,
                         limit
                     );
-                    Ok(limit.min(100))
+                    // 读回失败兜底：写入值（coherent 后 ≤100，无需再钳）。
+                    Ok(limit)
                 }
             }
         }
         Err(e) => Err(e),
     };
-    let care = match backend.set_battery_care(care) {
+    // 养护位写入：`care_result` 避免与形参 `care`（bool）同名遮蔽
+    // （修订 1.46 审计：`let care = ...set_battery_care(care)` 在函数内
+    // 重新绑定同名变量，后续阅读容易混淆"请求值"与"写入结果"）。
+    let care_result = match backend.set_battery_care(care) {
         Ok(()) => {
             log::info!(
                 "Battery care set to {}",
@@ -168,7 +210,10 @@ pub fn apply_battery_state(
         }
         Err(e) => Err(e),
     };
-    BatteryApplyOutcome { charge_limit, care }
+    BatteryApplyOutcome {
+        charge_limit,
+        care: care_result,
+    }
 }
 
 /// 一次"把整份配置应用到硬件"的结果：电池部分（充电上限 + 养护位，见
@@ -205,48 +250,60 @@ impl ApplyOutcome {
     }
 }
 
-/// 根据当前电源状态计算实际应写入 EC 的性能模式 raw code。
+/// 按电源状态把用户选择的性能模式映射为实际写入值（唯一事实来源）。
 ///
-/// 历史实现直接把 `ac_power_status() -> bool`（API 失败时静默返回 false）
-/// 喂给 `effective_ec_value`，把"电源状态未知"一律当作电池供电——交流下
-/// 狂暴模式被静默降级为极速。改为三态判定：仅在**确认**电池供电时降级，
-/// 未知时按用户选择的模式写入并告警（不做静默降级，见 platform::power）。
+/// - 交流供电：可写全部模式（狂暴保持）；
+/// - 电池供电：狂暴降级为极速（`effective_ec_value` 的 false 分支）；
+/// - 电源状态未知：不静默降级（平台层约定），按用户选择原样写入。
 ///
-/// GUI 切换路径（gui::commands::set_perf_mode_internal）与启动/电源重设路径
-/// （apply_config_to_hardware）共用一个行为来源，避免两处漂移。
-pub fn effective_perf_for_current_power(mode: u8) -> u8 {
-    use crate::platform::power::{power_status, PowerStatus};
-    match power_status() {
-        PowerStatus::OnAc => super::performance::effective_ec_value(mode, true),
-        PowerStatus::OnBattery => super::performance::effective_ec_value(mode, false),
-        PowerStatus::Unknown => {
-            log::warn!("电源状态未知；按用户选择写入性能模式 {:#x}", mode);
-            mode
+/// GUI 切换路径（`effective_perf_for_power`）与启动/电源重设路径
+/// （`effective_applied_mode`）共用此映射，避免两处漂移。
+fn raw_perf_for_status(mode: u8, status: crate::app::power::PowerStatus) -> u8 {
+    match status {
+        crate::app::power::PowerStatus::OnAc => {
+            crate::app::performance::effective_ec_value(mode, true)
         }
+        crate::app::power::PowerStatus::OnBattery => {
+            crate::app::performance::effective_ec_value(mode, false)
+        }
+        // 未知电源状态：不静默降级（平台层约定），按用户选择写入。
+        crate::app::power::PowerStatus::Unknown => mode,
     }
+}
+
+/// 根据给定电源状态计算实际应写入 EC 的性能模式 raw code。
+///
+/// 历史实现直接在函数内调用 `power_status()` 查询电源（`ec::battery` 反向
+/// 依赖平台层），且把"电源状态未知"一律当作电池供电——交流下狂暴模式被静默
+/// 降级为极速。改为三态判定：仅在**确认**电池供电时降级，未知时按用户选择
+/// 的模式写入并告警（不做静默降级）。电源状态由调用方经 `PowerSource` 端口
+/// 取得后传入，本函数保持纯逻辑。
+///
+/// GUI 切换路径（`gui::commands::set_perf_mode_internal`）与启动/电源重设路径
+/// （`apply_config_to_hardware`）共用一个映射来源（`raw_perf_for_status`）。
+pub fn effective_perf_for_power(mode: u8, status: crate::app::power::PowerStatus) -> u8 {
+    if status == crate::app::power::PowerStatus::Unknown {
+        log::warn!("电源状态未知；按用户选择写入性能模式 {:#x}", mode);
+    }
+    raw_perf_for_status(mode, status)
 }
 
 /// 电池自动切节能 + 电源降级合并后的**实际写入**性能模式。
 ///
 /// 纯逻辑（便于单测）：先按"电池供电自动切节能"覆盖用户模式，再走既有
-/// 交流电源降级（狂暴→极速）。返回 (实际写入, 是否与用户选择不同)。
+/// 电源降级映射（`raw_perf_for_status`）。返回 (实际写入, 是否与用户选择不同)。
 fn effective_applied_mode(
     user_mode: u8,
     auto_switch_to_quiet_on_battery: bool,
-    status: crate::platform::power::PowerStatus,
+    status: crate::app::power::PowerStatus,
 ) -> (u8, bool) {
-    use crate::platform::power::PowerStatus;
-    let mode = if auto_switch_to_quiet_on_battery && status == PowerStatus::OnBattery {
-        crate::ec::performance::PerfMode::Eco.ec_value()
-    } else {
-        user_mode
-    };
-    let raw = match status {
-        PowerStatus::OnAc => super::performance::effective_ec_value(mode, true),
-        PowerStatus::OnBattery => super::performance::effective_ec_value(mode, false),
-        // 未知电源状态：不静默降级（平台层约定），按用户选择写入。
-        PowerStatus::Unknown => mode,
-    };
+    let mode =
+        if auto_switch_to_quiet_on_battery && status == crate::app::power::PowerStatus::OnBattery {
+            crate::app::performance::PerfMode::Eco.ec_value()
+        } else {
+            user_mode
+        };
+    let raw = raw_perf_for_status(mode, status);
     (raw, raw != user_mode)
 }
 
@@ -257,14 +314,18 @@ fn effective_applied_mode(
 /// 该序列曾在 startup.rs（apply_startup_config）与 gui/commands.rs
 /// （ReapplyConfig 电源重设）各自实现过，存在漂移风险——统一收敛到此处后，
 /// 任何一处修改写序/降级规则都会同时作用于全部路径。调用方仍自行决定
-/// 写入成功后的配置回写与错误展示。
-pub fn apply_config_to_hardware(backend: &dyn EcBackend, config: &AppConfig) -> ApplyOutcome {
+/// 写入成功后的配置回写与错误展示。`status` 由调用方经 `PowerSource` 端口
+/// 取得后传入（领域层不直接查询 Windows 电源 API）。
+pub fn apply_config_to_hardware(
+    backend: &dyn EcBackend,
+    config: &AppConfig,
+    status: crate::app::power::PowerStatus,
+) -> ApplyOutcome {
     let bat = apply_battery_state(
         backend,
         config.battery_care_enabled,
         config.battery_charge_limit,
     );
-    let status = crate::platform::power::power_status();
     let (raw, adjusted) = effective_applied_mode(
         config.performance_mode,
         config.auto_switch_to_quiet_on_battery,
@@ -288,8 +349,9 @@ pub fn apply_config_to_hardware(backend: &dyn EcBackend, config: &AppConfig) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::performance::PerfMode;
+    use crate::app::power::PowerStatus;
     use crate::ec::mock::MockBackend;
-    use crate::ec::performance::PerfMode;
     use std::sync::atomic::Ordering;
 
     /// 养护开启 + 上限 100%（矛盾组合）：必须兜底写 80% 并读回。
@@ -351,6 +413,86 @@ mod tests {
             "must keep the written value"
         );
         assert!(outcome.care.is_ok());
+    }
+
+    /// 回归测试（修订 1.46 审计）：读回值 >100 不得被钳成 Ok(100)——真实后端
+    /// 与 mock 都把垃圾读回判为 Err，这里是**纵深防御**：若未来某后端越界返回
+    /// Ok(>100)，历史 `actual.min(100)` 会把它静默伪装成"成功写了 100%"（GUI
+    /// 按 care=false 持久化、下次启动强制写 100% 摧毁用户养护设置）。正确行为
+    /// 与"读回失败"同路径：保留**写入值**（coherent 后，如 60）而非垃圾值。
+    /// 用内联后端模拟"写入成功但读回 0xFF=255"的损坏寄存器。
+    #[test]
+    fn test_apply_battery_state_rejects_readback_above_100() {
+        struct GarbageReadback;
+        impl crate::app::ec::EcBackend for GarbageReadback {
+            fn name(&self) -> &'static str {
+                "garbage-readback"
+            }
+            fn get_battery_care_enabled(&self) -> Result<bool, EcError> {
+                Ok(false)
+            }
+            fn get_charge_limit(&self) -> Result<u8, EcError> {
+                Ok(255)
+            }
+            fn set_battery_care(&self, _enabled: bool) -> Result<(), EcError> {
+                Ok(())
+            }
+            fn set_charge_limit(&self, _percent: u8) -> Result<(), EcError> {
+                Ok(())
+            }
+            fn get_performance_mode(&self) -> Result<u8, EcError> {
+                Ok(PerfMode::Smart.ec_value())
+            }
+            fn set_performance_mode(&self, _mode: u8) -> Result<(), EcError> {
+                Ok(())
+            }
+        }
+        let outcome = apply_battery_state(&GarbageReadback, true, 60);
+        // 垃圾读回与"读回失败"同路径：保留写入值（60），绝不返回垃圾 100。
+        assert!(
+            matches!(outcome.charge_limit, Ok(60)),
+            "garbage readback (>100) must keep the written value, got {:?}",
+            outcome.charge_limit
+        );
+    }
+
+    /// 回归测试（修订 1.47 审计）：读回值 **0** 同样必须判为垃圾并保留写入值
+    /// ——历史实现只拒绝 >100，损坏的 0 会被当作"合法 0%"走 Ok(0)，调用方
+    /// 按 care=true + limit=0 持久化，后续任何保存路径都会把这个荒谬组合
+    /// 写进磁盘。与 `>100` 同路径：Err → 保留写入值（coherent 后，如 60）。
+    /// 用内联后端模拟"写入成功但读回 0x00"的损坏寄存器。
+    #[test]
+    fn test_apply_battery_state_rejects_readback_zero() {
+        struct ZeroReadback;
+        impl crate::app::ec::EcBackend for ZeroReadback {
+            fn name(&self) -> &'static str {
+                "zero-readback"
+            }
+            fn get_battery_care_enabled(&self) -> Result<bool, EcError> {
+                Ok(false)
+            }
+            fn get_charge_limit(&self) -> Result<u8, EcError> {
+                Ok(0)
+            }
+            fn set_battery_care(&self, _enabled: bool) -> Result<(), EcError> {
+                Ok(())
+            }
+            fn set_charge_limit(&self, _percent: u8) -> Result<(), EcError> {
+                Ok(())
+            }
+            fn get_performance_mode(&self) -> Result<u8, EcError> {
+                Ok(PerfMode::Smart.ec_value())
+            }
+            fn set_performance_mode(&self, _mode: u8) -> Result<(), EcError> {
+                Ok(())
+            }
+        }
+        let outcome = apply_battery_state(&ZeroReadback, true, 60);
+        assert!(
+            matches!(outcome.charge_limit, Ok(60)),
+            "zero readback must keep the written value, got {:?}",
+            outcome.charge_limit
+        );
     }
 
     /// 写入前校验：0 必须拒绝（读回契约把 0 判为非法，写入 0 会被静默
@@ -493,7 +635,7 @@ mod tests {
             performance_mode: 0x09,
             ..Default::default()
         };
-        let outcome = apply_config_to_hardware(&backend, &config);
+        let outcome = apply_config_to_hardware(&backend, &config, PowerStatus::OnAc);
         assert!(outcome.battery.charge_limit.is_ok());
         assert!(outcome.battery.care.is_ok());
         assert!(outcome.perf.is_ok());
@@ -516,7 +658,7 @@ mod tests {
             set_perf_fails: true,
             ..Default::default()
         };
-        let outcome = apply_config_to_hardware(&backend, &AppConfig::default());
+        let outcome = apply_config_to_hardware(&backend, &AppConfig::default(), PowerStatus::OnAc);
         assert!(outcome.perf.is_err());
         assert!(
             outcome.battery.charge_limit.is_ok(),
@@ -533,7 +675,7 @@ mod tests {
             battery_charge_limit: 85,
             ..Default::default()
         };
-        let outcome = apply_config_to_hardware(&backend, &config);
+        let outcome = apply_config_to_hardware(&backend, &config, PowerStatus::OnAc);
         assert_eq!(outcome.battery.charge_limit.unwrap(), 80);
     }
 
@@ -541,7 +683,7 @@ mod tests {
     /// 保持用户模式；关闭 + 电池 → 保持用户模式。
     #[test]
     fn test_effective_applied_mode_auto_quiet_on_battery() {
-        use crate::platform::power::PowerStatus;
+        use crate::app::power::PowerStatus;
         let smart = PerfMode::Smart.ec_value();
         // 开启 + 电池：切节能（与用户选择不同）。
         let (raw, adjusted) = effective_applied_mode(smart, true, PowerStatus::OnBattery);
@@ -561,7 +703,7 @@ mod tests {
     /// 关闭时狂暴在电池下降级为极速（既有规则不变）。
     #[test]
     fn test_effective_applied_mode_auto_quiet_interacts_with_extreme() {
-        use crate::platform::power::PowerStatus;
+        use crate::app::power::PowerStatus;
         let extreme = PerfMode::Extreme.ec_value();
         let (raw, adjusted) = effective_applied_mode(extreme, true, PowerStatus::OnBattery);
         assert_eq!(raw, PerfMode::Eco.ec_value());
@@ -574,7 +716,7 @@ mod tests {
     /// 未知电源状态不静默降级（平台层约定）：按用户选择原样写入。
     #[test]
     fn test_effective_applied_mode_unknown_keeps_user_mode() {
-        use crate::platform::power::PowerStatus;
+        use crate::app::power::PowerStatus;
         let extreme = PerfMode::Extreme.ec_value();
         let (raw, adjusted) = effective_applied_mode(extreme, false, PowerStatus::Unknown);
         assert_eq!(raw, extreme);

@@ -1,17 +1,13 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-use crate::ec::fnkey::{default_bindings, FnKeyBinding};
-use crate::ec::limits::{coherent_charge_limit, DEFAULT_CHARGE_LIMIT, FALLBACK_CARE_LIMIT};
-use crate::ec::performance::PerfMode;
+use crate::app::fnkey::{default_bindings, FnKeyBinding};
+use crate::app::limits::{coherent_charge_limit, DEFAULT_CHARGE_LIMIT, FULL_CHARGE_LIMIT};
+use crate::app::performance::PerfMode;
 
-#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
-pub enum BackendPreference {
-    #[default]
-    Auto,
-    WinRing0,
-    Wmi,
-}
+/// 后端偏好的类型定义见 `app::ec`（硬件访问端口模块）；此处保持历史导入
+/// 路径 `app::config::BackendPreference` 可用，同时避免重复定义。
+pub use crate::app::ec::BackendPreference;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -25,6 +21,8 @@ pub struct AppConfig {
     /// 电池供电时自动切换到指定性能模式（节能）。`false` 保持用户所选模式
     /// （狂暴在电池下仍按既有规则降级为极速）。
     pub auto_switch_to_quiet_on_battery: bool,
+    /// 充电达到养护上限时弹托盘通知（默认关闭，可选项——部分用户不想被打扰）。
+    pub notify_on_charge_limit: bool,
     pub backend: BackendPreference,
     /// Fn 功能键绑定表（默认 Fn+K → 循环切换性能模式）。
     #[serde(default = "default_bindings")]
@@ -42,6 +40,8 @@ impl Default for AppConfig {
             auto_start_on_boot: false,
             // 电池自动切换节能：默认关闭（保持用户所选模式）。
             auto_switch_to_quiet_on_battery: false,
+            // 充电到上限通知：默认关闭（可选功能，不主动打扰）。
+            notify_on_charge_limit: false,
             // 默认使用 WMI 后端（本机 2025 RedmiBook Pro 14 实测可用；
             // Auto 模式同样 WMI 优先）。
             backend: BackendPreference::Wmi,
@@ -179,11 +179,26 @@ impl ConfigStore {
         // 被撕裂（下轮启动解析失败回退默认）。唯一名 + 原子 rename 保证目标
         // 文件永远是某一次完整写入的产物。清理：write/rename 失败时删除
         // 本次残留的临时文件。
+        //
+        // **落盘前 fsync**（修订 1.36）：`fs::write` 只关闭句柄，不保证数据
+        // 块先于目录项 rename 落盘——断电/强杀时可能出现"config.toml 目录项
+        // 已更新而数据块未写"的 0 长度/撕裂文件，下轮启动解析失败回退
+        // degraded_defaults()，用户设置（充电上限/性能模式）静默失效。写后
+        // `sync_all` 确保数据与元数据刷盘后再 rename。注：Windows NTFS 的
+        // rename 原子性由文件系统日志保证，目录项本身的持久化不需要额外
+        // 目录句柄 fsync（与 POSIX 语义不同），此处已覆盖本平台可实现性。
         let path = self.path();
         static SAVE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let seq = SAVE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp_path = path.with_extension(format!("toml.{}.{}.tmp", std::process::id(), seq));
-        if let Err(e) = std::fs::write(&tmp_path, &s) {
+        let write_result = (|| -> std::io::Result<()> {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp_path)?;
+            f.write_all(s.as_bytes())?;
+            f.sync_all()?;
+            Ok(())
+        })();
+        if let Err(e) = write_result {
             let _ = std::fs::remove_file(&tmp_path);
             return Err(e.to_string());
         }
@@ -236,25 +251,38 @@ impl AppConfig {
             );
             self.performance_mode = PerfMode::Smart.ec_value();
         }
+        // `orig_limit` 记录**消毒前**的原始值（修订 1.46 审计）：随后 0 归一 /
+        // >100 钳制会改写 `self.battery_charge_limit`，矛盾的 200% 组合若在
+        // 钳制后才记录会误报 "100%"，与钳制告警的 "200%" 对不上、两条日志
+        // 无法串联出完整事实。必须在任何改写之前捕获。
+        let orig_limit = self.battery_charge_limit;
         if self.battery_charge_limit == 0 {
-            log::warn!("Config: charge limit 0 is invalid; using default 80%");
+            log::warn!(
+                "Config: charge limit 0 is invalid; using default {}%",
+                DEFAULT_CHARGE_LIMIT
+            );
             self.battery_charge_limit = DEFAULT_CHARGE_LIMIT;
-        } else if self.battery_charge_limit > 100 {
+        } else if self.battery_charge_limit > FULL_CHARGE_LIMIT {
             log::warn!(
                 "Config: charge limit {}% out of range; clamping to 100%",
                 self.battery_charge_limit
             );
-            self.battery_charge_limit = 100;
+            self.battery_charge_limit = FULL_CHARGE_LIMIT;
         }
-        if self.battery_care_enabled && self.battery_charge_limit >= 100 {
-            log::warn!(
-                "Config: battery care on with limit {}% (incoherent); using {}%",
-                self.battery_charge_limit,
-                FALLBACK_CARE_LIMIT
-            );
-        }
+        // 养护开启但上限 ≥100（矛盾组合）：与 coherent_charge_limit 的
+        // 兜底共用同一份规则，诊断由一次 warn 覆盖。0 的兜底已在上面单独
+        // 告警（"charge limit 0 is invalid"）并归一为 80——此处只负责 ≥100
+        // 的矛盾组合。记录的是消毒前原始值（orig_limit），见上。
+        let before_limit = self.battery_charge_limit;
         self.battery_charge_limit =
             coherent_charge_limit(self.battery_care_enabled, self.battery_charge_limit);
+        if self.battery_care_enabled && before_limit >= 100 {
+            log::warn!(
+                "Config: battery care on with limit {}% (incoherent); using {}%",
+                orig_limit,
+                self.battery_charge_limit
+            );
+        }
 
         // Fn 绑定消毒：丢弃空类/空前缀的条目（手改配置可能留下残缺绑定；
         // 前缀为空时匹配一切事件，属于危险配置，宁可丢弃）。前缀必须是
@@ -262,12 +290,22 @@ impl AppConfig {
         // 如 "0" 会匹配几乎全部该事件流（各报告大多以 0 开头），等同危险
         // 配置；类名必须是合法 WQL 标识符（防 WQL 注入，修订 1.32/M2）。
         // 绑定动作由 serde 枚举保证合法（未知枚举名直接解析失败走降级配置）。
+        //
+        // **类名规范化**（修订 1.47 审计）：`valid_class` 按 `trim()` 后的
+        // 类名校验，但存储的是原始串——带首尾空白的类名通过校验却永不匹配
+        // WMI 订阅类（监听线程按 trim 前拼 WQL，类不存在被跳过），形成
+        // "校验通过但绑定永死"的静默配置。此处先 trim 再存，保证校验与
+        // 实际使用的是同一个类名。
         let before = std::mem::take(&mut self.fn_key_bindings);
         self.fn_key_bindings = before
             .into_iter()
+            .map(|mut b| {
+                b.class = b.class.trim().to_string();
+                b
+            })
             .filter(|b| {
-                let valid = crate::ec::fnkey::valid_class(&b.class)
-                    && crate::ec::fnkey::valid_prefix(&b.prefix);
+                let valid = crate::app::fnkey::valid_class(&b.class)
+                    && crate::app::fnkey::valid_prefix(&b.prefix);
                 if !valid {
                     log::warn!("Config: dropping invalid fn key binding {:?}", b);
                 }
@@ -309,8 +347,9 @@ mod tests {
             auto_reapply_on_power_change: false,
             auto_start_on_boot: true,
             auto_switch_to_quiet_on_battery: true,
+            notify_on_charge_limit: true,
             backend: BackendPreference::Wmi,
-            fn_key_bindings: crate::ec::fnkey::default_bindings(),
+            fn_key_bindings: crate::app::fnkey::default_bindings(),
         };
         let s = toml::to_string_pretty(&cfg).expect("serialize");
         let deserialized: AppConfig = toml::from_str(&s).expect("deserialize");
@@ -602,22 +641,22 @@ mod tests {
     fn test_sanitize_drops_invalid_fn_bindings() {
         let mut cfg = AppConfig {
             fn_key_bindings: vec![
-                crate::ec::fnkey::FnKeyBinding {
+                crate::app::fnkey::FnKeyBinding {
                     class: "".into(),
                     prefix: "012801".into(),
-                    action: crate::ec::fnkey::FnAction::CyclePerfMode,
+                    action: crate::app::fnkey::FnAction::CyclePerfMode,
                     command: None,
                 },
-                crate::ec::fnkey::FnKeyBinding {
+                crate::app::fnkey::FnKeyBinding {
                     class: "HID_EVENT20".into(),
                     prefix: "   ".into(),
-                    action: crate::ec::fnkey::FnAction::None,
+                    action: crate::app::fnkey::FnAction::None,
                     command: None,
                 },
-                crate::ec::fnkey::FnKeyBinding {
+                crate::app::fnkey::FnKeyBinding {
                     class: "HID_EVENT20".into(),
                     prefix: "0107".into(),
-                    action: crate::ec::fnkey::FnAction::ReapplyConfig,
+                    action: crate::app::fnkey::FnAction::ReapplyConfig,
                     command: None,
                 },
             ],
@@ -636,28 +675,28 @@ mod tests {
     fn test_sanitize_drops_single_digit_prefix_and_bad_class() {
         let mut cfg = AppConfig {
             fn_key_bindings: vec![
-                crate::ec::fnkey::FnKeyBinding {
+                crate::app::fnkey::FnKeyBinding {
                     class: "HID_EVENT20".into(),
                     prefix: "0".into(),
-                    action: crate::ec::fnkey::FnAction::None,
+                    action: crate::app::fnkey::FnAction::None,
                     command: None,
                 },
-                crate::ec::fnkey::FnKeyBinding {
+                crate::app::fnkey::FnKeyBinding {
                     class: "HID_EVENT20 WHERE Foo=1".into(),
                     prefix: "012801".into(),
-                    action: crate::ec::fnkey::FnAction::None,
+                    action: crate::app::fnkey::FnAction::None,
                     command: None,
                 },
-                crate::ec::fnkey::FnKeyBinding {
+                crate::app::fnkey::FnKeyBinding {
                     class: "HID_EVENT20".into(),
                     prefix: "012".into(),
-                    action: crate::ec::fnkey::FnAction::None,
+                    action: crate::app::fnkey::FnAction::None,
                     command: None,
                 },
-                crate::ec::fnkey::FnKeyBinding {
+                crate::app::fnkey::FnKeyBinding {
                     class: "HID_EVENT20".into(),
                     prefix: "012801".into(),
-                    action: crate::ec::fnkey::FnAction::ReapplyConfig,
+                    action: crate::app::fnkey::FnAction::ReapplyConfig,
                     command: None,
                 },
             ],

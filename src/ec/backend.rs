@@ -1,68 +1,15 @@
-use super::config::BackendPreference;
-use super::error::EcError;
+//! 后端创建与空后端兜底。
+//!
+//! `EcBackend` trait / `EcError` / `BackendPreference` / `EcBackendFactory`
+//! 定义在 `app::ec`（端口在领域层，适配器在 `ec`）；本文件从那里
+//! 重导出（历史路径 `ec::backend::EcBackend` 等继续可用），并承载：
+//! - `create_backend`：按偏好创建真实后端；
+//! - `NullBackend`：无法创建任何后端时的空兜底；
+//! - `BackendFactory`：`app::ec::EcBackendFactory` 端口在组合根的实现。
 
-pub trait EcBackend: Send + Sync {
-    fn name(&self) -> &'static str;
+use crate::app::config::BackendPreference;
 
-    // ── High-level battery operations ──
-    fn get_battery_care_enabled(&self) -> Result<bool, EcError>;
-    fn get_charge_limit(&self) -> Result<u8, EcError>;
-    fn set_battery_care(&self, enabled: bool) -> Result<(), EcError>;
-    fn set_charge_limit(&self, percent: u8) -> Result<(), EcError>;
-
-    /// 一次调用同时获取电池养护状态与充电上限。
-    ///
-    /// 默认实现分别调用两个 getter；能一次往返同时返回两者的后端
-    /// （如 WMI：养护位与上限来自同一条命令的同一响应字段）应覆写，
-    /// 否则 GUI 每次刷新会多一次完整硬件往返（B-WMI-1）。
-    fn get_battery_state(&self) -> Result<(bool, u8), EcError> {
-        let care = self.get_battery_care_enabled()?;
-        let limit = self.get_charge_limit()?;
-        Ok((care, limit))
-    }
-
-    // ── High-level performance mode operations ──
-    fn get_performance_mode(&self) -> Result<u8, EcError>;
-    fn set_performance_mode(&self, mode: u8) -> Result<(), EcError>;
-
-    /// Whether the backend supports arbitrary (continuous) charge limit values.
-    /// WinRing0 supports 0–100, WMI only supports a fixed set.
-    fn supports_continuous_charge_limit(&self) -> bool {
-        true
-    }
-
-    /// The backend preference this backend corresponds to.
-    ///
-    /// Used to detect "already on this backend" so a switch can be a no-op
-    /// (recreating the same backend would tear down the driver that is in
-    /// active use, see winring0.rs) and to let the GUI reflect the backend
-    /// that is actually running after a fallback.
-    fn preference(&self) -> BackendPreference {
-        BackendPreference::Auto
-    }
-
-    /// Whether this backend is the null placeholder (created when no real
-    /// backend could be initialized).
-    ///
-    /// Callers use this instead of comparing `name()` strings (which is
-    /// fragile — a renamed display name silently breaks the check): when the
-    /// backend is null, the *user's configured* preference is still the
-    /// authoritative one (it will be retried on next startup), while for a
-    /// live backend the actual `preference()` is shown.
-    fn is_null(&self) -> bool {
-        false
-    }
-
-    /// Whether this backend is in a **faulted/latched** state requiring
-    /// recreation to recover (e.g. WMI 应答超时熔断)。
-    ///
-    /// 默认返回 false（WinRing0 无此概念）；WMI 后端在应答超时后熔断返回
-    /// true。调用方（GUI 后端切换）用它绕过"同种后端 no-op"优化：熔断的
-    /// 后端即便偏好未变也必须重建才能恢复（F2）。
-    fn needs_rebuild(&self) -> bool {
-        false
-    }
-}
+pub use crate::app::ec::{EcBackend, EcError};
 
 pub fn create_backend(pref: BackendPreference) -> Result<Box<dyn EcBackend>, EcError> {
     match pref {
@@ -88,6 +35,23 @@ pub fn create_backend(pref: BackendPreference) -> Result<Box<dyn EcBackend>, EcE
                 wmi_err, wr0_err
             )))
         }
+    }
+}
+
+/// `EcBackendFactory` 端口的真实实现：组合根（main.rs）注入给启动编排。
+///
+/// 领域层经 `app::ec::EcBackendFactory` 依赖本工厂，不直接触碰 `ec` 的
+/// 具体后端类型——创建后端、空后端兜底的实现细节被隔离在适配器层。
+#[derive(Debug, Clone, Copy)]
+pub struct BackendFactory;
+
+impl crate::app::ec::EcBackendFactory for BackendFactory {
+    fn create(&self, pref: BackendPreference) -> Result<Box<dyn EcBackend>, EcError> {
+        create_backend(pref)
+    }
+
+    fn null_backend(&self) -> Box<dyn EcBackend> {
+        Box::new(NullBackend)
     }
 }
 
@@ -134,6 +98,7 @@ impl EcBackend for NullBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::ec::EcBackendFactory;
 
     #[test]
     fn test_null_backend_name() {
@@ -171,6 +136,20 @@ mod tests {
     fn test_ec_backend_trait_object_is_send() {
         fn assert_send<T: Send>() {}
         assert_send::<Box<dyn EcBackend>>();
+    }
+
+    #[test]
+    fn test_backend_factory_creates_requested_backend() {
+        let factory = BackendFactory;
+        // 非管理员/非小米机器上创建可能失败，这里只验证「能调用工厂且结果类型正确」。
+        // 类型契约：Ok(Box<dyn EcBackend>)，Err(EcError)。
+        let _: Result<Box<dyn EcBackend>, EcError> = factory.create(BackendPreference::Wmi);
+    }
+
+    #[test]
+    fn test_backend_factory_null_backend_is_null() {
+        let factory = BackendFactory;
+        assert!(factory.null_backend().is_null());
     }
 
     /// 真机集成验证（手动运行，非 CI）：在受支持的小米/红米笔记本上创建
@@ -218,7 +197,7 @@ mod tests {
             // 性能模式必须是已知枚举之一（未定义 raw code 说明固件/驱动
             // 解析异常）；充电上限在 [0,100]，且养护位与限值推导一致。
             assert!(
-                crate::ec::performance::PerfMode::from_ec_value(perf).is_some(),
+                crate::app::performance::PerfMode::from_ec_value(perf).is_some(),
                 "[{}] invalid perf raw code {:#x}",
                 label,
                 perf
@@ -226,7 +205,7 @@ mod tests {
             assert!(limit <= 100, "[{}] invalid charge limit {}", label, limit);
             assert_eq!(
                 care,
-                crate::ec::battery::care_enabled_from_limit(limit),
+                crate::app::battery::care_enabled_from_limit(limit),
                 "[{}] care bit inconsistent with limit {}",
                 label,
                 limit

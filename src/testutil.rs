@@ -1,6 +1,6 @@
 //! 测试共用的临时配置目录工具（仅测试编译）。
 
-use crate::ec::config::ConfigStore;
+use crate::app::config::ConfigStore;
 
 /// 返回指向独立临时目录的 `ConfigStore`。
 ///

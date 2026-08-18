@@ -5,9 +5,10 @@
 //! - `init_backend`：创建/回退后端、应用启动配置、计算实际生效的偏好；
 //! - `apply_startup_config` / `sync_startup_config`：启动应用与硬件读回同步。
 
-use crate::ec::backend::EcBackend;
-use crate::ec::battery::care_enabled_from_limit;
-use crate::ec::config::{AppConfig, BackendPreference, ConfigStore};
+use crate::app::battery::care_enabled_from_limit;
+use crate::app::config::{AppConfig, BackendPreference, ConfigStore};
+use crate::app::ec::{EcBackend, EcBackendFactory};
+use crate::app::power::{PowerSource, PowerStatus};
 
 /// `init_backend` 的完整结果：后端、启动同步后的配置、初始化错误、实际生效偏好。
 pub struct StartupResult {
@@ -39,9 +40,17 @@ fn fallback_preference(pref: BackendPreference) -> Option<BackendPreference> {
 /// 落盘；若不把该副本交还给 GUI，GUI 的 save_state() 会把未同步的旧值
 /// （如 care=true+limit=100、85% 非预设值）重新写回磁盘，覆盖启动时验证过
 /// 的配置，导致磁盘配置反复"复活"矛盾组合。
-pub fn init_backend(store: ConfigStore, mut config: AppConfig) -> StartupResult {
+///
+/// 后端创建与 NullBackend 兜底经 `EcBackendFactory` 端口注入（组合根在
+/// main.rs 提供 `ec::backend::BackendFactory`），本函数不接触 `ec` 实现细节。
+pub fn init_backend(
+    store: ConfigStore,
+    mut config: AppConfig,
+    power: &dyn PowerSource,
+    factory: &dyn EcBackendFactory,
+) -> StartupResult {
     let (backend, mut init_error): (Box<dyn EcBackend>, Option<String>) =
-        match crate::ec::backend::create_backend(config.backend) {
+        match factory.create(config.backend) {
             Ok(b) => {
                 log::info!(
                     "EC backend: {} (preference: {:?})",
@@ -62,7 +71,7 @@ pub fn init_backend(store: ConfigStore, mut config: AppConfig) -> StartupResult 
                             config.backend,
                             pref
                         );
-                        match crate::ec::backend::create_backend(pref) {
+                        match factory.create(pref) {
                             Ok(b) => {
                                 let name = b.name().to_string();
                                 log::info!("Fallback EC backend: {}", name);
@@ -70,31 +79,26 @@ pub fn init_backend(store: ConfigStore, mut config: AppConfig) -> StartupResult 
                             }
                             Err(e) => {
                                 log::error!("Failed to create any EC backend: {}", e);
-                                (
-                                    Box::new(crate::ec::backend::NullBackend),
-                                    Some(e.to_string()),
-                                )
+                                (factory.null_backend(), Some(e.to_string()))
                             }
                         }
                     }
                     None => {
                         log::error!("All EC backends unavailable: {}", primary_err);
-                        (
-                            Box::new(crate::ec::backend::NullBackend),
-                            Some(primary_err.to_string()),
-                        )
+                        (factory.null_backend(), Some(primary_err.to_string()))
                     }
                 }
             }
         };
 
     if config.auto_apply_on_startup {
-        let outcome = apply_startup_config(&*backend, &config);
+        let status = power.snapshot().status;
+        let outcome = apply_startup_config(&*backend, &config, status);
 
         // F-START-04: 自动应用失败的错误除了记录日志，还要在 GUI 中展示。
-        let errors = apply_errors(&outcome);
-        if !errors.is_empty() {
-            let apply_err = format!("启动应用设置失败: {}", errors.join("; "));
+        let apply_err = apply_errors(&outcome);
+        if !apply_err.is_empty() {
+            let apply_err = format!("启动应用设置失败: {}", apply_err);
             init_error = Some(match init_error.take() {
                 Some(e) => format!("{}; {}", e, apply_err),
                 None => apply_err,
@@ -140,25 +144,27 @@ pub fn init_backend(store: ConfigStore, mut config: AppConfig) -> StartupResult 
     }
 }
 
-/// 把一次"整份配置应用到硬件"的结果转成用户可读的失败项（每项一条），
-/// 同时为每项失败写一条启动阶段日志。
+/// 把一次"整份配置应用到硬件"的结果转成用户可读的失败描述（字段级文案以
+/// "; " 连接），同时为每项失败写一条启动阶段日志。
 ///
 /// 与 `gui::commands::reapply_config` 的字段级错误文案不同，这里的条目是无
 /// 上下文前缀的字段级描述（"启动应用设置失败: " 前缀由调用方统一拼接）。
-/// 失败字段的遍历统一收敛在 `ApplyOutcome::field_errors`。
-fn apply_errors(outcome: &crate::ec::battery::ApplyOutcome) -> Vec<String> {
+/// 失败字段的遍历统一收敛在 `ApplyOutcome::field_errors`。仅构建字符串并
+/// 直接返回（历史先收集 Vec 再 join，修订 1.47 清理）。
+fn apply_errors(outcome: &crate::app::battery::ApplyOutcome) -> String {
     let mut errors = Vec::new();
     for (field, e) in outcome.field_errors() {
         log::warn!("Startup apply {} failed: {}", field, e);
         errors.push(format!("{}: {}", field, e));
     }
-    errors
+    errors.join("; ")
 }
 
 fn apply_startup_config(
     backend: &dyn EcBackend,
     config: &AppConfig,
-) -> crate::ec::battery::ApplyOutcome {
+    status: PowerStatus,
+) -> crate::app::battery::ApplyOutcome {
     log::info!(
         "Applying config on startup: care={}, limit={}%, perf={:#x}",
         config.battery_care_enabled,
@@ -171,7 +177,7 @@ fn apply_startup_config(
     // battery::apply_config_to_hardware writes the limit first (some EC
     // firmware auto-syncs the care bit from it) then the care bit, then the
     // perf mode (with AC-power degradation), and returns each result.
-    let desired_limit = crate::ec::limits::coherent_charge_limit(
+    let desired_limit = crate::app::limits::coherent_charge_limit(
         config.battery_care_enabled,
         config.battery_charge_limit,
     );
@@ -179,10 +185,10 @@ fn apply_startup_config(
         log::warn!(
             "Incoherent config: battery care on with limit {}%; using {}%",
             config.battery_charge_limit,
-            crate::ec::limits::FALLBACK_CARE_LIMIT
+            crate::app::limits::FALLBACK_CARE_LIMIT
         );
     }
-    crate::ec::battery::apply_config_to_hardware(backend, config)
+    crate::app::battery::apply_config_to_hardware(backend, config, status)
 }
 
 /// 把启动应用成功后验证过的硬件配置回写进持久化配置，使磁盘配置与硬件
@@ -200,7 +206,7 @@ fn apply_startup_config(
 fn sync_startup_config(
     backend: &dyn EcBackend,
     config: &mut AppConfig,
-    outcome: &crate::ec::battery::ApplyOutcome,
+    outcome: &crate::app::battery::ApplyOutcome,
 ) {
     // 性能模式：仅当写入成功且写入的 raw code 就是用户选择的模式时才回写。
     // 狂暴模式在电池供电时降级为极速（perf_written != performance_mode），
@@ -241,7 +247,7 @@ fn sync_startup_config(
                 Ok(_) => {}
                 Err(e) => log::debug!("Startup sync: care read-back failed: {}", e),
             }
-            crate::ec::battery::sync_config_after_apply(config, *applied);
+            crate::app::battery::sync_config_after_apply(config, *applied);
         }
     } else {
         log::debug!(
@@ -270,7 +276,7 @@ mod tests {
             battery_charge_limit: 80,
             ..Default::default()
         };
-        let outcome = apply_startup_config(&backend, &config);
+        let outcome = apply_startup_config(&backend, &config, PowerStatus::OnBattery);
 
         // 写入结果必须如实反映失败。
         assert!(outcome.battery.charge_limit.is_err());
@@ -305,7 +311,7 @@ mod tests {
             battery_charge_limit: 80,
             ..Default::default()
         };
-        let outcome = apply_startup_config(&backend, &config);
+        let outcome = apply_startup_config(&backend, &config, PowerStatus::OnBattery);
         assert!(outcome.battery.care.is_ok());
         assert!(outcome.battery.charge_limit.is_ok());
         assert_eq!(outcome.battery.charge_limit.as_ref().unwrap(), &80);
@@ -350,7 +356,7 @@ mod tests {
             battery_charge_limit: 85,
             ..Default::default()
         };
-        let outcome = apply_startup_config(&backend, &config);
+        let outcome = apply_startup_config(&backend, &config, PowerStatus::OnBattery);
         assert!(outcome.battery.charge_limit.is_ok() && outcome.battery.care.is_ok());
 
         let mut cfg = config;

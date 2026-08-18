@@ -31,11 +31,37 @@ pub enum UiCommand {
     /// 首次启动时 WMI 服务尚未就绪导致后端回退，延迟恢复探测线程探测到
     /// WMI 可用后把建好的后端交回 GUI（见 XiaomiApp 的 wmi_recover_*）。
     /// GUI 消费时校验用户偏好仍指向 WMI（探测期间手动切换则丢弃）。
-    WmiAvailable(Box<dyn crate::ec::backend::EcBackend>),
+    WmiAvailable(Box<dyn crate::app::ec::EcBackend>),
+    /// 手动后端切换的异步结果（见 gui::commands::try_switch_backend）：
+    /// 创建后端在**后台线程**执行（WMI 握手最长 ~10s，放 GUI 线程会卡帧，
+    /// 与 wmi_recover 的延迟恢复同模式）。`user_pref` 是用户发起切换时的
+    /// 偏好（GUI 消费时校验当前偏好仍等于它，中途改选则丢弃过期结果）。
+    BackendSwitchResult {
+        user_pref: crate::app::ec::BackendPreference,
+        result: Result<Box<dyn crate::app::ec::EcBackend>, String>,
+    },
+    /// 电池健康读数更新（`platform::battery_health` 后台线程上报）：
+    /// 参数为（设计容量 mWh, 当前满充容量 mWh）。满充容量/设计容量来自
+    /// `root\WMI` 的 `BatteryStaticData`/`BatteryFullChargedCapacity`，
+    /// 与 EC 后端无关。
+    BatteryHealthUpdated {
+        designed_mwh: u32,
+        full_mwh: u32,
+    },
+    /// 电池充放电状态更新（同一后台线程，修订 1.37）：用于预计剩余/充满
+    /// 时长。参数为（剩余容量 mWh, 充电速率 mW, 放电速率 mW, 是否充电,
+    /// 是否放电），来自 `root\WMI` 的 `BatteryStatus`。
+    BatteryEtaUpdated {
+        remaining_mwh: u32,
+        charge_rate_mw: u32,
+        discharge_rate_mw: u32,
+        charging: bool,
+        discharging: bool,
+    },
     /// 退出应用：由托盘"退出"菜单发起。GUI 收到后通过
     /// `ViewportCommand::Close` 请求 eframe 正常退出事件循环，
     /// 从而运行各组件 `Drop`（WinRing0 后端 DeinitializeOls 等）。
-    /// 不能靠直接向主窗口 `PostMessage(WM_QUIT)`：winio 事件循环
+    /// 不能靠直接向主窗口 `PostMessage(WM_QUIT)`：winit 事件循环
     /// 只处理自己派发的消息，外部 WM_QUIT 不触发 `run_native` 返回，
     /// 进程只能靠托盘 worker 的 15s 兜底 `process::exit` 强杀，
     /// 跳过所有清理（实测，修订 1.21）。
@@ -65,6 +91,36 @@ impl std::fmt::Debug for UiCommand {
             }
             // 后端实例不展示内容（无 Debug），只标记命令类型。
             Self::WmiAvailable(_) => f.write_str("WmiAvailable(_)"),
+            Self::BackendSwitchResult { user_pref, result } => {
+                write!(
+                    f,
+                    "BackendSwitchResult {{ user_pref: {:?}, result: {} }}",
+                    user_pref,
+                    match result {
+                        Ok(_) => "Ok(_)".to_string(),
+                        Err(e) => format!("Err({})", e),
+                    }
+                )
+            }
+            Self::BatteryHealthUpdated {
+                designed_mwh,
+                full_mwh,
+            } => write!(
+                f,
+                "BatteryHealthUpdated {{ designed_mwh: {}, full_mwh: {} }}",
+                designed_mwh, full_mwh
+            ),
+            Self::BatteryEtaUpdated {
+                remaining_mwh,
+                charge_rate_mw,
+                discharge_rate_mw,
+                charging,
+                discharging,
+            } => write!(
+                f,
+                "BatteryEtaUpdated {{ remaining_mwh: {}, charge_rate_mw: {}, discharge_rate_mw: {}, charging: {}, discharging: {} }}",
+                remaining_mwh, charge_rate_mw, discharge_rate_mw, charging, discharging
+            ),
             Self::Quit => f.write_str("Quit"),
         }
     }

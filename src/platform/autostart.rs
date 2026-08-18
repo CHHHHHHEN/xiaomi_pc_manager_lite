@@ -1,6 +1,5 @@
 use windows::core::{Interface, BSTR};
 use windows::Win32::Foundation::{VARIANT_FALSE, VARIANT_TRUE};
-use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 use windows::Win32::System::TaskScheduler::*;
 use windows::Win32::System::Variant::VARIANT;
 
@@ -39,27 +38,9 @@ const HRESULT_TASK_NOT_FOUND: i32 = -2147024894; // 0x80070002
 /// 该线程的 COM 公寓引用计数随之无界增长；且与 fnkey.rs 明确写下的
 /// "init 与 uninit 严格配对"约定矛盾（见其 run_watcher_once 注释）。配对后
 /// 每次操作引用计数回到 0，下轮操作重新初始化，行为确定。
-struct ComScope;
-
-impl ComScope {
-    /// 在本线程初始化 MTA 公寓（操作期间持有，Drop 时归零）。
-    fn init() -> Result<Self, String> {
-        unsafe {
-            CoInitializeEx(None, COINIT_MULTITHREADED)
-                .ok()
-                .map_err(|e| format!("CoInitializeEx: {}", e))?;
-        }
-        Ok(Self)
-    }
-}
-
-impl Drop for ComScope {
-    fn drop(&mut self) {
-        unsafe {
-            CoUninitialize();
-        }
-    }
-}
+///
+/// 与 battery_health 共用 `ec::wmi_util::ComScope`（修订 1.46 审计收敛）。
+type ComScope = crate::wmi_util::ComScope;
 
 fn task_service() -> Result<ITaskService, String> {
     // COM 已由调用方操作入口（task_state / enable / disable）的 ComScope
@@ -116,6 +97,65 @@ fn bstr_to_string(b: &BSTR) -> String {
     String::from_utf16_lossy(&b[..])
 }
 
+/// 从 Task Scheduler 任务 XML 中提取首个 `<tag>...</tag>` 的文本内容。
+///
+/// 用途：F-AUTO-09 校验任务动作（`<Exec><Command>路径</Command>
+/// <Arguments>--autostart</Arguments></Exec>`）时，`IActionCollection::get_Item`
+/// 在 windows-rs 0.62 中生成的包装是坏的（把 `VARIANT` 参数误标为 `i32`，
+/// 本机实测恒返回 0x80070057/0x80004005），改从任务定义 XML（
+/// `ITaskDefinition::XmlText`，纯 BSTR 读取无 ABI 问题）解析。
+///
+/// 支持 XML 转义还原（`&amp; &lt; &gt; &quot; &apos;`）与 CDATA 包裹；自闭合
+/// 标签（`<tag />`）或缺失返回 None。
+fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{}>", tag);
+    let close = format!("</{}>", tag);
+    let start = xml.find(&open)? + open.len();
+    let rest = xml.get(start..)?;
+    let end = rest.find(&close)?;
+    let raw = rest.get(..end)?.trim();
+    // CDATA 包裹：`<![CDATA[内容]]>`，内容原样（内部不做实体转义）。
+    if let Some(inner) = raw
+        .strip_prefix("<![CDATA[")
+        .and_then(|r| r.strip_suffix("]]>"))
+    {
+        return Some(inner.to_string());
+    }
+    let mut out = String::with_capacity(raw.len());
+    let mut iter = raw.chars().peekable();
+    while let Some(c) = iter.next() {
+        if c != '&' {
+            out.push(c);
+            continue;
+        }
+        // 读实体（到分号为止；上限防异常长输入）。
+        let mut ent = String::from("&");
+        for c2 in iter.by_ref() {
+            ent.push(c2);
+            if c2 == ';' {
+                break;
+            }
+            if ent.len() > 12 {
+                break;
+            }
+        }
+        let replaced = match ent.as_str() {
+            "&amp;" => Some('&'),
+            "&lt;" => Some('<'),
+            "&gt;" => Some('>'),
+            "&quot;" => Some('"'),
+            "&apos;" => Some('\''),
+            _ => None,
+        };
+        if let Some(r) = replaced {
+            out.push(r);
+        } else {
+            out.push_str(&ent);
+        }
+    }
+    Some(out)
+}
+
 /// 校验已注册任务是否符合当前预期（F-AUTO-09）：
 /// - 运行级别为最高权限（TASK_RUNLEVEL_HIGHEST）——旧版本注册的任务用
 ///   默认级别（LUA，非管理员）运行，启动时 `elevate_self()` 会在每次登录
@@ -146,50 +186,37 @@ fn task_matches(task: &IRegisteredTask) -> Result<bool, String> {
     }
 
     // 首个动作必须是 `<exe> --autostart`。
-    let actions = unsafe { def.Actions().map_err(|e| format!("Actions: {}", e))? };
-    let mut count = 0i32;
+    //
+    // 读取方式：任务定义 XML（`ITaskDefinition::XmlText`），而非
+    // `IActionCollection::get_Item`——后者在 windows-rs 0.62 生成的包装是
+    // **坏的**（把 COM 的 `VARIANT` 参数误标为 `i32`，本机实测每次调用
+    // 恒返回 E_INVALIDARG(0x80070057)/E_FAIL(0x80004005)，且因 ABI 不符
+    // 直接 AV）。该 bug 使 F-AUTO-09 的路径校验静默失效、并在每次启动时
+    // 刷一条 `autostart sync` 告警。XML 走纯 BSTR 获取（无 ABI 问题），
+    // `<Exec><Command>/<Arguments>` 是 Task Scheduler 的稳定结构。
+    let mut xml = BSTR::new();
     unsafe {
-        actions
-            .Count(&mut count)
-            .map_err(|e| format!("Actions::Count: {}", e))?;
+        def.XmlText(&mut xml)
+            .map_err(|e| format!("ITaskDefinition::XmlText: {}", e))?;
     }
-    if count < 1 {
-        log::warn!("Autostart task has no actions; needs rebase");
-        return Ok(false);
-    }
-    let action = unsafe {
-        actions
-            .get_Item(0)
-            .map_err(|e| format!("Actions::get_Item: {}", e))?
-    };
-    let exec: IExecAction = action
-        .cast()
-        .map_err(|e| format!("action to IExecAction: {}", e))?;
-    let mut path = BSTR::new();
-    let mut args = BSTR::new();
-    unsafe {
-        exec.Path(&mut path)
-            .map_err(|e| format!("IExecAction::Path: {}", e))?;
-        exec.Arguments(&mut args)
-            .map_err(|e| format!("IExecAction::Arguments: {}", e))?;
-    }
+    let xml_text = bstr_to_string(&xml);
+    let action_command = extract_xml_tag(&xml_text, "Command");
+    let action_args = extract_xml_tag(&xml_text, "Arguments");
     let exe = std::env::current_exe()
         .map_err(|e| format!("current_exe: {}", e))?
         .to_string_lossy()
         .to_string();
-    let path_matches = bstr_to_string(&path).eq_ignore_ascii_case(&exe);
-    let args_match = bstr_to_string(&args) == "--autostart";
-    if !path_matches {
+    let path_matches = match &action_command {
+        Some(p) => p.eq_ignore_ascii_case(&exe),
+        None => false,
+    };
+    let args_match = action_args.as_deref() == Some("--autostart");
+    if !path_matches || !args_match {
         log::warn!(
-            "Autostart task path '{}' != current exe '{}'",
-            bstr_to_string(&path),
+            "Autostart task action mismatch (command={:?}, args={:?}, current exe='{}'); needs rebase",
+            action_command,
+            action_args,
             exe
-        );
-    }
-    if !args_match {
-        log::warn!(
-            "Autostart task args '{}' != '--autostart'",
-            bstr_to_string(&args)
         );
     }
 
@@ -235,10 +262,13 @@ fn task_matches(task: &IRegisteredTask) -> Result<bool, String> {
 /// 登录触发 + 当前用户交互令牌，普通权限即可注册（无需管理员）。
 pub fn enable() -> Result<(), String> {
     let _com = ComScope::init()?;
-    let exe = std::env::current_exe()
-        .map_err(|e| format!("current_exe: {}", e))?
-        .to_string_lossy()
-        .to_string();
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {}", e))?;
+    // 路径经 OsStr → UTF-16 直构（不经 to_string_lossy）：注册进计划任务的
+    // 必须是真实 Windows 路径——lossy 会把非 UTF-8 的 UTF-16 路径替换成
+    // U+FFFD，任务启动时执行错误路径而静默失败（修订 1.46 安全加固，与
+    // util::WideString::from_os_str 同源问题）。
+    let exe_wide = crate::util::WideString::from_os_str(exe.as_os_str());
+    let exe_bstr = windows::core::BSTR::from_wide(exe_wide.units_no_nul());
 
     let service = task_service()?;
     let folder = task_folder(&service)?;
@@ -293,7 +323,7 @@ pub fn enable() -> Result<(), String> {
         let exec: IExecAction = action
             .cast()
             .map_err(|e| format!("action to IExecAction: {}", e))?;
-        exec.SetPath(&BSTR::from(&exe))
+        exec.SetPath(&exe_bstr)
             .map_err(|e| format!("SetPath: {}", e))?;
         exec.SetArguments(&BSTR::from("--autostart"))
             .map_err(|e| format!("SetArguments: {}", e))?;
@@ -334,7 +364,7 @@ pub fn enable() -> Result<(), String> {
     log::info!(
         "Autostart task '{}' registered ({} --autostart)",
         TASK_NAME,
-        exe
+        exe.display()
     );
     Ok(())
 }
@@ -431,13 +461,104 @@ mod tests {
         assert_eq!(HRESULT_TASK_NOT_FOUND as u32, 0x8007_0002);
     }
 
+    /// 从任务 XML 提取 `<Command>`/`<Arguments>` 的单元测试。
+    #[test]
+    fn test_extract_xml_tag_basic() {
+        // Task Scheduler 生成 XML 的典型结构（含缩进与首行编码声明）。
+        let xml = r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task>
+  <Actions Context="Author">
+    <Exec>
+      <Command>D:\SavedFiles\Tools\MiPcManagerLite\xiaomi-pc-manager-lite.exe</Command>
+      <Arguments>--autostart</Arguments>
+    </Exec>
+  </Actions>
+</Task>"#;
+        assert_eq!(
+            extract_xml_tag(xml, "Command").as_deref(),
+            Some(r"D:\SavedFiles\Tools\MiPcManagerLite\xiaomi-pc-manager-lite.exe")
+        );
+        assert_eq!(
+            extract_xml_tag(xml, "Arguments").as_deref(),
+            Some("--autostart")
+        );
+        // 缺失标签 → None。
+        assert_eq!(extract_xml_tag(xml, "Missing"), None);
+    }
+
+    /// XML 实体转义还原（路径含 `&`/`<`/`"` 等字符时的 Task Scheduler 输出）。
+    #[test]
+    fn test_extract_xml_tag_unescape() {
+        let xml = r#"<Task><Exec><Command>C:\a&amp;b\&lt;x&gt;.exe</Command><Arguments>&quot;--flag&quot;</Arguments></Exec></Task>"#;
+        assert_eq!(
+            extract_xml_tag(xml, "Command").as_deref(),
+            Some(r"C:\a&b\<x>.exe")
+        );
+        assert_eq!(
+            extract_xml_tag(xml, "Arguments").as_deref(),
+            Some("\"--flag\"")
+        );
+    }
+
+    /// CDATA 包裹（部分系统把命令写进 CDATA）。
+    #[test]
+    fn test_extract_xml_tag_cdata() {
+        let xml = r#"<Exec><Command><![CDATA[D:\my path\app.exe]]></Command></Exec>"#;
+        assert_eq!(
+            extract_xml_tag(xml, "Command").as_deref(),
+            Some("D:\\my path\\app.exe")
+        );
+    }
+
+    /// 自闭合标签（`<Arguments />` 表示空参数）→ None。
+    #[test]
+    fn test_extract_xml_tag_self_closing() {
+        let xml = "<Exec><Command>app.exe</Command><Arguments /></Exec>";
+        assert_eq!(extract_xml_tag(xml, "Arguments"), None);
+    }
+
+    /// 真机验证（手动运行，非 CI）：`task_matches` 现在经任务定义 XML 读取
+    /// 首个动作——本机任务路径与当前 exe 不同（开发路径 vs 部署路径），应
+    /// 返回 `Ok(false)`（触发按 F-AUTO-09 重建），且**不再**因
+    /// `IActionCollection::get_Item` 的 windows-rs 包装 bug 返回 Err。
+    /// 运行：`XIAOMI_LIVE_TASKSCHEDULER_TEST=1 cargo test -- --ignored
+    /// task_matches_live_no_error`。
+    #[test]
+    #[ignore = "live Task Scheduler verification"]
+    fn task_matches_live_no_error() {
+        if std::env::var_os("XIAOMI_LIVE_TASKSCHEDULER_TEST").is_none() {
+            eprintln!("skipping (set XIAOMI_LIVE_TASKSCHEDULER_TEST=1 to run)");
+            return;
+        }
+        let _ = env_logger::builder().is_test(true).try_init();
+        let _com = ComScope::init().expect("com init");
+        let Some(task) = task_state().expect("task_state") else {
+            eprintln!("task not found; skipping");
+            return;
+        };
+        // 关键断言：不再把 get_Item 的 0x80070057 作为错误传播（旧代码每次
+        // 启动都会刷 `autostart sync: Actions::get_Item` 告警并使 F-AUTO-09
+        // 失效）。返回值是"是否与当前 exe 匹配"的布尔，读取路径必须 Ok。
+        match task_matches(&task) {
+            Ok(_) => {}
+            Err(e) => panic!(
+                "task_matches returned Err (get_Item bug regression?): {}",
+                e
+            ),
+        }
+    }
+
     /// 真实环境验证（本机）：注册任务 → 查询存在 → 删除。
     /// 任务注册无需管理员（交互令牌、非最高权限）。
     ///
     /// **破坏性**：`disable()` 会删除机器上已存在的同名任务——若开发者
     /// 实际启用了开机自启动，`cargo test` 会静默删除其真实任务。必须显式
-    /// 设置 `XIAOMI_LIVE_TASKSCHEDULER_TEST=1` 才运行，默认跳过。
+    /// 设置 `XIAOMI_LIVE_TASKSCHEDULER_TEST=1` 且传入 `-- --ignored` 才运行。
+    /// 标记 `#[ignore]` 与同模块的 `task_matches_live_no_error` 一致：仅靠
+    /// env 门控不够——开发 shell 若恰好导出该变量，普通 `cargo test` 会静默
+    /// 删除真实任务（修订 1.47 审计）。
     #[test]
+    #[ignore = "destructive live Task Scheduler roundtrip"]
     fn test_enable_exists_disable_roundtrip() {
         if std::env::var_os("XIAOMI_LIVE_TASKSCHEDULER_TEST").is_none() {
             eprintln!(

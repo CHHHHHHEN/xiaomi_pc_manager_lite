@@ -1,17 +1,17 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod command;
+mod app;
 mod ec;
 mod embed;
 mod gui;
 mod platform;
-mod startup;
 #[cfg(test)]
 mod testutil;
 mod tray;
 mod util;
+mod wmi_util;
 
-use ec::config::ConfigStore;
+use crate::app::config::ConfigStore;
 
 /// 统一的 panic hook：无论构建类型都先把 panic 信息写入应用日志文件。
 /// release 构建无控制台（windows_subsystem = "windows"），默认 panic 输出
@@ -74,6 +74,11 @@ const LOG_ROTATE_BYTES: u64 = 4 * 1024 * 1024;
 
 /// 若日志文件超过阈值，先把它改名 `app.log.1`（覆盖旧的 `.1`），再让
 /// 调用方新建/追加新日志。历史内容保留一份，避免无界增长。
+///
+/// 注意：本函数在 `builder.try_init()` **之前**调用（见 init_logging 的顺序），
+/// 此时 `log::info!` 尚无 logger 会静默丢弃（修复，修订 1.40）——成功路径
+/// 用 `eprintln` 直写 stderr（debug 构建有控制台可见；release 无控制台但
+/// 轮转只是偶发信息，可接受）。
 fn rotate_log_if_large(path: &std::path::Path) {
     let Ok(meta) = std::fs::metadata(path) else {
         return;
@@ -83,7 +88,7 @@ fn rotate_log_if_large(path: &std::path::Path) {
     }
     let rotated = path.with_extension("log.1");
     match std::fs::rename(path, &rotated) {
-        Ok(()) => log::info!("Log rotated: {:?} -> {:?}", path, rotated),
+        Ok(()) => eprintln!("Log rotated: {:?} -> {:?}", path, rotated),
         Err(e) => eprintln!("log rotate {}: {}", path.to_string_lossy(), e),
     }
 }
@@ -100,6 +105,23 @@ fn register_app_user_model_id() {
     } {
         Ok(()) => log::debug!("AppUserModelID registered: XiaomiPcManagerLite"),
         Err(e) => log::warn!("SetCurrentProcessExplicitAppUserModelID failed: {}", e),
+    }
+}
+
+/// 后端初始化失败时的统一降级结果：NullBackend + 保留用户偏好 + 错误提示。
+///
+/// 线程创建失败与线程内 panic 两条降级路径曾各自构造一份 byte 级相同的
+/// `StartupResult`，统一收敛到此处。`config` 为**最终**配置（已随启动同步
+/// 落盘），须原样交还 GUI 以免下次 save_state 覆盖同步值。
+fn degraded_result(
+    config: &crate::app::config::AppConfig,
+    init_error: String,
+) -> app::startup::StartupResult {
+    app::startup::StartupResult {
+        backend: Box::new(ec::backend::NullBackend),
+        config: config.clone(),
+        init_error: Some(init_error),
+        effective_pref: config.backend,
     }
 }
 
@@ -122,7 +144,7 @@ fn main() {
     // 所有权由下方提权完成后的 acquire() 取得。
     if crate::platform::single_instance::pre_flight() {
         log::info!("Existing instance running; activating its window");
-        crate::platform::window::show_main_window();
+        crate::platform::window::wake_existing_window();
         return;
     }
     log::debug!("Single-instance pre-flight: no conflict; proceeding");
@@ -155,7 +177,7 @@ fn main() {
             // 已有实例在运行：唤醒已有窗口后退出，不重复启动。
             crate::platform::single_instance::SingleInstance::Existing => {
                 log::info!("Another instance is running; activating its window");
-                crate::platform::window::show_main_window();
+                crate::platform::window::wake_existing_window();
                 return;
             }
             // API 异常无法确认冲突（如 CreateMutexW 罕见失败）：按文档契约
@@ -187,11 +209,16 @@ fn main() {
     // 该线程的 COM 由 autostart::sync 的 ComScope 自行初始化/配对回收）。
     {
         let cfg = thread_config.clone();
-        std::thread::spawn(move || {
+        // 与各后台线程共用 util::spawn_guarded（L1 规则）：spawn 失败（OS 线程
+        // 资源耗尽）返回 Err 记录告警，裸 spawn 会 panic 传播到 main 进程无声
+        // 退出。自启动同步是后台辅助任务，失败不影响主流程。
+        if let Err(e) = crate::util::spawn_guarded("autostart-sync", move || {
             if let Err(e) = platform::autostart::sync(cfg.auto_start_on_boot) {
                 log::warn!("autostart sync: {}", e);
             }
-        });
+        }) {
+            log::warn!("autostart sync: failed to spawn sync thread: {}", e);
+        }
     }
     // 返回修改后的 config：启动同步（量化读回、矛盾兜底）发生在该线程的
     // config 副本上并已落盘；若不把该副本交还给 GUI，GUI 的 save_state()
@@ -212,35 +239,42 @@ fn main() {
     // 注意：catch_unwind 是闭包内的**第一条**语句，线程不存在"进入闭包前
     // panic"的窗口，join 只会在闭包整体正常返回后成功；此处对 join 结果
     // 直接 expect（若真发生也属编程错误，此时无后端可用比静默消失更可排查）。
-    let startup_result = std::thread::spawn(move || {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            startup::init_backend(thread_store, thread_config)
-        }))
-    })
-    .join()
-    .expect("EC backend init thread panicked before catch_unwind");
-    let startup::StartupResult {
+    //
+    // **thread::Builder 而非 std::thread::spawn**（与 autostart-sync 等全部
+    // 后台线程一致的 L1 规则）：裸 spawn 在 OS 线程资源耗尽时会在**主线程**
+    // panic——早于闭包内 catch_unwind、且发生在 join 之前，M4 的"优雅降级"
+    // 承诺随之失效（进程无声退出）。Builder 返回 Err 时记录告警并降级为
+    // NullBackend + 错误提示，GUI 照常启动。
+    let spawn_result = std::thread::Builder::new()
+        .name("ec-backend-init".to_string())
+        .spawn(move || {
+            let power = crate::platform::power::WindowsPowerSource;
+            let factory = crate::ec::backend::BackendFactory;
+            crate::util::catch_panic(move || {
+                app::startup::init_backend(thread_store, thread_config, &power, &factory)
+            })
+        });
+    let startup_result: Result<app::startup::StartupResult, String> = match spawn_result {
+        Ok(handle) => handle
+            .join()
+            .expect("EC backend init thread panicked before catch_unwind"),
+        Err(e) => {
+            log::error!("failed to spawn EC backend init thread: {}", e);
+            Err(format!("EC 后端初始化线程创建失败: {}", e))
+        }
+    };
+    let app::startup::StartupResult {
         backend,
         config,
         init_error,
         effective_pref,
     } = match startup_result {
         Ok(result) => result,
-        // 线程内 panic：降级为 NullBackend，让 GUI 正常启动并展示错误。
-        Err(panic) => {
-            let payload = panic
-                .downcast_ref::<&str>()
-                .map(|s| s.to_string())
-                .or_else(|| panic.downcast_ref::<String>().map(|s| s.to_string()))
-                .unwrap_or_else(|| "unknown panic".into());
-            log::error!("EC backend init panicked: {}", payload);
-            let effective_pref = config.backend;
-            startup::StartupResult {
-                backend: Box::new(ec::backend::NullBackend),
-                config,
-                init_error: Some(format!("EC 后端初始化异常: {}", payload)),
-                effective_pref,
-            }
+        // 线程内 panic 或线程创建失败：降级为 NullBackend，让 GUI 正常启动
+        // 并展示错误。
+        Err(payload) => {
+            log::error!("EC backend init failed: {}", payload);
+            degraded_result(&config, payload)
         }
     };
     log::info!(

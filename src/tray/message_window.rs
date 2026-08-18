@@ -71,7 +71,11 @@ pub fn message_loop(hwnd: HWND) {
             log::error!("GetMessageW failed (last error: {:#x})", unsafe {
                 GetLastError().0
             });
-            break;
+            // GetMessageW 错误路径此前直接 break 泄漏 HWND（只有 WM_QUIT 路径
+            // 执行到函数末尾的 DestroyWindow）——两条退出路径都必须显式销毁，
+            // 否则泄漏窗口/用户对象（修订 1.47 审计）。
+            let _ = unsafe { DestroyWindow(hwnd) };
+            return;
         }
         let _ = unsafe { TranslateMessage(&msg) };
         unsafe {

@@ -57,9 +57,17 @@ pub fn elevate_self() -> bool {
         }
     };
     let verb = WideString::new("runas");
-    let path = WideString::new(&exe.to_string_lossy());
+    // 路径直接用 OsStr 构造 UTF-16（不经 to_string_lossy）：
+    // Windows 路径可能是非 UTF-8 的 UTF-16 序列，lossy 会替换成 U+FFFD，
+    // ShellExecuteW 拿到错误路径 → 提权静默失败、本进程继续非管理员运行
+    // （修订 1.46 安全加固，见 util::WideString::from_os_str）。
+    let path = WideString::from_os_str(exe.as_os_str());
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
-    let args_buf = WideString::new(&build_command_line(&args));
+    // 命令行**在整个 UTF-16 域内构建**（不经 String/OsStr lossy 往返）：
+    // 参数可能含未配对代理项（非合法 UTF-8），to_string_lossy 会替换成
+    // U+FFFD——拼进 lpParameters 后提权进程收到被破坏的参数（修订 1.46
+    // 审计，与路径侧同源问题，见 build_command_line）。
+    let args_buf = WideString::from_units(build_command_line(&args));
     let ret = unsafe {
         ShellExecuteW(
             None,
@@ -87,54 +95,66 @@ pub fn elevate_self() -> bool {
     }
 }
 
-/// 将进程参数重建为 Windows 命令行字符串（供 ShellExecuteW 的 lpParameters）。
+/// 将进程参数重建为 Windows 命令行 UTF-16 序列（供 ShellExecuteW 的
+/// lpParameters）。**整个流程保持 UTF-16 域**（修订 1.46 审计）：每个参数经
+/// `encode_wide` 直取原始 UTF-16 单元（含未配对代理项），不再经
+/// `to_string_lossy` 往返——lossy 会把非 UTF-8 的代理项替换成 U+FFFD，
+/// 提权进程收到被破坏的参数。
+///
 /// 不含空格/制表符/引号的参数原样拼接；含这些字符的参数按 MSDN 命令行
 /// 解析规则（CommandLineToArgvW）转义后整体用双引号包裹：
 /// - 引号前的连续反斜杠必须加倍再加一（`\"` 使引号成为字面字符而非闭合符）；
 /// - 参数末尾的连续反斜杠数量必须加倍（否则会转义包裹参数的闭合引号，
 ///   导致 `C:\Program Files\` 这类路径解析错误）。
-fn build_command_line(args: &[std::ffi::OsString]) -> String {
-    fn quote(arg: &str) -> String {
-        let mut out = String::with_capacity(arg.len() + 2);
-        out.push('"');
+///
+/// 返回不含结尾 NUL 的 UTF-16 单元（调用方经 `WideString::from_units` 持有）。
+fn build_command_line(args: &[std::ffi::OsString]) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+
+    /// 单个参数按 CommandLineToArgvW 规则转义为带双引号包裹的 UTF-16。
+    fn quote(arg: &[u16]) -> Vec<u16> {
+        const BACKSLASH: u16 = b'\\' as u16;
+        const QUOTE: u16 = b'"' as u16;
+        let mut out = Vec::with_capacity(arg.len() + 2);
+        out.push(QUOTE);
         let mut backslashes = 0usize;
-        for c in arg.chars() {
+        for &c in arg {
             match c {
-                '\\' => backslashes += 1,
-                '"' => {
-                    for _ in 0..(backslashes * 2 + 1) {
-                        out.push('\\');
-                    }
-                    out.push('"');
+                BACKSLASH => backslashes += 1,
+                QUOTE => {
+                    out.extend(std::iter::repeat_n(BACKSLASH, backslashes * 2 + 1));
+                    out.push(c);
                     backslashes = 0;
                 }
                 _ => {
-                    for _ in 0..backslashes {
-                        out.push('\\');
-                    }
+                    out.extend(std::iter::repeat_n(BACKSLASH, backslashes));
                     out.push(c);
                     backslashes = 0;
                 }
             }
         }
-        // 参数以反斜杠结尾：加倍，避免转义闭合引号。
-        for _ in 0..(backslashes * 2) {
-            out.push('\\');
-        }
-        out.push('"');
+        // 参数以反斜杠结尾：加倍转义，避免闭合引号。
+        out.extend(std::iter::repeat_n(BACKSLASH, backslashes * 2));
+        out.push(QUOTE);
         out
     }
 
-    let mut cmdline = String::new();
+    let mut cmdline = Vec::new();
     for (i, arg) in args.iter().enumerate() {
         if i > 0 {
-            cmdline.push(' ');
+            cmdline.push(b' ' as u16);
         }
-        let s = arg.to_string_lossy();
-        if s.chars().any(|c| c == ' ' || c == '\t' || c == '"') {
-            cmdline.push_str(&quote(&s));
+        let wide: Vec<u16> = arg.encode_wide().collect();
+        // 空参数也必须保留为 `""`（CommandLineToArgvW 语义）：直接 extend
+        // 空片会把它从命令行里静默丢掉，参数个数错位（修订 1.46 审计）。
+        if wide.is_empty()
+            || wide
+                .iter()
+                .any(|&c| c == b' ' as u16 || c == b'\t' as u16 || c == b'"' as u16)
+        {
+            cmdline.extend(quote(&wide));
         } else {
-            cmdline.push_str(&s);
+            cmdline.extend(wide);
         }
     }
     cmdline
@@ -144,10 +164,15 @@ fn build_command_line(args: &[std::ffi::OsString]) -> String {
 mod tests {
     use super::*;
 
+    /// 把 UTF-16 单元还原为 String（测试辅助：期望值都是合法 ASCII/UTF-16）。
+    fn wide_to_string(units: &[u16]) -> String {
+        String::from_utf16_lossy(units)
+    }
+
     #[test]
     fn test_build_command_line_plain_args() {
         let args: Vec<std::ffi::OsString> = vec!["--autostart".into()];
-        assert_eq!(build_command_line(&args), "--autostart");
+        assert_eq!(wide_to_string(&build_command_line(&args)), "--autostart");
     }
 
     #[test]
@@ -159,7 +184,7 @@ mod tests {
             "say \"hi\"".into(),
         ];
         assert_eq!(
-            build_command_line(&args),
+            wide_to_string(&build_command_line(&args)),
             "--param \"has space\" \"tab\there\" \"say \\\"hi\\\"\""
         );
     }
@@ -169,7 +194,10 @@ mod tests {
         // 参数含空格且以反斜杠结尾：末尾反斜杠必须加倍，否则会转义包裹
         // 参数的闭合引号，`CommandLineToArgvW` 解析后参数不完整。
         let args: Vec<std::ffi::OsString> = vec!["C:\\Program Files\\".into()];
-        assert_eq!(build_command_line(&args), "\"C:\\Program Files\\\\\"");
+        assert_eq!(
+            wide_to_string(&build_command_line(&args)),
+            "\"C:\\Program Files\\\\\""
+        );
     }
 
     #[test]
@@ -185,13 +213,54 @@ mod tests {
             ("a\\b\"c\\d", "\"a\\b\\\"c\\d\""),
         ] {
             let args: Vec<std::ffi::OsString> = vec![arg.into()];
-            assert_eq!(build_command_line(&args), expected_cmdline, "arg: {arg}");
+            assert_eq!(
+                wide_to_string(&build_command_line(&args)),
+                expected_cmdline,
+                "arg: {arg}"
+            );
         }
+    }
+
+    /// 非 UTF-8 参数（含未配对代理项，Windows 上 `args_os` 可能产生）必须
+    /// 在 UTF-16 域内原样保留——`to_string_lossy` 会把代理项替换成 U+FFFD，
+    /// 提权进程收到被破坏的参数（修订 1.46 审计）。
+    #[test]
+    fn test_build_command_line_preserves_unpaired_surrogates() {
+        use std::os::windows::ffi::OsStringExt;
+        // 含代理项且**无**空格/引号：不包裹引号，原样输出全部单元
+        // （含未配对代理项 0xD800，不做 U+FFFD 替换）。
+        let args: Vec<std::ffi::OsString> =
+            vec![std::ffi::OsString::from_wide(&[0x44, 0xD800, 0x21])];
+        let wide = build_command_line(&args);
+        assert_eq!(&wide[..], &[0x44, 0xD800, 0x21]);
+        // 含代理项 + 空格：按规则加引号包裹，代理项仍原样保留。
+        let args2: Vec<std::ffi::OsString> =
+            vec![std::ffi::OsString::from_wide(&[0x44, 0xD800, 0x20, 0x21])];
+        let wide2 = build_command_line(&args2);
+        assert_eq!(
+            &wide2[..],
+            &[b'"' as u16, 0x44, 0xD800, 0x20, 0x21, b'"' as u16],
+            "arg with space + surrogate must be quoted without corruption"
+        );
+    }
+
+    /// 空参数必须保留为 `""`（修订 1.46 审计）：`CommandLineToArgvW` 对
+    /// `""` 还原出一个空字符串，对完全缺失的参数则少一个参数——丢弃空参
+    /// 会让参数个数错位。
+    #[test]
+    fn test_build_command_line_preserves_empty_arg() {
+        let args: Vec<std::ffi::OsString> = vec!["--flag".into(), "".into(), "tail".into()];
+        let wide = build_command_line(&args);
+        assert_eq!(
+            wide_to_string(&wide),
+            "--flag \"\" tail",
+            "empty arg must be preserved as \"\""
+        );
     }
 
     #[test]
     fn test_build_command_line_empty() {
-        assert_eq!(build_command_line(&[]), "");
+        assert!(build_command_line(&[]).is_empty());
     }
 
     #[test]

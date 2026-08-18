@@ -8,9 +8,8 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
 
-use crate::ec::backend::EcBackend;
-use crate::ec::config::BackendPreference;
-use crate::ec::error::EcError;
+use crate::app::config::BackendPreference;
+use crate::app::ec::{EcBackend, EcError};
 
 /// 可配置的内存 `EcBackend`。
 ///
@@ -22,6 +21,10 @@ use crate::ec::error::EcError;
 #[derive(Clone)]
 pub struct MockBackend {
     pub charge_limit: Arc<AtomicU8>,
+    /// 养护位**写入请求**的落地记录（`set_battery_care` 写入，`care_write_is_noop`
+    /// 时不写入）。注意：**读侧**（get_battery_care_enabled / get_battery_state）
+    /// 一律按 `charge_limit < 100` 推导，与真实后端（winring0/wmi）契约一致——
+    /// 本字段仅供测试断言"写养护位请求到达后端"（修订 1.47 审计）。
     pub battery_care: Arc<AtomicBool>,
     pub perf_mode: Arc<AtomicU8>,
     /// `get_battery_state` 调用计数（回归测试：刷新必须单次往返）。
@@ -39,12 +42,19 @@ pub struct MockBackend {
     /// （读回恒为 false）。启动同步必须不被这种固件误导（L5 回归：不能把
     /// care=false 写进配置，否则下次启动按 care=false 强制 100%）。
     pub care_write_is_noop: bool,
+    /// 模拟 WMI 后端熔断（`needs_rebuild() == true`）：死 worker/超时熔断后
+    /// 只能靠重建恢复（修订 1.45 的 WMI 熔断自动恢复测试用）。
+    pub needs_rebuild: bool,
 }
 
 impl Default for MockBackend {
     fn default() -> Self {
         Self {
-            charge_limit: Arc::new(AtomicU8::new(0)),
+            // 初始化为合法值 100%（养护关闭）：真实后端（winring0 / wmi）的
+            // get_charge_limit 把 0/>100 判为垃圾值返回 Err——mock 默认 0 会让
+            // 直接读默认实例的测试观察到 (false, 0)，与真机契约背离（修订 1.46
+            // 审计）。100% 是每个机器都合法存在的状态（未开启养护）。
+            charge_limit: Arc::new(AtomicU8::new(100)),
             battery_care: Arc::new(AtomicBool::new(false)),
             perf_mode: Arc::new(AtomicU8::new(0x09)),
             battery_state_calls: Arc::new(AtomicU32::new(0)),
@@ -56,6 +66,7 @@ impl Default for MockBackend {
             set_battery_care_fails: false,
             set_perf_fails: false,
             care_write_is_noop: false,
+            needs_rebuild: false,
         }
     }
 }
@@ -89,8 +100,6 @@ impl MockBackend {
     /// 模拟 WMI 量化：`set_charge_limit` 就近取预设值。
     pub fn quantizing() -> Self {
         Self {
-            charge_limit: Arc::new(AtomicU8::new(100)),
-            perf_mode: Arc::new(AtomicU8::new(0x09)),
             quantize: true,
             ..Default::default()
         }
@@ -99,7 +108,6 @@ impl MockBackend {
     /// 模拟"充电上限写入被固件拒绝"的后端：仅 `set_charge_limit` 失败。
     pub fn charge_limit_fails() -> Self {
         Self {
-            charge_limit: Arc::new(AtomicU8::new(100)),
             set_charge_limit_fails: true,
             ..Default::default()
         }
@@ -107,6 +115,28 @@ impl MockBackend {
 
     fn fail(&self) -> EcError {
         EcError::BackendUnavailable(format!("{} 拒绝操作", self.name))
+    }
+
+    /// 读开关的统一前置检查（三个 getter 曾各自重复 `read_fails` 判定，
+    /// 修订 1.47 清理）。
+    fn ensure_readable(&self) -> Result<(), EcError> {
+        if self.read_fails.load(Ordering::Relaxed) {
+            return Err(self.fail());
+        }
+        Ok(())
+    }
+
+    /// 读回原始值的合法性校验（与真实后端同一读回契约，见
+    /// `get_charge_limit` 的注释）：`0` 与 `>FULL_CHARGE_LIMIT` 是垃圾值。
+    /// 三个 getter 曾各自书写同一份 `if raw == 0 || raw > 100` 判定。
+    fn validate_read_raw(raw: u8) -> Result<u8, EcError> {
+        if raw == 0 || raw > crate::app::limits::FULL_CHARGE_LIMIT {
+            return Err(EcError::InvalidData(format!(
+                "充电上限 mock 值 {} 非法",
+                raw
+            )));
+        }
+        Ok(raw)
     }
 }
 
@@ -120,17 +150,25 @@ impl EcBackend for MockBackend {
     }
 
     fn get_battery_care_enabled(&self) -> Result<bool, EcError> {
-        if self.read_fails.load(Ordering::Relaxed) {
-            return Err(self.fail());
-        }
-        Ok(self.battery_care.load(Ordering::Relaxed))
+        self.ensure_readable()?;
+        // 与真实后端同款推导契约（winring0.rs / wmi.rs 的 get_battery_care_enabled
+        // 均为 care = 充电上限 < 100%，见 care_enabled_from_limit）：mock 直接
+        // 返回存储位会让"写限值不改养护位 → 读回 care=false"的测试在 CI 通过、
+        // 真机上行为不同（修订 1.47 审计，与 get_charge_limit 的垃圾值契约
+        // 对齐同源）。`battery_care` 原子仍保留：测试用它断言"写养护位请求
+        // 到达后端"（set_battery_care 的落地），读侧一律按限值推导。
+        let raw = Self::validate_read_raw(self.charge_limit.load(Ordering::Relaxed))?;
+        Ok(crate::app::battery::care_enabled_from_limit(raw))
     }
 
     fn get_charge_limit(&self) -> Result<u8, EcError> {
-        if self.read_fails.load(Ordering::Relaxed) {
-            return Err(self.fail());
-        }
-        Ok(self.charge_limit.load(Ordering::Relaxed))
+        self.ensure_readable()?;
+        // 与真实后端（winring0 / wmi 的 get_charge_limit）同一读回契约：0 与
+        // >100 是垃圾值，必须返回 Err 而非 Ok——mock 返回 Ok(0) 会让"读回
+        // 垃圾值"类测试在 CI 通过、真机上行为不同（修订 1.46 审计，与写入
+        // 路径的 validate_charge_limit_write 对称）。校验收敛在
+        // `validate_read_raw`（修订 1.47 清理）。
+        Self::validate_read_raw(self.charge_limit.load(Ordering::Relaxed))
     }
 
     fn set_battery_care(&self, enabled: bool) -> Result<(), EcError> {
@@ -147,10 +185,14 @@ impl EcBackend for MockBackend {
         if self.set_charge_limit_fails {
             return Err(self.fail());
         }
+        // 与真实后端（winring0 / wmi 的 set_charge_limit）走同一份写入前校验：
+        // 0 非法（读回契约把 0 判为垃圾值）、>100 钳到 100。mock 放行 0 会让
+        // 针对"写入 0 必须失败"的测试在 CI 通过、真机上行为不同（测试漂移）。
+        let pct = crate::app::battery::validate_charge_limit_write(percent)?;
         let pct = if self.quantize {
-            crate::ec::battery::nearest_wmi_percent(percent.min(100))
+            crate::app::battery::nearest_wmi_percent(pct)
         } else {
-            percent.min(100)
+            pct
         };
         self.charge_limit.store(pct, Ordering::Relaxed);
         Ok(())
@@ -158,13 +200,11 @@ impl EcBackend for MockBackend {
 
     fn get_battery_state(&self) -> Result<(bool, u8), EcError> {
         self.battery_state_calls.fetch_add(1, Ordering::Relaxed);
-        if self.read_fails.load(Ordering::Relaxed) {
-            return Err(self.fail());
-        }
-        Ok((
-            self.battery_care.load(Ordering::Relaxed),
-            self.charge_limit.load(Ordering::Relaxed),
-        ))
+        self.ensure_readable()?;
+        let limit = Self::validate_read_raw(self.charge_limit.load(Ordering::Relaxed))?;
+        // 养护位同样按限值推导（修订 1.47 审计，对齐 winring0/wmi 的
+        // get_battery_state：care = limit < 100），见 get_battery_care_enabled。
+        Ok((crate::app::battery::care_enabled_from_limit(limit), limit))
     }
 
     fn get_performance_mode(&self) -> Result<u8, EcError> {
@@ -184,5 +224,52 @@ impl EcBackend for MockBackend {
 
     fn supports_continuous_charge_limit(&self) -> bool {
         !self.quantize
+    }
+
+    fn needs_rebuild(&self) -> bool {
+        self.needs_rebuild
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 回归测试（mock/真实后端契约对齐）：写入 0% 必须像真实后端一样被
+    /// `validate_charge_limit_write` 拒绝。历史 mock 用 `percent.min(100)`
+    /// 放行 0，导致"写入 0 必须失败"类测试在 CI 通过、真机上行为不同。
+    #[test]
+    fn test_mock_set_charge_limit_rejects_zero() {
+        let backend = MockBackend::default();
+        assert!(
+            backend.set_charge_limit(0).is_err(),
+            "0% must be rejected before reaching the store"
+        );
+        // 写入被拒绝，内部状态保持默认合法值 100（未被 0 污染）。
+        assert_eq!(backend.charge_limit.load(Ordering::Relaxed), 100);
+        backend.set_charge_limit(80).unwrap();
+        assert_eq!(backend.charge_limit.load(Ordering::Relaxed), 80);
+        assert_eq!(backend.get_charge_limit().unwrap(), 80);
+    }
+
+    /// 回归测试（修订 1.46 审计）：mock 的**读回**也要像真实后端一样拒绝
+    /// 垃圾值（0/>100 返回 Err）——只约束写入会让"读回垃圾值"类测试在 CI
+    /// 通过、真机上行为不同。显式把内部状态改成垃圾值模拟"读回损坏的 EC
+    /// 寄存器"。
+    #[test]
+    fn test_mock_read_rejects_invalid_charge_limit() {
+        let backend = MockBackend::default();
+        // 默认 100%（合法），读回正常。
+        assert_eq!(backend.get_charge_limit().unwrap(), 100);
+        // 显式注入 0（模拟寄存器损坏）：读回必须 Err。
+        backend.charge_limit.store(0, Ordering::Relaxed);
+        assert!(backend.get_charge_limit().is_err());
+        assert!(backend.get_battery_state().is_err());
+        // 修复后恢复可读。
+        backend.set_charge_limit(60).unwrap();
+        assert_eq!(backend.get_charge_limit().unwrap(), 60);
+        // 养护位由限值推导（修订 1.47 审计）：60 < 100 → care=true，与
+        // 真实后端（winring0/wmi）的 get_battery_state 语义一致。
+        assert_eq!(backend.get_battery_state().unwrap(), (true, 60));
     }
 }

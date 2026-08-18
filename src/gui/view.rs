@@ -1,12 +1,31 @@
 use eframe::egui::{self, Color32, Frame, Margin, Vec2};
 
-use crate::ec;
+use crate::app;
 
 use super::app::XiaomiApp;
 
 /// 品牌蓝：标题栏底色与状态/选中态的统一强调色。历史实现在 view.rs 与
 /// app.rs 各自硬编码 `0x25,0x50,0xAA`，重复为两个事实来源——统一收敛到此处。
 pub const BRAND_BLUE: Color32 = Color32::from_rgb(0x25, 0x50, 0xAA);
+
+/// 绿色（健康/交流充电中）、橙色（轻度衰减/警告）、红色（警示）。
+/// 电量进度条（交流供电、<20% 红色警示）与电池健康度配色曾各自硬编码
+/// 同一组 RGB（修订 1.46 审计）——统一收敛到常量，两处语义不再漂移。
+const COLOR_OK: Color32 = Color32::from_rgb(0x1B, 0x5E, 0x20);
+const COLOR_WARN: Color32 = Color32::from_rgb(0xB0, 0x5F, 0x00);
+const COLOR_BAD: Color32 = Color32::from_rgb(0xC0, 0x39, 0x2B);
+
+/// 电池健康度等级配色（与电量进度条同风格）：≥95% 绿（健康）、80~95% 橙
+/// （轻度衰减）、<80% 红（明显衰减，提醒关注）。阈值与 F-BAT-13 一致。
+fn battery_health_color(pct: f32) -> Color32 {
+    if pct >= 95.0 {
+        COLOR_OK
+    } else if pct >= 80.0 {
+        COLOR_WARN
+    } else {
+        COLOR_BAD
+    }
+}
 
 impl XiaomiApp {
     pub fn show_main_view(&mut self, ui: &mut egui::Ui) {
@@ -34,7 +53,18 @@ impl XiaomiApp {
             })
             .show(ctx, |ui| {
                 let total_rect = ui.available_rect_before_wrap();
-                let button_strip_width = 96.0_f32;
+                // 最大化状态（`None` = 平台尚未上报窗口状态，按未最大化处理）：
+                // 整帧只查询一次，双击路径与按钮条共用同一结果（同一帧两个
+                // 按钮/双击不应读到不同值。历史在双击路径与按钮条各自
+                // ctx.input 查询，多一次锁开销且语义需保持一致——修订 1.47
+                // 收敛为单次查询）。
+                let is_maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                // 按钮区宽度 = 3 个 32px 按钮 + 按钮间默认 item_spacing(8px)×2，
+                // 随按钮尺寸推导而非硬编码 96（修订 1.46 审计：96 只够 3 个
+                // 按钮本体，右侧布局的间距把 Minimize 挤出标题区）。
+                let btn_size = egui::vec2(32.0, total_rect.height());
+                let spacing = ui.spacing().item_spacing.x;
+                let button_strip_width = btn_size.x * 3.0 + spacing * 2.0;
                 let title_rect = egui::Rect::from_min_max(
                     total_rect.min,
                     egui::pos2(
@@ -59,7 +89,6 @@ impl XiaomiApp {
                     ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                 }
                 if title_drag.double_clicked() {
-                    let is_maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_maximized));
                 }
 
@@ -96,30 +125,34 @@ impl XiaomiApp {
                     );
                 }
 
-                let btn_size = egui::vec2(32.0, total_rect.height());
+                // 最大化状态已在上方查询一次（双击路径 + 按钮条共用，见函数开头）。
+                // 按钮条内的最大化/还原按钮按该结果分派。
                 ui.allocate_new_ui(
                     egui::UiBuilder::new()
                         .max_rect(button_strip_rect)
                         .layout(egui::Layout::right_to_left(egui::Align::Center)),
                     |ui| {
-                        if titlebar_button(ui, btn_size, "close")
+                        if titlebar_button(ui, btn_size, TitleBarKind::Close)
                             .on_hover_text("隐藏到托盘")
                             .clicked()
                         {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
-                        let is_maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
                         if titlebar_button(
                             ui,
                             btn_size,
-                            if is_maximized { "restore" } else { "maximize" },
+                            if is_maximized {
+                                TitleBarKind::Restore
+                            } else {
+                                TitleBarKind::Maximize
+                            },
                         )
                         .on_hover_text(if is_maximized { "还原" } else { "最大化" })
                         .clicked()
                         {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_maximized));
                         }
-                        if titlebar_button(ui, btn_size, "minimize")
+                        if titlebar_button(ui, btn_size, TitleBarKind::Minimize)
                             .on_hover_text("最小化")
                             .clicked()
                         {
@@ -154,7 +187,10 @@ impl XiaomiApp {
                 if resize_resp.dragged() {
                     let delta = resize_resp.drag_delta();
                     let s = ctx.screen_rect().size();
-                    let new = egui::vec2((s.x + delta.x).max(400.0), (s.y + delta.y).max(500.0));
+                    let new = egui::vec2(
+                        (s.x + delta.x).max(crate::util::MIN_WINDOW_SIZE.0),
+                        (s.y + delta.y).max(crate::util::MIN_WINDOW_SIZE.1),
+                    );
                     ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(new));
                 }
                 if resize_resp.hovered() || resize_resp.dragged() {
@@ -215,10 +251,8 @@ impl XiaomiApp {
         if let Some(pct) = power.battery_percent {
             let pct_f = pct as f32 / 100.0;
             let fill = match (power.status, pct) {
-                (_, p) if p < 20 => Color32::from_rgb(0xC0, 0x39, 0x2B),
-                (crate::platform::power::PowerStatus::OnAc, _) => {
-                    Color32::from_rgb(0x1B, 0x5E, 0x20)
-                }
+                (_, p) if p < 20 => COLOR_BAD,
+                (crate::platform::power::PowerStatus::OnAc, _) => COLOR_OK,
                 _ => BRAND_BLUE,
             };
             ui.add(
@@ -235,12 +269,42 @@ impl XiaomiApp {
                     .text("电量未知"),
             );
         }
+        // 电池健康（后台线程经 root\WMI 容量读数上报，见
+        // platform::battery_health）：未读到（WMI 未就绪/无电池/类不可用）时
+        // 不展示该行，避免"未知"占位噪音。健康度 = 满充容量 / 设计容量；
+        // ≥95% 绿、80~95% 橙、<80% 红，与电量进度条同风格（F-BAT-13）。
+        if let Some(health) = self.battery_health {
+            if let Some(pct) = health.health_percent_u8() {
+                let color = battery_health_color(pct as f32);
+                ui.horizontal(|ui| {
+                    ui.label("电池健康:");
+                    ui.colored_label(
+                        color,
+                        format!(
+                            "{:.0}% (设计 {} mWh · 满充 {} mWh)",
+                            pct, health.designed_mwh, health.full_mwh
+                        ),
+                    );
+                });
+                // 进度条与文案使用**同一**舍入值（health_percent_u8）：避免
+                // 文案 99% 而进度条 98.6% 的两套显示不一致。
+                ui.add(
+                    egui::ProgressBar::new((pct as f32 / 100.0).clamp(0.0, 1.0))
+                        .desired_width(ui.available_width())
+                        .fill(color)
+                        .text(format!("{}%", pct)),
+                );
+            }
+        }
+        // 预计剩余/充满时长（root\WMI BatteryStatus 速率估算，修订 1.37）：
+        // 速率不可用（满电停充/异常）时不展示。
+        if let Some(eta) = &self.battery_eta_text {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(eta).color(Color32::from_gray(80)));
+            });
+        }
         ui.horizontal(|ui| {
-            let status = if self.runtime.battery_care_enabled {
-                "开启"
-            } else {
-                "关闭"
-            };
+            let status = app::battery::care_label(self.runtime.battery_care_enabled);
             ui.label(egui::RichText::new(format!("电池养护: {}", status)).strong());
             if !self.runtime.battery_care_enabled {
                 ui.colored_label(Color32::GRAY, "(充电至100%)");
@@ -249,7 +313,7 @@ impl XiaomiApp {
         ui.horizontal(|ui| {
             ui.label(format!("充电上限: {}%", self.runtime.charge_limit));
         });
-        let perf_name = ec::performance::PerfMode::name_or_unknown(self.runtime.performance_mode);
+        let perf_name = app::performance::PerfMode::name_or_unknown(self.runtime.performance_mode);
         ui.horizontal(|ui| {
             ui.label("性能模式: ");
             ui.colored_label(BRAND_BLUE, perf_name);
@@ -276,7 +340,7 @@ impl XiaomiApp {
                 ui.horizontal(|ui| {
                     ui.label("充电上限:")
                         .on_hover_text("充满即停的充电阈值，数值越低对电池越友好");
-                    for &limit in crate::ec::battery::WMI_PRESET_PERCENTS {
+                    for &limit in crate::app::battery::WMI_PRESET_PERCENTS {
                         let selected = self.runtime.charge_limit == limit;
                         if ui
                             .selectable_label(selected, format!("{}%", limit))
@@ -321,7 +385,7 @@ impl XiaomiApp {
 
     fn show_performance_mode_section(&mut self, ui: &mut egui::Ui) {
         ui.heading("性能模式");
-        let modes = ec::performance::PerfMode::all();
+        let modes = app::performance::PerfMode::all();
         let ncols = 3;
         egui::Grid::new("perf_grid")
             .min_col_width(100.0)
@@ -400,15 +464,15 @@ impl XiaomiApp {
             let changed = ui
                 .radio_value(
                     &mut pref,
-                    crate::ec::config::BackendPreference::Auto,
+                    crate::app::config::BackendPreference::Auto,
                     "自动",
                 )
                 .changed()
-                | ui.radio_value(&mut pref, crate::ec::config::BackendPreference::Wmi, "WMI")
+                | ui.radio_value(&mut pref, crate::app::config::BackendPreference::Wmi, "WMI")
                     .changed()
                 | ui.radio_value(
                     &mut pref,
-                    crate::ec::config::BackendPreference::WinRing0,
+                    crate::app::config::BackendPreference::WinRing0,
                     "WinRing0",
                 )
                 .changed();
@@ -419,33 +483,51 @@ impl XiaomiApp {
 
         ui.add_space(8.0);
 
-        let mut auto = self.config.auto_apply_on_startup;
-        if ui.checkbox(&mut auto, "启动时自动应用设置").changed() {
-            self.config.auto_apply_on_startup = auto;
+        if toggle_config_bool(
+            ui,
+            "启动时自动应用设置",
+            &mut self.config.auto_apply_on_startup,
+            None,
+        ) {
             self.save_state();
         }
 
-        let mut reapply = self.config.auto_reapply_on_power_change;
-        if ui.checkbox(&mut reapply, "电源切换时自动重设").changed() {
-            self.config.auto_reapply_on_power_change = reapply;
+        if toggle_config_bool(
+            ui,
+            "电源切换时自动重设",
+            &mut self.config.auto_reapply_on_power_change,
+            None,
+        ) {
             self.save_state();
         }
 
         // 电池供电自动切节能：打开后拔掉电源即自动切到 Eco（风扇静音、
         // 降低 CPU 功耗），插回电源恢复用户所选模式。仅在拔电且配置开启
         // 时生效（见 battery::apply_config_to_hardware 的降级逻辑）。
-        let mut quiet = self.config.auto_switch_to_quiet_on_battery;
-        if ui
-            .checkbox(&mut quiet, "电池供电时自动切换节能")
-            .on_hover_text("拔掉电源自动切换到节能模式，插回电源恢复原模式")
-            .changed()
-        {
-            self.config.auto_switch_to_quiet_on_battery = quiet;
-            self.save_state();
+        if toggle_config_bool(
+            ui,
+            "电池供电时自动切换节能",
+            &mut self.config.auto_switch_to_quiet_on_battery,
+            Some("拔掉电源自动切换到节能模式，插回电源恢复原模式"),
+        ) {
             // 立即生效：若当前在电池供电，马上按新配置重设硬件。
-            // 注意用 apply_and_sync 而非 reapply_config：用户主动切换
-            // 必须无条件应用，不受"电源切换时自动重设"开关约束。
+            // 注意用 apply_config_and_sync 而非 reapply_config：用户主动切换
+            // 必须无条件应用，不受"电源切换时自动重设"开关约束。其内部会
+            // save_state，此处不再重复落盘（修订 1.47 清理：历史在此先
+            // save_state 一次、apply 后又一次，配置被重复写入磁盘）。
             self.apply_config_and_sync();
+        }
+
+        // 充电达到养护上限通知：电池充到配置的充电上限（或充满）时弹托盘
+        // 通知，方便用户知晓"已到养护上限"。默认关闭（不主动打扰）。
+        if toggle_config_bool(
+            ui,
+            "充电达到上限时通知",
+            &mut self.config.notify_on_charge_limit,
+            Some("电池充电达到养护上限（或充满）时弹托盘通知"),
+        ) {
+            self.save_state();
+            self.sync_tray_status();
         }
 
         // F-AUTO-01: 开机自启动复选框。注册/删除走后台线程
@@ -454,9 +536,14 @@ impl XiaomiApp {
         // SetAutostartResult 回传结果（成功仅确认；失败回滚并展示错误）。
         let mut autostart = self.config.auto_start_on_boot;
         if ui.checkbox(&mut autostart, "开机自启动").changed() {
-            let _ = self
+            // 与其它发送方一致记录失败（全项目约定，见 main.rs/commands.rs）：
+            // channel 断开意味着 GUI 事件循环即将退出，静默丢弃会掩盖时序。
+            if let Err(e) = self
                 .cmd_tx
-                .send(crate::command::UiCommand::SetAutostart(autostart));
+                .send(crate::app::command::UiCommand::SetAutostart(autostart))
+            {
+                log::warn!("SetAutostart send failed: {}", e);
+            }
         }
 
         ui.add_space(12.0);
@@ -484,6 +571,9 @@ impl XiaomiApp {
     }
 
     /// Fn 功能键自定义绑定（监听线程经共享绑定表即时生效）。
+    ///
+    /// 三个区块（捕获模式 / 绑定列表 / 添加绑定）逻辑独立，从单一 ~180 行
+    /// 函数拆出（修订 1.47 整理），保持本函数为区块编排薄层。
     fn show_fn_key_section(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.heading("Fn 功能键");
@@ -500,7 +590,13 @@ impl XiaomiApp {
                 "当前没有绑定。可在下方「添加绑定」中选择预设键码。",
             );
         }
-        // 捕获模式开关 + 最近捕获事件展示。
+        self.show_fn_capture_row(ui);
+        self.show_fn_binding_list(ui);
+        self.show_fn_add_binding(ui);
+    }
+
+    /// 捕获模式开关 + 最近捕获事件展示（发现新键并"绑定为指定动作"）。
+    fn show_fn_capture_row(&mut self, ui: &mut egui::Ui) {
         let capturing = self.fn_capture.load(std::sync::atomic::Ordering::Relaxed);
         ui.horizontal(|ui| {
             let mut on = capturing;
@@ -525,53 +621,25 @@ impl XiaomiApp {
                     ui.monospace(format!(
                         "{} / {}",
                         class,
-                        ec::fnkey::FnKeyBinding::display_prefix(&hex)
+                        app::fnkey::FnKeyBinding::display_prefix(&hex)
                     ));
                 });
-                // 用捕获到的键直接添加绑定（无需从预设挑选）：捕获事件可能
-                // 带后续状态/长度字节，取前 6 个 hex（如 012801 = 3 字节）
-                // 作为前缀，既保留键码信息又不过度匹配。
-                // 注意截断必须是**偶数字符**（完整字节）：hex 是半字节编码，
-                // 奇数长度前缀（如 "01280"）匹配不到任何真实事件，且展示
-                // 时会缺半个字节（L3 回归）。按字节截断：先取前 6 字符，
-                // 若为奇数则回退到偶数位（等价于去掉末位半个字节）。
-                let mut prefix_len = hex.len().min(6);
-                if prefix_len % 2 != 0 {
-                    prefix_len -= 1;
-                }
-                // 防御：归一化后至少 2 字符（1 字节）才可作为前缀，否则空
-                // 前缀会"匹配一切"，属于危险配置（见 config.rs 绑定消毒）。
-                // 极端单字符输入（长度 1）时回退到**偶数长度**（0）而非
-                // 保留整个奇数串——单 hex 字符（如 "A"）会匹配所有以 A
-                // 开头的事件，与空前缀同属危险配置。
-                let prefix = if prefix_len >= 2 {
-                    &hex[..prefix_len]
-                } else {
-                    &hex[..hex.len() - hex.len() % 2]
-                };
+                // 用捕获到的键直接添加绑定（无需从预设挑选）：取 `capture_prefix`
+                // 截断后的前缀（保留键码信息又不过度匹配，截断规则见该函数）。
+                let prefix = capture_prefix(&hex);
                 // 动作选择必须保存在 self 上（每帧 UI 重建，局部变量会
                 // 重置回默认——历史实现用局部变量导致用户选中的动作在
                 // 下一帧丢失，"使用此键"恒绑定默认动作，H1 回归）。
                 let mut action = self.fn_capture_action;
                 ui.horizontal(|ui| {
                     ui.label("绑定为:");
-                    egui::ComboBox::from_id_salt("fn_capture_action")
-                        .selected_text(action.name())
-                        .show_ui(ui, |ui| {
-                            for a in crate::ec::fnkey::FnAction::all() {
-                                ui.selectable_value(&mut action, *a, a.name());
-                            }
-                        });
+                    fn_action_combo(ui, "fn_capture_action", &mut action);
                     self.fn_capture_action = action;
                     // RunCommand 动作：附带命令行输入框（草稿跨帧保持，
                     // 与添加绑定流程的 fn_add_command 同理；否则捕获绑定
                     // 到的 RunCommand 命令为空、需事后到列表再改一次）。
-                    if action == crate::ec::fnkey::FnAction::RunCommand {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.fn_capture_command)
-                                .hint_text("例如 start notepad 或 C:\\tools\\app.exe")
-                                .desired_width(200.0),
-                        );
+                    if action == crate::app::fnkey::FnAction::RunCommand {
+                        run_command_field(ui, &mut self.fn_capture_command, 200.0);
                     }
                     if ui.button("使用此键").clicked() {
                         let command = self.fn_capture_command.clone();
@@ -587,10 +655,13 @@ impl XiaomiApp {
                 ui.colored_label(Color32::GRAY, "（等待功能键事件…）");
             }
         }
+    }
 
-        // 绑定列表：每条一行（展示 + 动作下拉 + 删除）。
-        // 删除会前移后续条目下标，当前 for 的索引序列在删除后失效——
-        // 用 mutated 标记跳出循环，下一帧用更新后的列表重新渲染。
+    /// 绑定列表：每条一行（展示 + 动作下拉 + 删除）。
+    ///
+    /// 删除会前移后续条目下标，当前 for 的索引序列在删除后失效——用
+    /// `mutated` 标记跳出循环，下一帧用更新后的列表重新渲染。
+    fn show_fn_binding_list(&mut self, ui: &mut egui::Ui) {
         let binding_count = self.config.fn_key_bindings.len();
         let mut mutated = false;
         for i in 0..binding_count {
@@ -610,7 +681,7 @@ impl XiaomiApp {
             let label = format!(
                 "{}. {}",
                 i + 1,
-                ec::fnkey::FnKeyBinding {
+                app::fnkey::FnKeyBinding {
                     class: class.clone(),
                     prefix: prefix.clone(),
                     action: *action,
@@ -621,26 +692,20 @@ impl XiaomiApp {
             ui.horizontal(|ui| {
                 ui.label(label);
                 let mut selected_action = *action;
-                egui::ComboBox::from_id_salt(ui.id().with(format!("fn_action_{}", i)))
-                    .selected_text(selected_action.name())
-                    .show_ui(ui, |ui| {
-                        for a in ec::fnkey::FnAction::all() {
-                            ui.selectable_value(&mut selected_action, *a, a.name());
-                        }
-                    });
+                fn_action_combo(
+                    ui,
+                    ui.id().with(format!("fn_action_{}", i)),
+                    &mut selected_action,
+                );
                 if selected_action != *action {
                     self.set_fn_binding_action(i, selected_action);
                 }
                 // RunCommand 动作：展示命令行输入框（其余动作不展示）。
                 // 输入框宽度有限，放在下一行水平组避免挤爆当前行；失去焦点
                 // 时若内容有变化才落盘（避免每帧都触发 save_state）。
-                if selected_action == ec::fnkey::FnAction::RunCommand {
+                if selected_action == app::fnkey::FnAction::RunCommand {
                     let mut cmd_text = command.clone().unwrap_or_default();
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(&mut cmd_text)
-                            .hint_text("例如 start notepad 或 C:\\tools\\app.exe")
-                            .desired_width(240.0),
-                    );
+                    let resp = run_command_field(ui, &mut cmd_text, 240.0);
                     if resp.lost_focus() && cmd_text != command.as_deref().unwrap_or_default() {
                         self.set_fn_binding_command(i, &cmd_text);
                     }
@@ -651,42 +716,54 @@ impl XiaomiApp {
                 }
             });
         }
+    }
 
-        // 添加绑定：预设键码下拉 + 动作 + 添加按钮。
-        // 选择状态必须保存在 self 上（每帧 UI 重新构建，局部变量每帧重置
-        // 回默认值导致下拉永远显示第一项、选中无法保持——见 fn_add_* 修复）。
+    /// 添加绑定：预设键码下拉 + 动作 + 添加按钮。
+    ///
+    /// 选择状态必须保存在 self 上（每帧 UI 重新构建，局部变量每帧重置
+    /// 回默认值导致下拉永远显示第一项、选中无法保持——见 fn_add_* 修复）。
+    fn show_fn_add_binding(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.label("添加:");
             let mut selected = self.fn_add_preset_index;
+            // 索引由下方枚举 KNOWN_FN_KEYS 的 ComboBox 写入，恒在界内；但
+            // 渲染路径不应 panic——越界时告警并回退第 0 项（修订 1.46 审计：
+            // 历史用 .expect 让数组误改直接崩溃整个 GUI，单次越界不应杀死
+            // 应用，且下拉仍按合法索引渲染、下一帧即自愈）。
+            let selected_key = crate::app::fnkey::KNOWN_FN_KEYS.get(selected).or_else(|| {
+                log::error!(
+                    "fn_add_preset_index {} out of KNOWN_FN_KEYS bounds; falling back to 0",
+                    selected
+                );
+                selected = 0;
+                crate::app::fnkey::KNOWN_FN_KEYS.first()
+            });
             egui::ComboBox::from_id_salt("fn_add_preset")
-                .selected_text(crate::ec::fnkey::KNOWN_FN_KEYS[selected].name)
+                .selected_text(selected_key.map(|k| k.name).unwrap_or_default())
                 .show_ui(ui, |ui| {
-                    for (idx, k) in crate::ec::fnkey::KNOWN_FN_KEYS.iter().enumerate() {
+                    for (idx, k) in crate::app::fnkey::KNOWN_FN_KEYS.iter().enumerate() {
                         ui.selectable_value(&mut selected, idx, k.name);
                     }
                 });
             self.fn_add_preset_index = selected;
             let mut add_action = self.fn_add_action;
-            egui::ComboBox::from_id_salt("fn_add_action")
-                .selected_text(add_action.name())
-                .show_ui(ui, |ui| {
-                    for a in crate::ec::fnkey::FnAction::all() {
-                        ui.selectable_value(&mut add_action, *a, a.name());
-                    }
-                });
+            fn_action_combo(ui, "fn_add_action", &mut add_action);
             self.fn_add_action = add_action;
             // RunCommand 动作：附带命令行输入框（草稿跨帧保持，见
             // app.rs 的 fn_add_command 注释）；其余动作不展示。
-            if add_action == ec::fnkey::FnAction::RunCommand {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.fn_add_command)
-                        .hint_text("例如 start notepad 或 C:\\tools\\app.exe")
-                        .desired_width(200.0),
-                );
+            if add_action == app::fnkey::FnAction::RunCommand {
+                run_command_field(ui, &mut self.fn_add_command, 200.0);
             }
             if ui.button("添加绑定").clicked() {
-                let k = &crate::ec::fnkey::KNOWN_FN_KEYS[selected];
+                // 点击路径同样防越界：告警 + 跳过（不 panic，渲染路径同规则）。
+                let Some(k) = crate::app::fnkey::KNOWN_FN_KEYS.get(selected) else {
+                    log::warn!(
+                        "fn_add_preset_index {} out of KNOWN_FN_KEYS; ignoring add click",
+                        selected
+                    );
+                    return;
+                };
                 // 先克隆命令文本（闭包内 &mut self.add_fn_binding 与
                 // &self.fn_add_command 无法共存借用）。
                 let command = self.fn_add_command.clone();
@@ -698,7 +775,95 @@ impl XiaomiApp {
     }
 }
 
-pub fn titlebar_button(ui: &mut egui::Ui, size: egui::Vec2, kind: &str) -> egui::Response {
+/// 设置区布尔开关的"勾选 → 写回配置"统一样板（修订 1.47 收敛）。
+///
+/// 启动自动应用 / 电源重设 / 电池自动切节能 / 达上限通知四个开关曾各自
+/// 重复 `let mut x = config.f; if checkbox(...).changed() { config.f = x;
+/// save_state(); }` 的样板。本函数只负责勾选检测与写回，返回 `true` 表示
+/// 发生了变更——持久化与"即时生效"动作由调用方决定（各开关的落盘策略
+/// 不同：`apply_config_and_sync` 内部会 save_state，直接 save 的开关由
+/// 调用方显式调用）。
+fn toggle_config_bool(
+    ui: &mut egui::Ui,
+    label: &str,
+    field: &mut bool,
+    hover: Option<&str>,
+) -> bool {
+    let mut value = *field;
+    let mut response = ui.checkbox(&mut value, label);
+    if let Some(text) = hover {
+        response = response.on_hover_text(text);
+    }
+    if response.changed() {
+        *field = value;
+        true
+    } else {
+        false
+    }
+}
+
+/// Fn 动作下拉框（`ComboBox` + `FnAction::all()` 列表）。捕获行、绑定列表
+/// 行、添加行曾三处各自复制同一段 `ComboBox ... for a in FnAction::all()`
+/// 代码——统一收敛到此处，新增动作类型只改这一处。
+///
+/// `id_salt` 由调用方区分同名下拉（egui 按 id 区分交互状态）。
+fn fn_action_combo(
+    ui: &mut egui::Ui,
+    id_salt: impl std::hash::Hash,
+    action: &mut app::fnkey::FnAction,
+) {
+    egui::ComboBox::from_id_salt(id_salt)
+        .selected_text(action.name())
+        .show_ui(ui, |ui| {
+            for a in crate::app::fnkey::FnAction::all() {
+                ui.selectable_value(action, *a, a.name());
+            }
+        });
+}
+
+/// 把捕获到的功能键事件 hex 截断为**绑定的前缀**。
+///
+/// 捕获事件可能带后续状态/长度字节，取前 6 个 hex（如 `012801` = 3 字节）
+/// 作为前缀，既保留键码信息又不过度匹配。
+///
+/// 截断必须是**偶数字符**（完整字节）：hex 是半字节编码，奇数长度前缀
+/// （如 `01280`）匹配不到任何真实事件，且展示时会缺半个字节（L3 回归）。
+/// 极端输入（长度 < 2，如单 hex 字符 `"A"`）会匹配所有以 A 开头的事件，
+/// 与空前缀同属危险配置——回退到**偶数长度**（0）而非保留奇数串。
+fn capture_prefix(hex: &str) -> &str {
+    let mut prefix_len = hex.len().min(6);
+    if !prefix_len.is_multiple_of(2) {
+        prefix_len -= 1;
+    }
+    if prefix_len >= 2 {
+        &hex[..prefix_len]
+    } else {
+        &hex[..hex.len() - hex.len() % 2]
+    }
+}
+
+/// RunCommand 动作的命令行输入框（提示语 + 宽度）。捕获行/绑定列表行/
+/// 添加行三处曾各自复制同一段 `TextEdit::singleline(...).hint_text(...)`——
+/// 统一收敛到此处。
+fn run_command_field(ui: &mut egui::Ui, text: &mut String, width: f32) -> egui::Response {
+    ui.add(
+        egui::TextEdit::singleline(text)
+            .hint_text("例如 start notepad 或 C:\\tools\\app.exe")
+            .desired_width(width),
+    )
+}
+
+/// 标题栏按钮类型：编译期确定绘制分支（历史实现用 `&str` 分发，
+/// 拼写错误静默落入 `_ => {}` 分支不绘制）。
+#[derive(Clone, Copy)]
+pub enum TitleBarKind {
+    Close,
+    Minimize,
+    Maximize,
+    Restore,
+}
+
+pub fn titlebar_button(ui: &mut egui::Ui, size: egui::Vec2, kind: TitleBarKind) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
     let hovered = response.hovered();
     if hovered {
@@ -711,7 +876,7 @@ pub fn titlebar_button(ui: &mut egui::Ui, size: egui::Vec2, kind: &str) -> egui:
     let pad = 10.0;
     let painter = ui.painter();
     match kind {
-        "close" => {
+        TitleBarKind::Close => {
             let r = pad * 0.5;
             painter.line_segment(
                 [egui::pos2(cx - r, cy - r), egui::pos2(cx + r, cy + r)],
@@ -722,14 +887,14 @@ pub fn titlebar_button(ui: &mut egui::Ui, size: egui::Vec2, kind: &str) -> egui:
                 stroke,
             );
         }
-        "minimize" => {
+        TitleBarKind::Minimize => {
             let half = pad * 0.4;
             painter.line_segment(
                 [egui::pos2(cx - half, cy), egui::pos2(cx + half, cy)],
                 stroke,
             );
         }
-        "maximize" => {
+        TitleBarKind::Maximize => {
             let half = pad * 0.45;
             let r = egui::Rect::from_center_size(
                 egui::pos2(cx, cy),
@@ -737,7 +902,7 @@ pub fn titlebar_button(ui: &mut egui::Ui, size: egui::Vec2, kind: &str) -> egui:
             );
             painter.rect_stroke(r, 2.0, stroke, egui::StrokeKind::Inside);
         }
-        "restore" => {
+        TitleBarKind::Restore => {
             let half = pad * 0.4;
             let r1 = egui::Rect::from_center_size(
                 egui::pos2(cx + 2.0, cy - 2.0),
@@ -750,7 +915,6 @@ pub fn titlebar_button(ui: &mut egui::Ui, size: egui::Vec2, kind: &str) -> egui:
             painter.rect_stroke(r1, 2.0, stroke, egui::StrokeKind::Inside);
             painter.rect_stroke(r2, 2.0, stroke, egui::StrokeKind::Inside);
         }
-        _ => {}
     }
     response
 }
@@ -772,13 +936,46 @@ pub fn load_cjk_font() -> Option<(String, Vec<u8>)> {
 }
 
 pub fn load_icon_data() -> Option<egui::IconData> {
-    let png_bytes = include_bytes!("../../icons/icon.png");
-    let img = image::load_from_memory(png_bytes).ok()?;
-    let rgba = img.to_rgba8();
-    let (w, h) = rgba.dimensions();
-    Some(egui::IconData {
-        rgba: rgba.into_raw(),
-        width: w,
-        height: h,
-    })
+    // 图标来自嵌入资源（include_bytes），内容进程内恒定——解码一次并缓存：
+    // 历史实现每次调用都重新解码 PNG，run_app 的 with_icon 与首帧 update 的
+    // 标题栏纹理各解一次。OnceLock 保证只解码一次，后续调用直接复用。
+    static CACHE: std::sync::OnceLock<Option<egui::IconData>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let png_bytes = include_bytes!("../../icons/icon.png");
+            let img = image::load_from_memory(png_bytes).ok()?;
+            let rgba = img.to_rgba8();
+            let (w, h) = rgba.dimensions();
+            Some(egui::IconData {
+                rgba: rgba.into_raw(),
+                width: w,
+                height: h,
+            })
+        })
+        .clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 电池健康度等级配色（F-BAT-13）：≥95% 绿 / 80~95% 橙 / <80% 红。
+    /// 边界值归属（≥80 归橙、<80 归红）用色值三元组锁定，防止未来调整阈值
+    /// 时与需求文档漂移。
+    #[test]
+    fn test_battery_health_color_thresholds() {
+        let green = Color32::from_rgb(0x1B, 0x5E, 0x20);
+        let orange = Color32::from_rgb(0xB0, 0x5F, 0x00);
+        let red = Color32::from_rgb(0xC0, 0x39, 0x2B);
+
+        // ≥95 绿。
+        assert_eq!(battery_health_color(100.0), green);
+        assert_eq!(battery_health_color(95.0), green);
+        // 80~95 橙（含 80 边界，不含 95）。
+        assert_eq!(battery_health_color(94.9), orange);
+        assert_eq!(battery_health_color(80.0), orange);
+        // <80 红。
+        assert_eq!(battery_health_color(79.9), red);
+        assert_eq!(battery_health_color(0.0), red);
+    }
 }

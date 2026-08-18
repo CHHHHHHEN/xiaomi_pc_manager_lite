@@ -1,4 +1,5 @@
 mod message_window;
+mod notify;
 pub mod worker;
 
 pub use worker::spawn;
@@ -9,7 +10,7 @@ pub use worker::spawn;
 /// `TrayStatus` 的共享实例更新；托盘 worker 线程按固定周期读取并刷新
 /// tooltip，右键菜单打开时读取以展示当前性能模式。共享经 `Mutex`：
 /// 双方都是短临界区、无嵌套锁，不存在死锁风险。
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TrayStatus {
     /// 电池养护当前状态。
     pub battery_care_enabled: bool,
@@ -17,16 +18,14 @@ pub struct TrayStatus {
     pub charge_limit: u8,
     /// 性能模式当前值（EC raw code）。
     pub performance_mode: u8,
-}
-
-impl Default for TrayStatus {
-    fn default() -> Self {
-        Self {
-            battery_care_enabled: false,
-            charge_limit: 80,
-            performance_mode: crate::ec::performance::PerfMode::Smart.ec_value(),
-        }
-    }
+    /// 电池健康度（满充/设计 × 100，整数）；`None` = 尚未读到或本机无数据
+    /// （tooltip 不展示该段）。
+    pub battery_health_percent: Option<u8>,
+    /// 预计剩余/充满时长文案（GUI 后台线程估算，修订 1.37）；`None` = 速率
+    /// 不可用，tooltip 不展示该段。
+    pub battery_eta_text: Option<String>,
+    /// "充电达到养护上限时通知"开关（GUI 同步配置，托盘读取）。
+    pub notify_on_charge_limit: bool,
 }
 
 /// 托盘共享状态的类型别名。

@@ -2,7 +2,7 @@ use std::sync::Mutex;
 
 use super::addr as ec_addr;
 use super::backend::EcBackend;
-use super::error::EcError;
+use crate::app::ec::EcError;
 use libloading::Library;
 
 use windows::core::PCWSTR;
@@ -11,6 +11,21 @@ use windows::Win32::System::Services::*;
 
 type ReadPort = unsafe extern "system" fn(u16) -> u8;
 type WritePort = unsafe extern "system" fn(u16, u8);
+
+/// EC 命令/数据端口状态寄存器位（EC CMD 端口 0x66 的状态位定义）。
+/// 等待 IBF（Input Buffer Full）清空后才能写，等待 OBF（Output Buffer
+/// Full）置位后才能读。
+const EC_IBF_MASK: u8 = 0x02;
+const EC_OBF_MASK: u8 = 0x01;
+/// EC 命令端口命令字：读寄存器 / 写寄存器。
+const EC_CMD_READ: u8 = 0x80;
+const EC_CMD_WRITE: u8 = 0x81;
+
+/// WinRing0 内核驱动在 SCM 注册的服务名（唯一事实来源）。InitializeOls
+/// 内部按此名 CreateService/StartService，清理时按此名 OpenServiceW 匹配。
+/// 历史实现把 `"WinRing0_1_2_0"` 字面量散落三处（cleanup_service 内部），
+/// 驱动改名后清理与加载会对不上——统一收敛到此处（修订 1.47 清理）。
+const WINRING0_SERVICE_NAME: &str = "WinRing0_1_2_0";
 
 /// 轮询 EC 命令/数据端口直到满足 `(port & mask) == expected`，或超时。
 ///
@@ -49,18 +64,16 @@ fn ec_wait_status(rp: ReadPort, step: &'static str, mask: u8, expected: u8) -> R
     Err(EcError::Timeout(ec_addr::EC_CMD))
 }
 
-/// `ec_wait_status` 的具名别名：调用点传语义化步骤名（如 "读:数据 OBF 就绪"），
-/// 超时日志据此定位卡在协议哪一步。内部直接转发。
-fn step_wait(rp: ReadPort, step: &'static str, mask: u8, expected: u8) -> Result<(), EcError> {
-    ec_wait_status(rp, step, mask, expected)
-}
-
 /// EC 操作偶发超时的**一次**瞬态重试。
 ///
 /// EC 处于忙/被其它程序占用时，单次约 1s 等待可能恰好落在忙窗口内（实测
 /// 偶发 EC 操作超时，地址 0x66）。重试一次（再等待 ~1s）绝大多数瞬态即
 /// 恢复；持续两次超时才是真故障，按原错误如实上报，不掩盖问题。仅重试
 /// 一次避免 GUI 长时间阻塞（读/写各自至多 ~2s）。
+///
+/// **只重试瞬态错误（`Timeout`）**：非瞬态错误（如地址越界的 `InvalidData`）
+/// 是确定性失败，重试只会浪费一次完整 ~1s 等待、并把确定性问题记成
+/// "transient" 误导排查——这类错误直接原样返回。
 fn retry_transient<T>(
     what: &str,
     addr: u16,
@@ -68,7 +81,7 @@ fn retry_transient<T>(
 ) -> Result<T, EcError> {
     match op() {
         Ok(v) => Ok(v),
-        Err(e) => {
+        Err(e) if matches!(e, EcError::Timeout(_)) => {
             log::warn!(
                 "WinRing0: {} (0x{:02x}) transient {}; retrying once",
                 what,
@@ -88,6 +101,7 @@ fn retry_transient<T>(
                 }
             }
         }
+        Err(e) => Err(e),
     }
 }
 
@@ -137,16 +151,24 @@ pub fn arch_file_names() -> (&'static str, &'static str) {
     }
 }
 
-fn try_load(dll_path: &str) -> Result<(Library, ReadPort, WritePort), EcError> {
+fn try_load(dll_path: &std::path::Path) -> Result<(Library, ReadPort, WritePort), EcError> {
+    // libloading 的 Library::new 接受 AsRef<OsStr>：直接传 Path，不经
+    // to_string_lossy——Windows 路径可能含非 UTF-8 的 UTF-16 序列，lossy
+    // 会把它替换成 U+FFFD 导致找不到文件（修订 1.46 安全加固，与
+    // util::WideString::from_os_str 同源问题）。
     let lib = match unsafe { Library::new(dll_path) } {
         Ok(l) => l,
         Err(e) => {
-            log::warn!("WinRing0: Library::new({}) failed: {}", dll_path, e);
+            log::warn!(
+                "WinRing0: Library::new({}) failed: {}",
+                dll_path.display(),
+                e
+            );
             return Err(EcError::DllLoad(e.to_string()));
         }
     };
 
-    log::info!("WinRing0: loaded DLL from {}", dll_path);
+    log::info!("WinRing0: loaded DLL from {}", dll_path.display());
 
     // InitializeOls internally calls GetModuleFileName(NULL) to get the
     // EXE path, then looks for the .sys file in the EXE directory.
@@ -235,9 +257,9 @@ fn cleanup_service() {
                 return;
             }
         };
-        let id = crate::util::WideString::new("WinRing0_1_2_0");
+        let id = crate::util::WideString::new(WINRING0_SERVICE_NAME);
         if let Ok(svc) = OpenServiceW(scm, id.as_pcwstr(), SERVICE_ALL_ACCESS) {
-            log::info!("WinRing0: removing stale service WinRing0_1_2_0");
+            log::info!("WinRing0: removing stale service {}", WINRING0_SERVICE_NAME);
             let _ = ControlService(svc, SERVICE_CONTROL_STOP, std::ptr::null_mut());
             let _ = DeleteService(svc);
             let _ = CloseServiceHandle(svc);
@@ -265,7 +287,10 @@ fn cleanup_service() {
                 );
             }
         } else {
-            log::debug!("WinRing0: no stale WinRing0_1_2_0 service to clean");
+            log::debug!(
+                "WinRing0: no stale {} service to clean",
+                WINRING0_SERVICE_NAME
+            );
         }
         let _ = CloseServiceHandle(scm);
     }
@@ -274,15 +299,13 @@ fn cleanup_service() {
 /// Copy the .sys file to the EXE directory so that InitializeOls's internal
 /// Initialize() can find it (it uses GetModuleFileName(NULL) which returns
 /// the EXE path, then looks for .sys in the EXE directory).
-fn ensure_sys_in_exe_dir(dll_path: &str) {
-    let dll = std::path::Path::new(dll_path);
-    let sys_name = dll
-        .file_name()
-        .and_then(std::ffi::OsStr::to_str)
-        .map(|n| n.to_lowercase().replace(".dll", ".sys"))
-        .unwrap_or_else(|| dll_name().replace(".dll", ".sys"));
-
-    let sys_src = dll.with_file_name(&sys_name);
+fn ensure_sys_in_exe_dir(dll_path: &std::path::Path) {
+    // sys 文件名直接取自架构文件名对（arch_file_names，与 dll_name 同一
+    // 单一事实来源）。历史实现用 `dll_name().replace(".dll", ".sys")` 做
+    // 字符串替换，一旦架构文件命名规则变化（如版本化 .sys），替换结果会
+    // 与 arch_file_names 静默分叉——直接从源取对更不易漂移。
+    let (_, sys_name) = arch_file_names();
+    let sys_src = dll_path.with_file_name(sys_name);
     if !sys_src.exists() {
         log::warn!("WinRing0: .sys not found at {:?}", sys_src);
         return;
@@ -290,19 +313,31 @@ fn ensure_sys_in_exe_dir(dll_path: &str) {
 
     if let Ok(exe) = std::env::current_exe() {
         if let Some(exe_dir) = exe.parent() {
-            let sys_dst = exe_dir.join(&sys_name);
+            let sys_dst = exe_dir.join(sys_name);
             if sys_dst.exists() && sys_dst == sys_src {
                 return;
             }
-            match std::fs::copy(&sys_src, &sys_dst) {
-                Ok(_) => log::info!("WinRing0: copied .sys to {:?}", sys_dst),
+            // 原子写（临时文件 + rename）而非 std::fs::copy：本进程是提权
+            // 进程，copy 会跟随目标处的符号链接/重解析点——低权限用户在
+            // 可写的 EXE 目录预置指向任意文件的链接时，提权进程会覆写该
+            // 文件（TOCTOU，与 embed::atomic_write 同一安全问题）。直接
+            // 复用 embed 的原子写（读源字节 → 写临时 → rename 替换）。
+            let data = match std::fs::read(&sys_src) {
+                Ok(d) => d,
+                Err(e) => {
+                    log::warn!("WinRing0: read .sys {}: {}", sys_src.to_string_lossy(), e);
+                    return;
+                }
+            };
+            match crate::embed::atomic_write(&sys_dst, &data) {
+                Ok(()) => log::info!("WinRing0: copied .sys to {:?}", sys_dst),
                 Err(e) => log::warn!("WinRing0: copy .sys to EXE dir: {}", e),
             }
         }
     }
 }
 
-fn try_load_all(dll_path: &str) -> Result<WinRing0Backend, EcError> {
+fn try_load_all(dll_path: &std::path::Path) -> Result<WinRing0Backend, EcError> {
     try_load(dll_path).map(|(lib, rp, wp)| WinRing0Backend {
         rp,
         wp,
@@ -322,9 +357,9 @@ impl WinRing0Backend {
         // 因此全部改为**绝对路径**加载：优先 EXE 同级目录，否则提取嵌入式
         // 副本到同一目录再加载。
         let exe_dir = std::env::current_exe()
-            .map_err(|e| EcError::DllLoad(format!("current_exe: {}", e)))?
+            .map_err(|e| EcError::DllLoad(format!("无法获取当前可执行文件路径: {}", e)))?
             .parent()
-            .ok_or_else(|| EcError::DllLoad("executable has no parent directory".into()))?
+            .ok_or_else(|| EcError::DllLoad("可执行文件路径没有父目录".into()))?
             .to_path_buf();
 
         // 兼容性提示：历史版本支持用户把自定义 DLL 放到当前工作目录。
@@ -338,14 +373,26 @@ impl WinRing0Backend {
             );
         }
 
-        // 1. Try alongside the EXE (absolute path)
+        // 1. Try alongside the EXE (absolute path) — **仅当与嵌入副本内容一致**
         // 失败原因暂存（如 DLL 缺失 / InitializeOls 失败 / 驱动加载被拒绝）：
         // 步骤 2 也失败时把最具体的错误带进最终返回，避免笼统的
         // "not found" 掩盖真实根因（如 DLL 在但驱动初始化失败）。
+        //
+        // **内容校验**（修订 1.46 安全加固）：EXE 目录在便携部署中常为普通
+        // 用户可写（Downloads/Desktop），低权限用户可预置同名恶意 DLL——
+        // 提权进程若直接加载即提权代码执行。仅当磁盘副本与嵌入资源**字节
+        // 一致**（自上次提取以来未被改写）才直接加载；不一致/缺失则走
+        // 步骤 2 用嵌入副本重新提取后加载，杜绝加载未验证的同名文件。
         let exe_dll = exe_dir.join(name);
-        match try_load_all(&exe_dll.to_string_lossy()) {
-            Ok(backend) => return Ok(backend),
-            Err(e) => log::warn!("WinRing0: load from EXE dir failed: {}", e),
+        if crate::embed::exe_dir_dll_is_embedded() {
+            match try_load_all(&exe_dll) {
+                Ok(backend) => return Ok(backend),
+                Err(e) => log::warn!("WinRing0: load from EXE dir failed: {}", e),
+            }
+        } else {
+            log::warn!(
+                "WinRing0: EXE-dir DLL differs from embedded copy or missing; re-extracting trusted copy"
+            );
         }
 
         // 2. Fall back to extracting the embedded binaries into the EXE
@@ -355,8 +402,7 @@ impl WinRing0Backend {
             Ok(p) => p,
             Err(e) => return Err(EcError::DllLoad(format!("{} 提取失败: {}", name, e))),
         };
-        let path_str = extracted_path.to_string_lossy().to_string();
-        try_load_all(&path_str)
+        try_load_all(&extracted_path)
     }
 }
 
@@ -382,23 +428,25 @@ impl WinRing0Backend {
         let addr = ec_addr_u8(addr)?;
         let _guard = crate::util::lock_or_recover(&self.lock, "WinRing0");
         // IBF（bit1）空闲后才能写命令/地址/数据；OBF（bit0）就绪后才能读数。
-        // 各等待步骤带语义名，超时时能区分卡在哪一步（见 step_wait 注释）。
-        step_wait(self.rp, "读:命令前 IBF 清", 0x02, 0)?;
-        unsafe { (self.wp)(ec_addr::EC_CMD, 0x80) };
-        step_wait(self.rp, "读:地址前 IBF 清", 0x02, 0)?;
+        // 各等待步骤带语义名，超时时能区分卡在哪一步。
+        ec_wait_status(self.rp, "读:命令前 IBF 清", EC_IBF_MASK, 0)?;
+        unsafe { (self.wp)(ec_addr::EC_CMD, EC_CMD_READ) };
+        ec_wait_status(self.rp, "读:地址前 IBF 清", EC_IBF_MASK, 0)?;
         unsafe { (self.wp)(ec_addr::EC_DATA, addr) };
         // 最终 OBF 等待失败后，EC 可能刚好在超时瞬间置 OBF——数据已就绪在
         // 数据端口。此时返回 Err 但**不读走**该字节，残留值会使下一次
         // `read_byte` 的 OBF 等待立即命中、返回陈旧数据（R1 回归）。
         // 超时路径把数据端口清掉（read 会清 OBF），让后续读取从干净状态开始。
-        step_wait(self.rp, "读:数据 OBF 就绪", 0x01, 0x01).inspect_err(|_| {
-            let stale = unsafe { (self.rp)(ec_addr::EC_DATA) };
-            log::warn!(
-                "WinRing0: OBF timeout after address 0x{:02x}; drained stale data 0x{:02x}",
-                addr,
-                stale
-            );
-        })?;
+        ec_wait_status(self.rp, "读:数据 OBF 就绪", EC_OBF_MASK, EC_OBF_MASK).inspect_err(
+            |_| {
+                let stale = unsafe { (self.rp)(ec_addr::EC_DATA) };
+                log::warn!(
+                    "WinRing0: OBF timeout after address 0x{:02x}; drained stale data 0x{:02x}",
+                    addr,
+                    stale
+                );
+            },
+        )?;
         Ok(unsafe { (self.rp)(ec_addr::EC_DATA) })
     }
 
@@ -410,13 +458,13 @@ impl WinRing0Backend {
     fn write_byte_once(&self, addr: u16, value: u8) -> Result<(), EcError> {
         let addr = ec_addr_u8(addr)?;
         let _guard = crate::util::lock_or_recover(&self.lock, "WinRing0");
-        step_wait(self.rp, "写:命令前 IBF 清", 0x02, 0)?;
-        unsafe { (self.wp)(ec_addr::EC_CMD, 0x81) };
-        step_wait(self.rp, "写:地址前 IBF 清", 0x02, 0)?;
+        ec_wait_status(self.rp, "写:命令前 IBF 清", EC_IBF_MASK, 0)?;
+        unsafe { (self.wp)(ec_addr::EC_CMD, EC_CMD_WRITE) };
+        ec_wait_status(self.rp, "写:地址前 IBF 清", EC_IBF_MASK, 0)?;
         unsafe { (self.wp)(ec_addr::EC_DATA, addr) };
-        step_wait(self.rp, "写:值前 IBF 清", 0x02, 0)?;
+        ec_wait_status(self.rp, "写:值前 IBF 清", EC_IBF_MASK, 0)?;
         unsafe { (self.wp)(ec_addr::EC_DATA, value) };
-        step_wait(self.rp, "写:完成 IBF 清", 0x02, 0)?;
+        ec_wait_status(self.rp, "写:完成 IBF 清", EC_IBF_MASK, 0)?;
         Ok(())
     }
 }
@@ -426,8 +474,8 @@ impl EcBackend for WinRing0Backend {
         "WinRing0 (I/O Port)"
     }
 
-    fn preference(&self) -> super::config::BackendPreference {
-        super::config::BackendPreference::WinRing0
+    fn preference(&self) -> crate::app::config::BackendPreference {
+        crate::app::config::BackendPreference::WinRing0
     }
 
     // ── High-level battery ──
@@ -436,11 +484,11 @@ impl EcBackend for WinRing0Backend {
         // Derive from charge limit — EC may auto-sync BATTERY_CARE from
         // CHARGE_LIMIT on real hardware, so reading 0xA4 directly is unreliable.
         let limit = self.get_charge_limit()?;
-        log::info!(
+        log::debug!(
             "WinRing0: battery care enabled by charge limit -> {}%",
             limit
         );
-        Ok(super::battery::care_enabled_from_limit(limit))
+        Ok(crate::app::battery::care_enabled_from_limit(limit))
     }
 
     fn get_charge_limit(&self) -> Result<u8, EcError> {
@@ -454,13 +502,13 @@ impl EcBackend for WinRing0Backend {
         // 消毒也会把 0 归一化为 80。因此非法值直接返回错误，由调用方决定
         // 处理（刷新展示错误、写后回读走"保留写入值"的兜底），绝不冒充有效
         // 的 100% 状态。
-        if raw == 0 || raw > 100 {
+        if raw == 0 || raw > crate::app::limits::FULL_CHARGE_LIMIT {
             return Err(EcError::InvalidData(format!(
                 "充电上限寄存器值 0x{:02x} 非法",
                 raw
             )));
         }
-        log::info!("WinRing0: read charge limit -> {}%", raw);
+        log::debug!("WinRing0: read charge limit -> {}%", raw);
         Ok(raw)
     }
 
@@ -472,7 +520,7 @@ impl EcBackend for WinRing0Backend {
 
     fn set_charge_limit(&self, percent: u8) -> Result<(), EcError> {
         // 写入前统一校验（0 拒绝 / >100 钳制），见 battery::validate_charge_limit_write。
-        let pct = super::battery::validate_charge_limit_write(percent)?;
+        let pct = crate::app::battery::validate_charge_limit_write(percent)?;
         log::info!("WinRing0: set charge limit -> {}%", pct);
         self.write_byte(ec_addr::CHARGE_LIMIT, pct)
     }
@@ -481,14 +529,14 @@ impl EcBackend for WinRing0Backend {
         // 单次端口读：养护位由限值推导（见 get_battery_care_enabled），
         // 避免默认实现再读一次限值（B-WMI-1）。
         let limit = self.get_charge_limit()?;
-        Ok((super::battery::care_enabled_from_limit(limit), limit))
+        Ok((crate::app::battery::care_enabled_from_limit(limit), limit))
     }
 
     // ── High-level performance mode ──
 
     fn get_performance_mode(&self) -> Result<u8, EcError> {
         let mode = self.read_byte(ec_addr::PERF_MODE)?;
-        log::info!("WinRing0: read perf mode -> {:#x}", mode);
+        log::debug!("WinRing0: read perf mode -> {:#x}", mode);
         Ok(mode)
     }
 

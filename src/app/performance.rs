@@ -13,14 +13,15 @@ pub enum PerfMode {
 
 impl PerfMode {
     pub fn from_ec_value(val: u8) -> Option<Self> {
-        match val {
-            0x0A => Some(Self::Eco),
-            0x02 => Some(Self::Quiet),
-            0x09 => Some(Self::Smart),
-            0x03 => Some(Self::Fast),
-            0x04 => Some(Self::Extreme),
-            _ => None,
+        // 判别值与协议值统一经 `ec_value()` 单点引用：历史实现把 0x0A/0x02/…
+        // 逐字再写一遍，与枚举判别值互为两个事实来源——改判别值不同步改这里
+        // 就静默漂移（仅往返测试能抓住）。改为与判别值同源（修订 1.46 审计）。
+        for mode in Self::all() {
+            if mode.ec_value() == val {
+                return Some(*mode);
+            }
         }
+        None
     }
 
     /// 模式对应的 EC raw code。

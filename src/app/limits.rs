@@ -8,6 +8,13 @@
 /// 配置中充电上限的默认值（也是 GUI 滑块/后端预设的常见起点）。
 pub const DEFAULT_CHARGE_LIMIT: u8 = 80;
 
+/// 充电上限的**满充**值：`limit == FULL_CHARGE_LIMIT` 即"不限制充电"（养护
+/// 关闭），`limit < FULL_CHARGE_LIMIT` 即养护开启。该语义散落在 battery.rs
+/// 的 `care_enabled_from_limit`/`apply_battery_state`、limits.rs 的自洽规则、
+/// config.rs 消毒与 mock/winring0 的读回校验各自书写 `100`——收敛到此处后，
+/// 任何阈值调整只改这一处，全部路径同时生效。
+pub const FULL_CHARGE_LIMIT: u8 = 100;
+
 /// 电池养护开启时上限被清为 100%（矛盾组合）时的统一兜底值。
 pub const FALLBACK_CARE_LIMIT: u8 = DEFAULT_CHARGE_LIMIT;
 
@@ -21,7 +28,7 @@ pub const FALLBACK_CARE_LIMIT: u8 = DEFAULT_CHARGE_LIMIT;
 /// get_charge_limit、WMI 的 raw code 映射），写入 `0` 会落到"WinRing0 写
 /// 0x00、WMI 就近映射成 40%"的静默写寄存器兜底，与读回契约不一致。
 pub fn coherent_charge_limit(enabled: bool, limit: u8) -> u8 {
-    if enabled && (limit == 0 || limit >= 100) {
+    if enabled && (limit == 0 || limit >= FULL_CHARGE_LIMIT) {
         FALLBACK_CARE_LIMIT
     } else {
         limit

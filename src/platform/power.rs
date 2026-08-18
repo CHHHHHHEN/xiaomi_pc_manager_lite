@@ -1,21 +1,15 @@
-//! 电源状态查询（Windows 系统 API）。
+//! 电源状态查询（Windows 系统 API）——`PowerSource` 端口的平台实现。
+//!
+//! 领域类型 `PowerStatus`/`PowerSnapshot` 与端口 `PowerSource` 定义在
+//! `app::power`（纯领域模块）。本模块提供 `WindowsPowerSource`（`GetSystemPowerStatus`
+//! 实现）以及面向兼容的 `power_status()` / `power_snapshot()` 便捷函数。
 
-/// 当前电源状态（三态）。
-///
-/// 历史实现把 `GetSystemPowerStatus` 的失败**静默当作电池供电**（返回
-/// false），且 MSDN 定义的 `ACLineStatus == 255`（未知）也被判为电池——
-/// 交流供电下狂暴模式会被静默降级为极速，用户选择被无声改写。改为三态：
-/// 只有在**确认**是电池供电时才执行降级；未知（API 失败或 255）单独标记，
-/// 由调用方决定处理（不静默降级）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PowerStatus {
-    /// 接入交流电源。
-    OnAc,
-    /// 电池供电。
-    OnBattery,
-    /// 无法确认（`GetSystemPowerStatus` 失败或返回未定义值）。
-    Unknown,
-}
+use crate::app::power::PowerSource;
+pub use crate::app::power::{PowerSnapshot, PowerStatus};
+
+/// MSDN `SYSTEM_POWER_STATUS` 的"未知"哨兵值：`ACLineStatus == 255`（未知）
+/// 与 `BatteryLifePercent == 255`（未知/未装电池）共用同一字节。
+const UNKNOWN_SENTINEL: u8 = 255;
 
 fn classify_acline(ac_line_status: u8) -> PowerStatus {
     match ac_line_status {
@@ -26,32 +20,35 @@ fn classify_acline(ac_line_status: u8) -> PowerStatus {
     }
 }
 
-/// 未知电源状态告警的**去重**：`power_status`/`power_snapshot` 被 GUI 每帧
+/// 未知电源状态告警的**去重**：`WindowsPowerSource::snapshot` 被 GUI 每帧
 /// 与托盘每 2s 轮询，若某台机器 `ACLineStatus` 恒为 255（无电池/驱动异常），
-/// 未去重的实现会在每个调用点刷一条 warn——每秒几十条重复日志，把真实告警
-/// 淹没并加速日志轮转（M2 回归，修订 1.30）。只在**状态值变化**时记录：
-/// 首次出现未知值告警一次，之后同样的未知值静默。
+/// 未去重的实现会在每个调用点刷一条 warn。只在**状态值变化**时记录。
 static LAST_WARNED_UNKNOWN: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// 未知电源状态告警（仅首次出现时记录一次，之后静默）。
-///
-/// `power_status`/`power_snapshot` 两个查询函数共用同一个一次告警闩：
-/// `ACLineStatus` 未知与 `GetSystemPowerStatus` 调用失败都会落到"电源状态
-/// 未知"，分开记录会刷两条重复日志（且失败路径每帧刷 error 的问题与 M2 同源，
-/// 修订 1.30 一并收敛）。首次记录后置位闩，之后同状态静默。
 fn warn_unknown_once() -> bool {
-    let first = !LAST_WARNED_UNKNOWN.swap(true, std::sync::atomic::Ordering::Relaxed);
-    if first {
-        log::warn!("Power state unknown; won't repeat this session");
+    crate::util::log_once(
+        log::Level::Warn,
+        &LAST_WARNED_UNKNOWN,
+        "Power state unknown; won't repeat this session",
+    )
+}
+
+/// `GetSystemPowerStatus` 查询的 `PowerSource` 实现。
+///
+/// 用法：`let power = WindowsPowerSource; power.snapshot().status`。
+/// 领域层/用例层只依赖 `&dyn PowerSource`，不触碰 Windows API。
+pub struct WindowsPowerSource;
+
+impl PowerSource for WindowsPowerSource {
+    fn snapshot(&self) -> PowerSnapshot {
+        power_snapshot()
     }
-    first
 }
 
 /// 一次查询 `GetSystemPowerStatus`，失败时返回 None 并记录错误（经
-/// `warn_unknown_once` 去重，避免失败持续期间每帧刷一条 error）。
-///
-/// `power_status` / `power_snapshot` 共用此函数，避免各自重复错误日志。
+/// `warn_unknown_once` 去重）。
 fn system_power_status() -> Option<windows::Win32::System::Power::SYSTEM_POWER_STATUS> {
     let mut status = unsafe { std::mem::zeroed() };
     if unsafe { windows::Win32::System::Power::GetSystemPowerStatus(&mut status) }.is_err() {
@@ -65,28 +62,12 @@ fn system_power_status() -> Option<windows::Win32::System::Power::SYSTEM_POWER_S
 ///
 /// 历史实现位于 `ec::performance`（纯逻辑枚举/EC 值映射），但电源查询是纯
 /// Windows 系统能力（`GetSystemPowerStatus`），与领域模型无关——收敛到
-/// platform 层后，`ec::performance` 保持为无平台依赖的纯领域模块。
+/// platform 层后，`app::performance` 保持为无平台依赖的纯领域模块。
 pub fn power_status() -> PowerStatus {
-    let Some(status) = system_power_status() else {
-        return PowerStatus::Unknown;
-    };
-    let power = classify_acline(status.ACLineStatus);
-    if power == PowerStatus::Unknown {
-        warn_unknown_once();
-    }
-    power
+    power_snapshot().status
 }
 
-/// 一次调用同时返回电源状态与电池电量百分比（状态栏/托盘共用，避免两次
-/// 完整查询）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PowerSnapshot {
-    pub status: PowerStatus,
-    /// 电池电量百分比；`None` 表示 API 失败、未知（255）或未装电池。
-    pub battery_percent: Option<u8>,
-}
-
-/// 电源状态与电池电量的一次性快照。
+/// 电源状态与电池电量的一次性快照（GUI 状态栏/托盘共用，避免两次查询）。
 pub fn power_snapshot() -> PowerSnapshot {
     let Some(s) = system_power_status() else {
         return PowerSnapshot {
@@ -100,7 +81,8 @@ pub fn power_snapshot() -> PowerSnapshot {
     }
     // MSDN BatteryLifePercent：0-100 有效，255=未知/未装。255 返回 None，
     // 由调用方显示"未知"而非荒谬的 255%。
-    let battery_percent = (s.BatteryLifePercent != 255).then_some(s.BatteryLifePercent);
+    let battery_percent =
+        (s.BatteryLifePercent != UNKNOWN_SENTINEL).then_some(s.BatteryLifePercent);
     PowerSnapshot {
         status,
         battery_percent,
@@ -111,12 +93,15 @@ pub fn power_snapshot() -> PowerSnapshot {
 mod tests {
     use super::*;
 
+    /// 串行化依赖共享静态 `LAST_WARNED_UNKNOWN` 的两个测试。
+    static POWER_TEST_SERIALIZE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// MSDN 语义：0=电池、1=交流、255=未知（不能把未知静默当电池）。
     #[test]
     fn test_classify_acline_semantics() {
         assert_eq!(classify_acline(0), PowerStatus::OnBattery);
         assert_eq!(classify_acline(1), PowerStatus::OnAc);
-        assert_eq!(classify_acline(255), PowerStatus::Unknown);
+        assert_eq!(classify_acline(UNKNOWN_SENTINEL), PowerStatus::Unknown);
         // 其余值均按未知处理，绝不静默归入电池。
         assert_eq!(classify_acline(2), PowerStatus::Unknown);
     }
@@ -124,16 +109,15 @@ mod tests {
     /// 仅验证可调用、不崩溃；结果取决于运行环境。
     #[test]
     fn test_power_status_does_not_panic() {
+        let _guard = POWER_TEST_SERIALIZE.lock().unwrap();
         let _ = power_status();
+        let _ = WindowsPowerSource.snapshot();
     }
 
-    /// 未知电源状态告警去重（M2 回归，修订 1.30）：首次告警返回 true，
-    /// 之后同状态的重复告警返回 false——GUI 每帧 + 托盘每 2s 轮询下
-    /// 不会每秒刷几十条重复日志。
+    /// 未知电源状态告警去重。
     #[test]
     fn test_warn_unknown_once_deduplicates() {
-        // 该静态量被生产路径共享：把已知的当前值记下，测试结束后恢复，
-        // 避免污染其它测试或真实轮询的状态。
+        let _guard = POWER_TEST_SERIALIZE.lock().unwrap();
         let prev = LAST_WARNED_UNKNOWN.load(std::sync::atomic::Ordering::Relaxed);
         LAST_WARNED_UNKNOWN.store(false, std::sync::atomic::Ordering::Relaxed);
         assert!(warn_unknown_once(), "first unknown must be reported");

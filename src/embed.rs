@@ -1,9 +1,83 @@
 use rust_embed::RustEmbed;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(RustEmbed)]
 #[folder = "bin"]
 struct WinRing0Binaries;
+
+/// 嵌入式 WinRing0 DLL 的原始字节（按当前架构文件名，单一事实来源）。
+///
+/// 加载路径用它做**内容校验**（见 `winring0::WinRing0Backend::new` 与
+/// `extract_winring0`）：仅当 EXE 目录中的 DLL 与此字节一致时才允许直接加载，
+/// 否则按嵌入副本重新提取——杜绝"EXE 目录被低权限用户塞入同名恶意 DLL"后
+/// 提权进程直接加载（修订 1.46 安全加固）。
+pub fn embedded_dll_bytes() -> Result<std::borrow::Cow<'static, [u8]>, String> {
+    let (dll_name, _) = crate::ec::winring0::arch_file_names();
+    WinRing0Binaries::get(dll_name)
+        .map(|f| f.data)
+        .ok_or_else(|| format!("{} not found in embedded binaries", dll_name))
+}
+
+/// 原子写文件：先写同目录唯一临时文件，再 rename 覆盖目标。
+///
+/// **为什么**（修订 1.46 安全加固）：本进程以管理员运行，`std::fs::write`
+/// 直接写目标路径会**跟随目标处的符号链接/重解析点**（CreateFile 语义），
+/// 低权限用户可在可写的 EXE 目录（便携部署常见）预置 `WinRing0x64.dll/.sys`
+/// 符号链接指向任意文件，提权进程随即截断/覆写该文件（TOCTOU 提权写入）。
+/// 先写唯一临时文件再 `std::fs::rename`（Windows 上映射为
+/// `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`）则**替换整个目录项**而非跟随
+/// 重解析点——目标若为链接，被整体替换为正常文件，不会写穿到链接目标。
+///
+/// 临时文件名含 PID + 自增序号：同目录并发写入互不冲突（rename 原子性）；
+/// 残留临时文件在下次成功写入前可能堆积，但数量 = 并发写入次数、极小，
+/// 且写入成功路径必 rename（失败路径的临时文件由调用方清理）。
+pub(crate) fn atomic_write(path: &Path, data: &[u8]) -> Result<(), String> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = path
+        .parent()
+        .ok_or_else(|| format!("no parent for {:?}", path))?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| format!("no file name for {:?}", path))?;
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp_path = dir.join(format!(
+        ".{}.tmp.{}.{}",
+        file_name.to_string_lossy(),
+        std::process::id(),
+        seq
+    ));
+
+    let write_result =
+        std::fs::write(&tmp_path, data).and_then(|()| std::fs::rename(&tmp_path, path));
+    match write_result {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // 失败时清理临时文件（尽力而为，避免残留）。
+            let _ = std::fs::remove_file(&tmp_path);
+            Err(format!("write {}: {}", path.to_string_lossy(), e))
+        }
+    }
+}
+
+/// 校验 EXE 目录中的 DLL 是否与嵌入副本**内容一致**（字节级）。
+///
+/// 一致 = 自上次提取以来未被外部改写（可信副本，直接加载）；不一致/缺失 =
+/// 可能被低权限用户在可写 EXE 目录替换为恶意 DLL——必须重新提取嵌入副本。
+pub fn exe_dir_dll_is_embedded() -> bool {
+    let (dll_name, _) = crate::ec::winring0::arch_file_names();
+    let Some(exe_dir) = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|p| p.to_path_buf()))
+    else {
+        return false;
+    };
+    let Ok(disk) = std::fs::read(exe_dir.join(dll_name)) else {
+        return false;
+    };
+    embedded_dll_bytes()
+        .map(|embedded| disk.as_slice() == embedded.as_ref())
+        .unwrap_or(false)
+}
 
 pub fn extract_winring0() -> Result<PathBuf, String> {
     // 文件名对（DLL, SYS）统一由 winring0.rs 提供，避免两处硬编码漂移。
@@ -31,31 +105,53 @@ pub fn extract_winring0() -> Result<PathBuf, String> {
     // `main::init_logging` 的日志目录（app.log 由本进程持有打开句柄，删除
     // 必然失败且永远静默失败），而且会误删同目录下其它应用/实例的文件。
     // 只删除按文件名精确匹配的遗留副本，绝不整目录删除。
-    let old_sys_dir =
-        std::path::PathBuf::from(std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into()))
-            .join("Temp");
-    let _ = std::fs::remove_file(old_sys_dir.join(dll_name));
-    let _ = std::fs::remove_file(old_sys_dir.join(sys_name));
-
-    // Remove stale files at the target location, retry once if handles linger
-    for retry in 0..2 {
-        let _ = std::fs::remove_file(target_dir.join(dll_name));
-        let _ = std::fs::remove_file(target_dir.join(sys_name));
-        if retry == 0 {
-            std::thread::sleep(std::time::Duration::from_millis(300));
+    //
+    // 旧路径在 `%WINDIR%\Temp`。WINDIR 是 Windows 系统变量恒被设置；万一
+    // 缺失（环境异常）则跳过该清理并记录 debug——不猜测系统根目录
+    // （历史实现硬编码 `C:\Windows` 兜底），该清理本身是尽力而为。
+    match std::env::var_os("WINDIR") {
+        Some(dir) => {
+            let old_sys_dir = std::path::PathBuf::from(dir).join("Temp");
+            let _ = std::fs::remove_file(old_sys_dir.join(dll_name));
+            let _ = std::fs::remove_file(old_sys_dir.join(sys_name));
+        }
+        None => {
+            log::debug!("WINDIR not set; skipping legacy %WINDIR%\\Temp cleanup");
         }
     }
 
+    // 原子写（临时文件 + rename）：不跟随目标重解析点，见 atomic_write 注释。
+    // remove_file 前置清理改为原子替换承载：直接 rename 覆盖既有文件（含陈旧
+    // 句柄残留时的重试——历史"remove+write"存在竞态窗口，替换为单次原子操作）。
+    //
+    // DLL 与 SYS **统一**用带重试的原子写（修订 1.47 审计）：历史实现只给
+    // DLL 3 次尝试，SYS 单次直写——上一实例仍持有 `.sys` 句柄时（驱动服务
+    // 卸载/文件占用竞态），SYS 提取单次失败即整个后端初始化失败，与 DLL
+    // 的容错策略不一致。两者都可能被残留句柄短暂占用，重试节奏统一。
     let dll_path = target_dir.join(dll_name);
-    std::fs::write(&dll_path, &embedded_dll.data)
-        .map_err(|e| format!("write {}: {}", dll_name, e))?;
-
+    atomic_write_with_retry(&dll_path, &embedded_dll.data)?;
     let sys_path = target_dir.join(sys_name);
-    std::fs::write(&sys_path, &embedded_sys.data)
-        .map_err(|e| format!("write {}: {}", sys_name, e))?;
+    atomic_write_with_retry(&sys_path, &embedded_sys.data)?;
 
     log::info!("Extracted {} + {} to {:?}", dll_name, sys_name, target_dir);
     Ok(dll_path)
+}
+
+/// 原子写 + 短暂重试（覆盖旧版本残留句柄的竞态，DLL/SYS 共用）。
+fn atomic_write_with_retry(path: &std::path::Path, data: &[u8]) -> Result<(), String> {
+    let mut last_err = None;
+    for attempt in 0..3 {
+        match atomic_write(path, data) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_err = Some(e);
+                if attempt < 2 {
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                }
+            }
+        }
+    }
+    Err(last_err.expect("loop always sets last_err on failure"))
 }
 
 #[cfg(test)]
@@ -93,5 +189,39 @@ mod tests {
             "missing embedded {}",
             sys_name
         );
+    }
+
+    /// 原子写（临时文件 + rename）必须覆盖既有文件内容（修订 1.46 安全
+    /// 加固的写入语义：rename 替换目录项而非跟随重解析点）。
+    #[test]
+    fn test_atomic_write_replaces_existing() {
+        let dir = std::env::temp_dir().join(format!("xmpl-atomic-write-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("target.bin");
+        // 首次写入。
+        atomic_write(&path, b"first").expect("write must succeed");
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+        // 覆盖既有文件。
+        atomic_write(&path, b"second-larger").expect("overwrite must succeed");
+        assert_eq!(std::fs::read(&path).unwrap(), b"second-larger");
+        // 没有残留临时文件（写入成功路径必 rename）。
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no temp files may remain: {:?}",
+            leftovers
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 嵌入 DLL 字节可读且与嵌入资源一致（exe_dir_dll_is_embedded 的输入源）。
+    #[test]
+    fn test_embedded_dll_bytes_present() {
+        let bytes = embedded_dll_bytes().expect("embedded DLL bytes must exist");
+        assert!(!bytes.is_empty(), "embedded DLL must not be empty");
     }
 }
