@@ -333,13 +333,16 @@ impl XiaomiApp {
         action: ec::fnkey::FnAction,
         command: &str,
     ) {
-        if class.trim().is_empty() || prefix.trim().is_empty() {
-            log::warn!("add_fn_binding: empty class/prefix ignored");
+        // 与 config.rs 消毒同一套规则（修订 1.32/M3）：前缀须至少一个完整
+        // 字节、类名须为合法 WQL 标识符——单字节前缀与非法类名即使手改
+        // 配置也会被丢弃，GUI 侧保持一致避免"能加进去但下次加载被删"。
+        if !ec::fnkey::valid_class(class) {
+            log::warn!("add_fn_binding: invalid class ignored: {:?}", class);
             return;
         }
         let prefix = ec::fnkey::normalize_hex(prefix);
-        if prefix.is_empty() {
-            log::warn!("add_fn_binding: non-hex prefix ignored: {:?}", prefix);
+        if !ec::fnkey::valid_prefix(&prefix) {
+            log::warn!("add_fn_binding: invalid prefix ignored: {:?}", prefix);
             return;
         }
         // 只有 RunCommand 动作会携带命令文本；其余动作恒为 None。

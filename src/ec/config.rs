@@ -257,13 +257,17 @@ impl AppConfig {
             coherent_charge_limit(self.battery_care_enabled, self.battery_charge_limit);
 
         // Fn 绑定消毒：丢弃空类/空前缀的条目（手改配置可能留下残缺绑定；
-        // 前缀为空时匹配一切事件，属于危险配置，宁可丢弃）。绑定动作由
-        // serde 枚举保证合法（未知枚举名直接解析失败走降级配置）。
+        // 前缀为空时匹配一切事件，属于危险配置，宁可丢弃）。前缀必须是
+        // 至少一个完整字节（归一化后偶数长度，修订 1.32/M3）：单字节前缀
+        // 如 "0" 会匹配几乎全部该事件流（各报告大多以 0 开头），等同危险
+        // 配置；类名必须是合法 WQL 标识符（防 WQL 注入，修订 1.32/M2）。
+        // 绑定动作由 serde 枚举保证合法（未知枚举名直接解析失败走降级配置）。
         let before = std::mem::take(&mut self.fn_key_bindings);
         self.fn_key_bindings = before
             .into_iter()
             .filter(|b| {
-                let valid = !b.class.trim().is_empty() && !b.prefix.trim().is_empty();
+                let valid = crate::ec::fnkey::valid_class(&b.class)
+                    && crate::ec::fnkey::valid_prefix(&b.prefix);
                 if !valid {
                     log::warn!("Config: dropping invalid fn key binding {:?}", b);
                 }
@@ -623,6 +627,45 @@ mod tests {
         assert_eq!(cfg.fn_key_bindings.len(), 1);
         assert_eq!(cfg.fn_key_bindings[0].class, "HID_EVENT20");
         assert_eq!(cfg.fn_key_bindings[0].prefix, "0107");
+    }
+
+    /// 修订 1.32/M3：消毒必须一并丢弃**单字节前缀**（归一化后长度 1，如
+    /// "0" 匹配几乎全部该事件流）与非法类名（WQL 注入面），与 GUI 侧
+    /// add_fn_binding 同一套校验规则。
+    #[test]
+    fn test_sanitize_drops_single_digit_prefix_and_bad_class() {
+        let mut cfg = AppConfig {
+            fn_key_bindings: vec![
+                crate::ec::fnkey::FnKeyBinding {
+                    class: "HID_EVENT20".into(),
+                    prefix: "0".into(),
+                    action: crate::ec::fnkey::FnAction::None,
+                    command: None,
+                },
+                crate::ec::fnkey::FnKeyBinding {
+                    class: "HID_EVENT20 WHERE Foo=1".into(),
+                    prefix: "012801".into(),
+                    action: crate::ec::fnkey::FnAction::None,
+                    command: None,
+                },
+                crate::ec::fnkey::FnKeyBinding {
+                    class: "HID_EVENT20".into(),
+                    prefix: "012".into(),
+                    action: crate::ec::fnkey::FnAction::None,
+                    command: None,
+                },
+                crate::ec::fnkey::FnKeyBinding {
+                    class: "HID_EVENT20".into(),
+                    prefix: "012801".into(),
+                    action: crate::ec::fnkey::FnAction::ReapplyConfig,
+                    command: None,
+                },
+            ],
+            ..Default::default()
+        };
+        cfg.sanitize();
+        assert_eq!(cfg.fn_key_bindings.len(), 1);
+        assert_eq!(cfg.fn_key_bindings[0].prefix, "012801");
     }
 
     /// 旧版本配置文件（无 fn_key_bindings 字段）反序列化时，必须回退到

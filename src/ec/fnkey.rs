@@ -381,13 +381,13 @@ fn run_watcher_loop(
         }
 
         if enumerators.is_empty() {
-            empty_streak += 1;
             // 没有绑定且未捕获时，没有订阅任何类是正常状态：空转等待
             // 新绑定（GUI 添加绑定后下一轮即订阅），不刷屏日志。
             if subscribed_classes.is_empty() && !capturing {
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 continue;
             }
+            empty_streak += 1;
             if empty_streak >= 6 {
                 return Err(WatcherError::NoEventClasses);
             }
@@ -523,28 +523,37 @@ fn dispatch_bindings(
     bindings: &SharedBindings,
     cmd_tx: &mpsc::Sender<UiCommand>,
 ) -> bool {
-    for binding in lock_or_recover_bindings(bindings).iter() {
-        if binding.class != class_name {
-            continue;
-        }
-        let prefix = normalize_hex(&binding.prefix);
-        if prefix.is_empty() || !normalized.starts_with(&prefix) {
-            continue;
-        }
-        log::info!("Fn: matched {} -> {}", binding.label(), normalized);
-        // 自定义命令：以独立进程执行（不阻塞监听线程），无 UiCommand。
-        if binding.action == FnAction::RunCommand {
-            run_external_command(binding.command.as_deref());
-            return true;
-        }
-        if let Some(cmd) = binding.action.as_ui_command() {
-            send_watcher_command(cmd_tx, cmd);
-        } else {
-            log::debug!("Fn: binding {} has no action; consumed", binding.label());
-        }
+    // 先复制出命中绑定的动作数据再释放读锁：避免在持锁期间做跨线程
+    // spawn（失败即 panic，会毒化共享锁并永久杀死监听线程——L1 回归）。
+    let matched: Option<(String, FnAction, Option<String>)> = lock_or_recover_bindings(bindings)
+        .iter()
+        .find(|b| {
+            b.class == class_name && {
+                let prefix = normalize_hex(&b.prefix);
+                !prefix.is_empty() && normalized.starts_with(&prefix)
+            }
+        })
+        .map(|b| (b.class.clone(), b.action, b.command.clone()));
+    let Some((binding_class, action, command)) = matched else {
+        return false;
+    };
+    log::info!(
+        "Fn: matched {} / {} -> {}",
+        binding_class,
+        normalized,
+        action.name()
+    );
+    // 自定义命令：以独立进程执行（不阻塞监听线程），无 UiCommand。
+    if action == FnAction::RunCommand {
+        run_external_command(command.as_deref());
         return true;
     }
-    false
+    if let Some(cmd) = action.as_ui_command() {
+        send_watcher_command(cmd_tx, cmd);
+    } else {
+        log::debug!("Fn: binding {} has no action; consumed", action.name());
+    }
+    true
 }
 
 /// 以**独立进程**执行自定义命令（`RunCommand` 动作），不阻塞 WMI 事件
@@ -623,24 +632,32 @@ fn run_external_command(command: Option<&str>) {
         return;
     }
 
-    std::thread::spawn(move || {
-        // CREATE_NO_WINDOW = 0x08000000：不创建控制台窗口。
-        let mut cmd = std::process::Command::new("cmd.exe");
-        cmd.arg("/C");
-        cmd.arg(&command);
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x0800_0000);
-        }
-        match cmd.spawn() {
-            Ok(_child) => {
-                // 分离执行，不等待子进程。
-                log::debug!("Fn: external command spawned");
+    // 线程名带命令前缀便于排查（调试器/任务管理器线程列表）；Builder 而非
+    // `thread::spawn`：spawn 失败（OS 线程资源耗尽）时记录告警而非 panic
+    // 传播——监听线程在该路径无 catch_unwind，panic 会静默杀死监听（L1）。
+    let spawn_result = std::thread::Builder::new()
+        .name("fn-runcommand".to_string())
+        .spawn(move || {
+            // CREATE_NO_WINDOW = 0x08000000：不创建控制台窗口。
+            let mut cmd = std::process::Command::new("cmd.exe");
+            cmd.arg("/C");
+            cmd.arg(&command);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x0800_0000);
             }
-            Err(e) => log::warn!("Fn: external command spawn failed: {}", e),
-        }
-    });
+            match cmd.spawn() {
+                Ok(_child) => {
+                    // 分离执行，不等待子进程。
+                    log::debug!("Fn: external command spawned");
+                }
+                Err(e) => log::warn!("Fn: external command spawn failed: {}", e),
+            }
+        });
+    if let Err(e) = spawn_result {
+        log::warn!("Fn: failed to spawn command thread: {}", e);
+    }
 }
 
 /// 事件 hex 统一归一化：剔除所有非字母数字字符（如 "01-28-01" 的分隔符）
@@ -657,6 +674,31 @@ pub fn normalize_hex(report_hex: &str) -> String {
         .filter(|c| c.is_ascii_hexdigit())
         .collect::<String>()
         .to_ascii_uppercase()
+}
+
+/// 校验 Fn 绑定前缀是否安全可用。
+///
+/// 空串匹配一切事件、单字节（长度 1）前缀在归一化后大多以 `0` 开头会匹配
+/// 几乎全部同类型事件（如 `"0"`），都属于危险配置，一律拒绝（修订 1.32，
+/// M3 回归）。合法前缀必须能构成**至少一个完整字节**（偶数长度）。
+pub fn valid_prefix(prefix: &str) -> bool {
+    let p = normalize_hex(prefix);
+    p.len() >= 2 && p.len().is_multiple_of(2)
+}
+
+/// 校验 Fn 绑定的 WMI 事件类名是否为合法 WQL 标识符。
+///
+/// 类名会被原样拼进 `SELECT * FROM {}`（WQL），只允许
+/// `[A-Za-z_][A-Za-z0-9_]*`——否则手改配置注入 WHERE 子句可改变订阅
+/// 语义、甚至让监听线程在管理员权限下订阅并记录任意事件流（修订 1.32，
+/// M2 安全加固）。绑定动作由 serde 枚举保证合法。
+pub fn valid_class(class: &str) -> bool {
+    let mut chars = class.trim().chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// 将 VT_UI1 SAFEARRAY 的数据缓冲转为大写十六进制字符串。
@@ -727,6 +769,27 @@ mod tests {
         assert_eq!(normalize_hex("01-28-01 00 00"), "0128010000");
         assert_eq!(normalize_hex("012801ffff"), "012801FFFF");
         assert_eq!(normalize_hex(""), "");
+    }
+
+    /// 前缀校验（修订 1.32/M3）：空/单字节/奇数长度都是危险或无效配置；
+    /// 至少一个完整字节才合法。类名校验（M2）：只允许合法 WQL 标识符。
+    #[test]
+    fn test_valid_prefix_and_class() {
+        assert!(valid_prefix("012801"));
+        assert!(valid_prefix("01-28-01"));
+        assert!(valid_prefix("AB"));
+        assert!(!valid_prefix(""));
+        assert!(!valid_prefix("0"));
+        assert!(!valid_prefix("012"));
+        assert!(!valid_prefix("XYZ"));
+
+        assert!(valid_class("HID_EVENT20"));
+        assert!(valid_class("_MyClass2"));
+        assert!(!valid_class(""));
+        assert!(!valid_class("HID_EVENT20 WHERE Foo=1"));
+        assert!(!valid_class("HID-EVENT20"));
+        assert!(!valid_class("1CLASS"));
+        assert!(!valid_class("HID EVENT"));
     }
 
     /// 绑定前缀匹配：按下命中、释放不命中（F-FNK-06）、类不匹配不命中。
