@@ -7,6 +7,10 @@ use crate::ec::performance::PerfMode;
 
 use super::app::XiaomiApp;
 
+/// NFR-REL-03：连续硬件读写失败达到此阈值后，暂停自动重试并在 GUI 展示
+/// 持久提示（见 `refresh_from_backend` 的计数逻辑）。
+const HW_FAILURE_PAUSE_THRESHOLD: u32 = 3;
+
 impl XiaomiApp {
     pub fn process_commands(&mut self, ctx: &egui::Context) {
         let mut needs_repaint = false;
@@ -651,6 +655,15 @@ impl XiaomiApp {
                 errors.push(format!("读取电池状态: {}", e));
             }
         }
+        // NFR-REL-03：EC 读写连续失败计数。任意读取成功即清零（硬件恢复）；
+        // 连续失败达到阈值后暂停自动重试并提示用户（错误已展示，见下方
+        // error_msg 分支）。历史实现无限重试且无任何"连续失败"概念——
+        // 驱动失效/EC 掉线等持续故障下，用户只看到反复刷新的相同错误。
+        if errors.is_empty() {
+            self.consecutive_hw_failures = 0;
+        } else {
+            self.consecutive_hw_failures = self.consecutive_hw_failures.saturating_add(1);
+        }
         // Only the runtime state is refreshed here; the persisted config keeps
         // the user's desired settings so they are not silently overwritten by
         // whatever the hardware currently reports.
@@ -664,6 +677,18 @@ impl XiaomiApp {
             );
             self.error_msg = None;
         } else {
+            // 连续失败达阈值：把"已暂停自动重试"的持久提示并入错误展示，
+            // 让用户区分"偶发一次失败"与"后端已不可用"（NFR-REL-03）。
+            if self.consecutive_hw_failures >= HW_FAILURE_PAUSE_THRESHOLD {
+                log::warn!(
+                    "Hardware read failed {} consecutive times; pausing retry",
+                    self.consecutive_hw_failures
+                );
+                errors.push(format!(
+                    "硬件连续读取失败 {} 次，已暂停自动重试；请检查驱动或切换后端",
+                    self.consecutive_hw_failures
+                ));
+            }
             self.error_msg = Some(errors.join("; "));
         }
     }
@@ -1149,6 +1174,44 @@ mod tests {
         // The persisted desired settings must not be overwritten.
         assert_eq!(app.config.battery_charge_limit, 60);
         assert!(!app.config.battery_care_enabled);
+    }
+
+    /// NFR-REL-03：连续硬件读取失败达到阈值后，GUI 错误提示必须包含
+    /// "已暂停自动重试"（驱动失效/EC 掉线等持续故障不再静默无限重试）；
+    /// 任意一次成功读取清零计数并移除持久提示。
+    #[test]
+    fn test_consecutive_failures_pause_retry_and_reset_on_success() {
+        let store = test_store();
+        let mock = MockBackend::all_fail("hw-pause", BackendPreference::Auto);
+        let mut app = XiaomiApp::new(
+            store,
+            Box::new(mock.clone()),
+            AppConfig::default(),
+            crate::ec::config::BackendPreference::Auto,
+            None,
+            false,
+        );
+        // `XiaomiApp::new()` 已执行一次初始刷新：failing 后端下计 1 次失败。
+        assert_eq!(app.consecutive_hw_failures, 1);
+
+        // 再失败一次（累计 2）：错误展示但不带"已暂停"提示。
+        app.refresh_from_backend();
+        assert_eq!(app.consecutive_hw_failures, 2);
+        let msg = app.error_msg.as_deref().unwrap_or_default();
+        assert!(!msg.contains("已暂停自动重试"), "before threshold: {}", msg);
+
+        // 再失败一次（累计 3）：达到阈值，错误消息必须带持久暂停提示。
+        app.refresh_from_backend();
+        assert_eq!(app.consecutive_hw_failures, 3);
+        let msg = app.error_msg.as_deref().unwrap_or_default();
+        assert!(msg.contains("已暂停自动重试"), "at threshold: {}", msg);
+
+        // 一次成功读取：计数清零、持久提示移除。
+        mock.read_fails
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        app.refresh_from_backend();
+        assert_eq!(app.consecutive_hw_failures, 0);
+        assert!(app.error_msg.is_none());
     }
 
     /// 回归测试：损坏的 EC 读值（充电上限 >100，如寄存器返回 0xFF）不得

@@ -89,21 +89,35 @@ impl std::ops::Deref for OwnedVariant {
 ///
 /// fnkey.rs 与 wmi.rs 各自重复实现过同样的样板（to_pcwstr → Get → 取
 /// VARIANT），统一收敛到此处。返回的 VARIANT 由 `OwnedVariant` 在 Drop 时
-/// 自动释放，调用方无需手动 `VariantClear`。属性缺失时返回 None。
+/// 自动释放，调用方无需手动 `VariantClear`。
+///
+/// 属性缺失（`WBEM_E_NOT_FOUND`）时返回 None——这是各类事件对象属性可选
+/// 的**正常**情形（如 `EventDetail` 与 `ReportHex` 二选一）。其它 `Get`
+/// 失败（`WBEM_E_ACCESS_DENIED`/provider 错误等）说明对象本身或提供程序
+/// 异常，历史上被 `.ok()?` 静默吞掉、与"属性不存在"无法区分，真实故障
+/// 永远不可见——此处记录 warn 日志（仅此，不改变返回语义，调用方仍按
+/// None 处理；异常值本身不携带可恢复信息，告警足以排查）。
 pub fn get_property(obj: &IWbemClassObject, name: &str) -> Option<OwnedVariant> {
-    let name = crate::util::WideString::new(name);
+    let wname = crate::util::WideString::new(name);
     let mut val = VARIANT::default();
     let mut _type = 0i32;
     let mut _flavor = 0i32;
-    unsafe {
+    let hr = unsafe {
         obj.Get(
-            name.as_pcwstr(),
+            wname.as_pcwstr(),
             0,
             &mut val,
             Some(&mut _type as *mut i32),
             Some(&mut _flavor as *mut i32),
         )
-        .ok()?;
+    };
+    if let Err(e) = hr {
+        // WBEM_E_NOT_FOUND (0x80041002)：属性缺失，正常路径（部分事件对象
+        // 只带 ReportHex 不带 EventDetail 等），静默返回 None。
+        if (e.code().0 as u32) != (windows::Win32::System::Wmi::WBEM_E_NOT_FOUND.0 as u32) {
+            log::warn!("WMI Get({}) failed: {}", name, e);
+        }
+        return None;
     }
     Some(OwnedVariant::new(val))
 }

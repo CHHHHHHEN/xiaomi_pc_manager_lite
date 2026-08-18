@@ -44,7 +44,7 @@
 | 1.27 | 2026-08-17 | **二轮评审回归（真机验证 + 双代理复查）**：① 开机自启动**过期失败回滚**：串行 worker 中先发请求的失败结果可能晚于更新请求落盘后到达（快速连点），无条件回滚会把配置覆盖成旧值、重新制造"任务在而配置关"背离——失败回滚仅当"当前配置仍等于该失败请求的期望值"时执行。② WMI 熔断后**同实例恢复**：超时熔断（wedged）后 `try_switch_backend` 的"同种后端 no-op"优化会跳过重建，WMI-only 机器上后端永久卡死到重启——新增 `EcBackend::needs_rebuild()`（WMI 熔断返回 true），切换逻辑在熔断态强制 `create_backend` 重建全新 worker。③ 熔断错误可读性：`battery()`/`perf()` 对熔断快速失败（`Unit(Err)`）如实透传"无响应（超时熔断，请切换后端重试）"，不再退化成笼统"响应异常"。④ 真机复验：本机实测双后端初始化/切换、Fn 监听订阅 HID_EVENT20、托盘/热键注册、Ctrl+Alt+B 实时切换养护（WMI 100%→80%）全部正常 | opencode |
 | 1.28 | 2026-08-18 | **修复电池供电时计划任务被终止（F-BUG）**：开机自启动任务注册时未显式设置任务电源设置，沿用 Windows 默认 `StopIfGoingOnBatteries=TRUE`——笔记本拔掉电源适配器（切到电池）即被任务计划服务终止，正是"电池供电时自启动应用退出"的根因；同时默认 `ExecutionTimeLimit=PT72H` 会在常驻运行满 72 小时时强制终止。修复：`enable` 显式 `SetStopIfGoingOnBatteries(FALSE)` + `SetDisallowStartIfOnBatteries(FALSE)`，`ExecutionTimeLimit` 设为 `PT0S`（无限）；`task_matches` 同步校验三项设置，历史版本注册的旧任务在下次启动 sync 时自动重建（F-AUTO-09 机制）。新增 F-AUTO-11 / AC-AUTO-07 | opencode |
 | 1.29 | 2026-08-18 | **修复首次启动 WMI 总是不可用（F-BUG）**：应用随登录自启动时 WinMgmt 服务/`MICommonInterface` 提供程序可能尚未就绪，WMI 后端在启动握手（10s 上限）内单次连接失败即回退 WinRing0，表现为"第一次启动 WMI 不可用、手动切换却可用"。修复：① 连接重试——`WmiWorker::connect` 在握手预算内对连接+预探测做 4 次 ×2s 退避的有界重试（确定性 `WmiInterfaceNotFound` 同样重试，因提供程序未注册时 ExecQuery 同样返回空、无法与"本机无接口"区分；总退避 6s 显著小于 10s 预算，常量关系由测试锁定），启动常见场景直接自愈；② 延迟恢复——若预算内仍未恢复（WMI 服务启动慢的极端情况），GUI 启动后按 20s→40s→80s→160s 指数退避在**后台线程**探测 WMI（最多 4 次），探测成功且用户偏好仍为 Auto/WMI 时自动切换回 WMI（`UiCommand::WmiAvailable`，偏好未变则丢弃过期结果），用户无需手动切。新增 F-HAL-17 / F-HAL-18 / AC-HAL-09 | opencode |
-| 1.30 | 2026-08-18 | **高 DPI 图标清晰度修复 + Fn 自定义命令执行（修订 1.26 规划落地）+ 双代理评审回归修复**：① 图标取帧策略改为**不小于 DPI 缩放后物理尺寸的最小帧**（宁大勿小只缩小不放大），修复 200% 等缩放下 16px 帧被系统放大发糊的回归——`tray_icon_size_px()` 用 `GetDpiForSystem`（winit PerMonitorV2 感知下返回真实 DPI）换算托盘目标尺寸，`set_main_window_icon` 的小/大图标同步按 `scaled_px_at_dpi` 换算；② Fn 绑定新增 **`RunCommand`（运行自定义命令）**动作：`FnKeyBinding` 增加 `command` 字段（`#[serde(default)]` 向后兼容旧配置），GUI 绑定列表/添加流程在动作选为"运行自定义命令"时展示命令行输入框，监听线程命中后以独立进程 `cmd.exe /C <command>` 执行（`CREATE_NO_WINDOW` 隐藏控制台、后台线程不阻塞 WMI 事件循环），空命令跳过并告警，同命令 1s 防抖防固件重复上报；③ Fn 捕获"绑定为"动作跨帧丢失（H1）：捕获流程动作下拉用局部变量、每帧重置，用户选中的动作在下一帧丢失、"使用此键"恒绑定默认动作——改为持久到 `self.fn_capture_action`；④ Fn"重新应用设置"被门控误伤（M3）：Fn 动作复用电源广播的 `UiCommand::ReapplyConfig`，`auto_reapply_on_power_change` 关闭时用户按键无声无反应——新增 `UiCommand::ReapplyConfigManual`（不受门控）并让 Fn 映射到手动路径；⑤ 电源状态未知告警刷屏（M2）：`power_snapshot` 每帧+托盘每 2s 轮询，`ACLineStatus` 未知时每次重复 warn——改为首次告警后去重；⑥ 捕获前缀单字符时回退分支保留整个奇数串会"匹配一切"，改为回退到偶数长度。新增 F-FNK-14/15/16 | opencode |
+| 1.30 | 2026-08-18 | **高 DPI 图标清晰度修复 + Fn 自定义命令执行（修订 1.26 规划落地）+ 双代理评审回归修复**：① 图标取帧策略改为**不小于 DPI 缩放后物理尺寸的最小帧**（宁大勿小只缩小不放大），修复 200% 等缩放下 16px 帧被系统放大发糊的回归——`tray_icon_size_px()` 用 `GetDpiForSystem`（winit PerMonitorV2 感知下返回真实 DPI）换算托盘目标尺寸，`set_main_window_icon` 的小/大图标同步按 `scaled_px_at_dpi` 换算；② Fn 绑定新增 **`RunCommand`（运行自定义命令）**动作：`FnKeyBinding` 增加 `command` 字段（`#[serde(default)]` 向后兼容旧配置），GUI 绑定列表/添加流程在动作选为"运行自定义命令"时展示命令行输入框，监听线程命中后以独立进程 `cmd.exe /C <command>` 执行（`CREATE_NO_WINDOW` 隐藏控制台、后台线程不阻塞 WMI 事件循环），空命令跳过并告警，同命令 1s 防抖防固件重复上报；③ Fn 捕获"绑定为"动作跨帧丢失（H1）：捕获流程动作下拉用局部变量、每帧重置，用户选中的动作在下一帧丢失、"使用此键"恒绑定默认动作——改为持久到 `self.fn_capture_action`；④ Fn"重新应用设置"被门控误伤（M3）：Fn 动作复用电源广播的 `UiCommand::ReapplyConfig`，`auto_reapply_on_power_change` 关闭时用户按键无声无反应——新增 `UiCommand::ReapplyConfigManual`（不受门控）并让 Fn 映射到手动路径；⑤ 电源状态未知告警刷屏（M2）：`power_snapshot` 每帧+托盘每 2s 轮询，`ACLineStatus` 未知时每次重复 warn——改为首次告警后去重；⑥ 捕获前缀单字符时回退分支保留整个奇数串会"匹配一切"，改为回退到偶数长度；⑦ 单实例判定去除 `GetLastError` 陈旧值依赖：`main()` 提权检测等先前 Win32 调用残留的 last-error 会把首次启动误判为"已有实例"而退出——改为 `CreateMutexW` + `WaitForSingleObject(handle,0)` 所有权探测（`WAIT_OBJECT_0`/`WAIT_ABANDONED`=获得、`WAIT_TIMEOUT`=已有实例）；⑧ 托盘消息窗口 `set_wndproc` 失败时泄漏 HWND——失败路径显式 `DestroyWindow`；⑨ WMI `get_property` 把全部 `Get` 失败静默吞成 None（provider/访问错误与"属性不存在"无法区分）——`WBEM_E_NOT_FOUND`（属性缺失，正常）静默，其它错误记录 warn；⑨ WMI `get_property` 把全部 `Get` 失败静默吞成 None（provider/访问错误与"属性不存在"无法区分）——`WBEM_E_NOT_FOUND`（属性缺失，正常）静默，其它错误记录 warn；⑩ `GetSystemPowerStatus` 失败路径每帧刷 error 日志（M2 同源）——统一收敛到 `warn_unknown_once` 去重闩；⑪ 测试补强：`recv_reply` 过期应答清理（乱序 seq 丢弃）、真机双后端只读集成测试 `hardware_read_smoke_test`（WMI/WinRing0 各读性能模式/电池养护/充电上限，本机实测双后端均 perf=0x9、care=true、limit=80% 一致）；⑫ **NFR-REL-03 实现**：EC 连续读写失败达到阈值（3 次）后，GUI 错误提示附带"已暂停自动重试"，任意一次成功读取清零计数并移除提示（`consecutive_hw_failures`）；⑬ 需求文档对齐代码事实：F-ERR-04 变体更新为实际的 `WmiCallHResult`/`Timeout`/`InvalidData`、F-HAL-14 提取路径改为 exe 同目录、F-START-01 启动顺序修正（配置先于后端创建）、F-GUI-20 说明可见性切换由托盘层直达、F-BAT-01 养护位由充电上限推导；NFR-MNT-03 clippy 清零（`assertions_on_constants` → const 断言）、Cargo.toml 注释 `lto=fat` 改为 `thin`。新增 F-FNK-14/15/16 | opencode |
 
 ---
 
@@ -212,7 +212,7 @@ graph TD
 
 | 编号 | 需求描述 | 优先级 |
 |------|---------|--------|
-| F-BAT-01 | 系统应能从 EC 寄存器 `0xA4` 读取电池养护启用状态，返回值非零表示已启用 | Must |
+| F-BAT-01 | 系统应读取电池养护启用状态。实现上两个后端均从**充电上限**推导养护位（`care_enabled_from_limit`：上限 <100% 即养护开启）——EC 固件会把养护位与充电上限自动同步，直读 `0xA4` 在部分机型不可靠（实测，修订 1.30）；`0xA4` 仅用于写入（`set_battery_care`） | Must |
 | F-BAT-02 | 系统应向 EC 寄存器 `0xA4` 写入电池养护启用状态，写入 `0x01` 启用，`0x00` 禁用 | Must |
 | F-BAT-03 | 系统应能从 EC 寄存器 `0xA7` 读取当前充电上限百分比值 | Must |
 | F-BAT-04 | 系统应向 EC 寄存器 `0xA7` 写入充电上限百分比值 | Must |
@@ -299,7 +299,7 @@ graph TD
 | F-HAL-11 | WinRing0 应通过动态加载方式调用：`InitializeOls()`, `ReadIoPortByte()`, `WriteIoPortByte()`, `DeinitializeOls()` | Must |
 | F-HAL-12 | 系统应提供工厂函数 `create_backend(pref: BackendPreference) -> Result<Box<dyn EcBackend>, EcError>` | Must |
 | F-HAL-13 | `BackendPreference::Auto` 应先尝试创建 WMI 后端，失败后静默回退到 WinRing0 | Must |
-| F-HAL-14 | 系统应将 WinRing0 DLL 在编译时通过 `rust-embed` 嵌入到二进制中，运行时提取到 `%TEMP%/XiaomiPcManagerLite/bin/` | Must |
+| F-HAL-14 | 系统应将 WinRing0 DLL 在编译时通过 `rust-embed` 嵌入到二进制中，运行时提取到**可执行文件同目录**（历史路径 `%TEMP%/XiaomiPcManagerLite/bin` 已弃用——该目录正是日志目录且整目录删除会误删其它实例文件，见修订 1.30；`%WINDIR%\Temp` 遗留副本在提取时清理） | Must |
 | F-HAL-15 | DLL 提取时，应清理目标目录中的旧版本文件以避免版本冲突 | Should |
 | F-HAL-16 | 用户通过 GUI 设置中的单选按钮可在 Auto / WMI / WinRing0 之间切换后端偏好 | Should |
 | F-HAL-17 | 启动阶段创建 WMI 后端应容忍瞬态故障：连接/预探测失败（WinMgmt 服务未就绪、提供程序尚在加载等）应在握手预算内**有界重试**（重试退避总和须明显小于握手上限），并保证总等待不超过预算后仍失败才回退 | Must |
@@ -386,7 +386,7 @@ graph TD
 | F-GUI-17 | 设置区域应包含"电源变更时重新应用"复选框 | Should |
 | F-GUI-18 | 设置区域应显示当前应用版本号 | Should |
 | F-GUI-19 | 系统应处理来自后台线程的 `UiCommand` 命令，在每帧渲染前通过 `try_recv()` 消费所有待处理命令 | Must |
-| F-GUI-20 | 命令 `ToggleWindow`：切换窗口可见性（隐藏至托盘 / 显示） | Must |
+| F-GUI-20 | 窗口可见性切换（隐藏至托盘 / 显示）：由托盘层直接操作主窗口（`platform::window::hide/show_main_window`），**不**经 `UiCommand`——窗口隐藏后 egui update 循环停止的历史缺陷决定了隐藏态命令必须由非 GUI 线程直达（修订 1.9/1.19） | Must |
 | F-GUI-21 | 命令 `Quit`：保存配置并退出整个进程 | Must |
 | F-GUI-22 | 命令 `ToggleBatteryCare`：切换电池养护开关 | Must |
 | F-GUI-23 | 命令 `CyclePerfMode`：切换到下一个性能模式 | Must |
@@ -515,7 +515,7 @@ graph TD
 
 | 编号 | 需求描述 | 优先级 |
 |------|---------|--------|
-| F-START-01 | 系统启动流程应依次为：初始化日志 → 创建 EC 后端 → 加载配置 → 读取当前硬件状态 → 根据配置可选应用 → 启动 GUI | Must |
+| F-START-01 | 系统启动流程应依次为：初始化日志 → 加载配置 → 创建 EC 后端（按配置中的后端偏好）→ 根据配置可选应用 → 读取当前硬件状态 → 启动 GUI | Must |
 | F-START-02 | 如果配置中 `auto_apply_on_startup` 为 `true`，系统应在硬件状态读取后，将配置中的各项值写入硬件 | Must |
 | F-START-03 | 自动应用操作应覆盖电池养护启用状态、充电上限、性能模式三项 | Must |
 | F-START-04 | 自动应用操作失败时不应阻断 GUI 启动流程，错误应记录到日志并在 GUI 中展示 | Must |
@@ -546,12 +546,13 @@ graph TD
 | F-ERR-03 | 所有硬件读写操作失败时，应在 GUI 中以红色文字显示错误信息 | Must |
 | F-ERR-04 | `EcError` 应包含以下变体： | Must |
 | | - `DllLoad(String)`：WinRing0 DLL 加载失败，附原因 | |
-| | - `InitFailed`：WinRing0 初始化失败 | |
+| | - `InitFailed(String)`：WinRing0 初始化失败 | |
 | | - `WmiConnect(String)`：WMI/COM 初始化失败，附原因 | |
 | | - `WmiInterfaceNotFound`：MICommonInterface 类未找到 | |
-| | - `WmiCallFailed(u16)`：WMI 调用失败，附错误码 | |
-| | - `ReadFailed(u16)`：EC 读取失败，附地址 | |
-| | - `WriteFailed(u16)`：EC 写入失败，附地址 | |
+| | - `WmiCallFailed(u16)`：WMI 调用失败，附状态码 | |
+| | - `WmiCallHResult(u32)`：WMI 调用返回 HRESULT 错误 | |
+| | - `Timeout(u16)`：EC 操作超时，附地址 | |
+| | - `InvalidData(String)`：硬件返回无效数据 | |
 | | - `BackendUnavailable(String)`：所有后端均不可用，附原因 | |
 | F-ERR-05 | 配置加载失败（文件损坏/权限不足）时，应使用默认配置并记录错误日志 | Must |
 | F-ERR-06 | 配置保存失败时不应影响 App 正常运行，错误应记录日志 | Must |

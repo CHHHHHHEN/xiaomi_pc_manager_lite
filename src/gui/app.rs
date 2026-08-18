@@ -112,6 +112,9 @@ pub struct XiaomiApp {
     pub(crate) wmi_recover_at: Option<std::time::Instant>,
     /// 已发起的 WMI 延迟恢复探测次数（指数退避与上限用，见 WMI_RECOVER_*）。
     pub(crate) wmi_recover_attempts: u32,
+    /// 连续硬件读取/写入失败计数（NFR-REL-03）：达到阈值后暂停自动重试
+    /// 并在 GUI 展示持久提示，避免"每帧重复失败 + 反复重试"刷屏。
+    pub(crate) consecutive_hw_failures: u32,
 }
 
 impl XiaomiApp {
@@ -167,6 +170,7 @@ impl XiaomiApp {
             quitting: false,
             wmi_recover_at: None,
             wmi_recover_attempts: 0,
+            consecutive_hw_failures: 0,
         };
 
         // WMI 延迟恢复探测初始化（首次启动 WMI 失败回退时启用，见

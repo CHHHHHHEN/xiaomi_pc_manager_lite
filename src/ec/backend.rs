@@ -172,4 +172,74 @@ mod tests {
         fn assert_send<T: Send>() {}
         assert_send::<Box<dyn EcBackend>>();
     }
+
+    /// 真机集成验证（手动运行，非 CI）：在受支持的小米/红米笔记本上创建
+    /// WMI 与 WinRing0 两个后端并读取硬件状态，验证核心功能路径（电池
+    /// 养护/充电上限/性能模式读取）在真实硬件上可用。
+    ///
+    /// **只读**：只调用 getter、不调用 setter——写入路径已由各后端单测
+    /// （仿真 backend）覆盖，真机写入属于用户主动操作、不应由测试触发。
+    ///
+    /// 跳过策略：任一后端创建失败（非管理员/驱动缺失/非小米机器）即打印
+    /// 原因并继续尝试另一后端，两者都不可用则整体跳过——保证在任何环境
+    /// 都不假红也不假绿。运行：`cargo test -- --ignored
+    /// hardware_read_smoke_test`。
+    #[test]
+    #[ignore = "requires admin on a supported Xiaomi/Redmi laptop (manual hardware test)"]
+    fn hardware_read_smoke_test() {
+        let mut exercised = 0usize;
+        for pref in [BackendPreference::Wmi, BackendPreference::WinRing0] {
+            let label = match pref {
+                BackendPreference::Wmi => "WMI",
+                BackendPreference::WinRing0 => "WinRing0",
+                BackendPreference::Auto => unreachable!(),
+            };
+            let backend = match create_backend(pref) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("[{}] backend unavailable (skip): {}", label, e);
+                    continue;
+                }
+            };
+            let perf = match backend.get_performance_mode() {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("[{}] read perf mode failed: {}", label, e);
+                    continue;
+                }
+            };
+            let (care, limit) = match backend.get_battery_state() {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("[{}] read battery state failed: {}", label, e);
+                    continue;
+                }
+            };
+            // 性能模式必须是已知枚举之一（未定义 raw code 说明固件/驱动
+            // 解析异常）；充电上限在 [0,100]，且养护位与限值推导一致。
+            assert!(
+                crate::ec::performance::PerfMode::from_ec_value(perf).is_some(),
+                "[{}] invalid perf raw code {:#x}",
+                label,
+                perf
+            );
+            assert!(limit <= 100, "[{}] invalid charge limit {}", label, limit);
+            assert_eq!(
+                care,
+                crate::ec::battery::care_enabled_from_limit(limit),
+                "[{}] care bit inconsistent with limit {}",
+                label,
+                limit
+            );
+            eprintln!(
+                "[{}] OK: perf={:#x}, care={}, limit={}%",
+                label, perf, care, limit
+            );
+            exercised += 1;
+        }
+        assert!(
+            exercised > 0,
+            "neither WMI nor WinRing0 backend available; not a supported machine"
+        );
+    }
 }

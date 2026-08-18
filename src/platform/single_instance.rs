@@ -15,8 +15,10 @@
 //! 进程，若在提权前持有互斥体，旧进程尚未退出时新进程会被误判为"第二实例"
 //! 而退出，破坏提权重启动。
 
-use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
-use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::Foundation::{
+    CloseHandle, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
+use windows::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
 
 /// 会话级命名互斥体（`Local\` 前缀，仅当前登录会话可见）。
 /// 同用户的提权进程与非提权进程共享同一会话，可访问同一个互斥体。
@@ -41,11 +43,20 @@ pub enum SingleInstance {
 }
 
 /// 尝试取得单实例互斥体所有权。
+///
+/// 所有权判定不用 `GetLastError`（历史实现）：`CreateMutexW` 成功时
+/// `GetLastError` 是"上次错误"值，`main()` 在此前已执行过若干 Win32 调用
+/// （提权检测、AppUserModelID、日志文件打开），其中任一次把 last-error 残留
+/// 为 `ERROR_ALREADY_EXISTS` 就会让**首次启动**被误判为"已有实例"而退出。
+/// 改用 `WaitForSingleObject(handle, 0)` 的返回码做所有权探测（零超时、无阻塞）：
+/// - `WAIT_OBJECT_0`：本进程获得所有权（互斥体此前无人持有或已释放）；
+/// - `WAIT_ABANDONED`：原持有者进程崩溃/退出未释放——内核将所有权转移给
+///   本进程，按"已获得"处理（崩溃遗留不会卡死后续启动）；
+/// - `WAIT_TIMEOUT`：互斥体被另一实例持有 → 判定"已有实例"；
+/// - 其它值：API 异常，按"无法确认"处理（不阻塞启动）。
 pub fn acquire() -> SingleInstance {
     let name = crate::util::WideString::new(INSTANCE_MUTEX_NAME);
     unsafe {
-        // bInitialOwner=true：新创建则当前线程即所有者；已存在则
-        // GetLastError 返回 ERROR_ALREADY_EXISTS。
         let handle = match CreateMutexW(None, true, name.as_pcwstr()) {
             Ok(h) => h,
             Err(_) => {
@@ -53,15 +64,23 @@ pub fn acquire() -> SingleInstance {
                 return SingleInstance::Unknown;
             }
         };
-        let already_exists = GetLastError().0 == ERROR_ALREADY_EXISTS.0;
-        if already_exists {
-            // 已有实例持有互斥体（或持有者崩溃后对象尚未清理——内核会在
-            // 持有进程退出时释放对象，此处短暂的重叠窗口忽略）。
-            let _ = CloseHandle(handle);
-            log::info!("Another instance is already running");
-            SingleInstance::Existing
-        } else {
-            SingleInstance::Acquired(SingleInstanceGuard(handle))
+        match WaitForSingleObject(handle, 0) {
+            WAIT_OBJECT_0 | WAIT_ABANDONED => {
+                // 本进程取得所有权（或接管崩溃遗留，内核语义等效）。
+                SingleInstance::Acquired(SingleInstanceGuard(handle))
+            }
+            WAIT_TIMEOUT => {
+                // 已有实例持有互斥体（或持有者崩溃后对象尚未清理——内核
+                // 会在持有进程退出时释放对象，此处短暂的重叠窗口忽略）。
+                let _ = CloseHandle(handle);
+                log::info!("Another instance is already running");
+                SingleInstance::Existing
+            }
+            _ => {
+                let _ = CloseHandle(handle);
+                log::warn!("Single instance mutex: WaitForSingleObject failed; proceeding");
+                SingleInstance::Unknown
+            }
         }
     }
 }

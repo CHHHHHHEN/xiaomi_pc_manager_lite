@@ -11,11 +11,11 @@ use windows::Win32::UI::Shell::{
     NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DefWindowProcW, DestroyMenu, GetCursorPos, KillTimer,
-    PostMessageW, PostQuitMessage, RegisterWindowMessageW, SetForegroundWindow, SetTimer,
-    TrackPopupMenu, HICON, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, TPM_BOTTOMALIGN,
-    TPM_LEFTALIGN, TPM_LEFTBUTTON, WM_APP, WM_COMMAND, WM_DESTROY, WM_HOTKEY, WM_LBUTTONUP,
-    WM_NULL, WM_RBUTTONUP, WM_TIMER,
+    AppendMenuW, CreatePopupMenu, DefWindowProcW, DestroyMenu, DestroyWindow, GetCursorPos,
+    KillTimer, PostMessageW, PostQuitMessage, RegisterWindowMessageW, SetForegroundWindow,
+    SetTimer, TrackPopupMenu, HICON, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING,
+    TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_LEFTBUTTON, WM_APP, WM_COMMAND, WM_DESTROY, WM_HOTKEY,
+    WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WM_TIMER,
 };
 
 use crate::command::UiCommand;
@@ -171,6 +171,9 @@ fn worker_thread(cmd_tx: mpsc::Sender<UiCommand>, status: SharedTrayStatus, ctx:
     };
     if let Err(e) = message_window::set_wndproc(hwnd, wndproc) {
         log::error!("Set message window wndproc: {}", e);
+        // create_message_window 已成功创建窗口，set_wndproc 失败时若直接
+        // return 会泄漏该 HWND（及其用户对象）——显式销毁后返回。
+        let _ = unsafe { DestroyWindow(hwnd) };
         return;
     }
     log::info!("Message window hwnd=0x{:X}", hwnd.0 as usize);

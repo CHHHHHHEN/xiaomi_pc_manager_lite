@@ -203,6 +203,7 @@ enum WmiCmd {
     Quit,
 }
 
+#[derive(Debug)]
 enum WmiReply {
     Unit(Result<(), EcError>),
     BatteryState(Result<(bool, u8), EcError>),
@@ -1388,6 +1389,43 @@ mod tests {
         }
     }
 
+    /// 回归测试：`recv_reply` 的**过期应答清理**——通道中先到达的过期应答
+    /// （旧 seq）必须被丢弃、继续等待本 seq 的应答，绝不把过期应答误配给
+    /// 当前调用（T1 熔断的唯一防错配保护，修订 1.25）。
+    ///
+    /// 覆盖场景：调用 seq=7 时，通道里残留着上一次超时调用的应答
+    /// (seq=5) 与本调用应答 (seq=7)。`recv_reply` 必须先跳过 seq=5 再返回
+    /// seq=7；若不清除，会静默把 seq=5 的应答错配给 seq=7 的调用方。
+    #[test]
+    fn test_recv_reply_discards_stale_seq() {
+        // 直接构造 WmiBackend，用发送端预置应答序列（不真正起 worker，
+        // 也不走 call()——只验证 recv_reply 的 seq 配对逻辑）。
+        let (res_tx, res_rx) = mpsc::channel::<(u64, WmiReply)>();
+        let backend = WmiBackend {
+            tx: mpsc::channel::<(u64, WmiCmd)>().0, // 测试不发送命令
+            res: Mutex::new(res_rx),
+            next_seq: std::sync::atomic::AtomicU64::new(1),
+            wedged: std::sync::atomic::AtomicBool::new(false),
+        };
+        // 预置：过期应答（seq=5）先于当前应答（seq=7）到达通道。
+        res_tx
+            .send((5, WmiReply::PerfMode(Ok(0x77))))
+            .expect("preload stale");
+        res_tx
+            .send((7, WmiReply::PerfMode(Ok(0x99))))
+            .expect("preload current");
+        // 等待 seq=7 时，seq=5 的过期应答必须被丢弃，最终返回 seq=7 的
+        // 应答（0x99）而非 0x77。
+        let guard = crate::util::lock_or_recover(&backend.res, "WMI");
+        let reply = backend
+            .recv_reply(&guard, 7)
+            .expect("seq=7 reply must be returned");
+        match reply {
+            WmiReply::PerfMode(Ok(mode)) => assert_eq!(mode, 0x99, "stale reply must be discarded"),
+            other => panic!("unexpected reply: {:?}", other),
+        }
+    }
+
     #[test]
     fn test_wmi_rawcode_for_percent_nearest() {
         assert_eq!(wmi_rawcode_for_percent(85), Some(1)); // 80%（与最近预设一致）
@@ -1450,7 +1488,9 @@ mod tests {
     /// 否则重试尚未结束父端已超时放弃，重试逻辑形同虚设。锁定常量值防漂移。
     #[test]
     fn test_connect_retry_budget_within_handshake_timeout() {
-        assert!(CONNECT_ATTEMPTS >= 2, "retry loop must be meaningful");
+        // 常量断言：重试次数是编译期常量，clippy 视运行期 assert 为
+        // "恒定断言"（NFR-MNT-03）。用 const 块保持同等的编译期保障。
+        const _: () = assert!(CONNECT_ATTEMPTS >= 2, "retry loop must be meaningful");
         let total_backoff = (CONNECT_ATTEMPTS - 1) as u128 * CONNECT_RETRY_DELAY.as_millis();
         // 预留单次连接（ConnectServer + ExecQuery）的耗时余量：总退避须小于
         // 握手上限的 80%，避免极端情况下超时截止前连最后一试都轮不到。

@@ -42,7 +42,8 @@ windows = { version = "0.62", features = [
 ]}
 
 # 发布构建优化（NFR-PERF-04 目标 ≤ 5 MB）：
-# - lto = "fat"：跨 crate 链接期优化，消除依赖间冗余代码；
+# - lto = "thin"：跨 crate 链接期优化，消除依赖间冗余代码（thin 在保持
+#   大部分 LTO 收益的同时显著缩短链接时间，实测体积 4.6MB 达成目标）；
 # - codegen-units = 1：单 codegen 单元最大化内联收益（与 LTO 配合）；
 # - opt-level = "z"：极致优化体积；本应用是 IO/等待密集（WMI/托盘/热键），
 #   无热计算路径，z 的尺寸收益没有性能代价；

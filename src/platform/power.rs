@@ -34,22 +34,28 @@ fn classify_acline(ac_line_status: u8) -> PowerStatus {
 static LAST_WARNED_UNKNOWN: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// 记录未知电源状态告警（首次出现时）。返回是否实际记录了本次告警。
+/// 未知电源状态告警（仅首次出现时记录一次，之后静默）。
+///
+/// `power_status`/`power_snapshot` 两个查询函数共用同一个一次告警闩：
+/// `ACLineStatus` 未知与 `GetSystemPowerStatus` 调用失败都会落到"电源状态
+/// 未知"，分开记录会刷两条重复日志（且失败路径每帧刷 error 的问题与 M2 同源，
+/// 修订 1.30 一并收敛）。首次记录后置位闩，之后同状态静默。
 fn warn_unknown_once() -> bool {
     let first = !LAST_WARNED_UNKNOWN.swap(true, std::sync::atomic::Ordering::Relaxed);
     if first {
-        log::warn!("ACLineStatus unknown; power state unknown (won't repeat)");
+        log::warn!("Power state unknown; won't repeat this session");
     }
     first
 }
 
-/// 一次查询 `GetSystemPowerStatus`，失败时返回 None 并记录错误。
+/// 一次查询 `GetSystemPowerStatus`，失败时返回 None 并记录错误（经
+/// `warn_unknown_once` 去重，避免失败持续期间每帧刷一条 error）。
 ///
 /// `power_status` / `power_snapshot` 共用此函数，避免各自重复错误日志。
 fn system_power_status() -> Option<windows::Win32::System::Power::SYSTEM_POWER_STATUS> {
     let mut status = unsafe { std::mem::zeroed() };
     if unsafe { windows::Win32::System::Power::GetSystemPowerStatus(&mut status) }.is_err() {
-        log::error!("GetSystemPowerStatus failed; power state unknown");
+        warn_unknown_once();
         return None;
     }
     Some(status)

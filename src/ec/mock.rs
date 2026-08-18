@@ -29,7 +29,9 @@ pub struct MockBackend {
     pub name: &'static str,
     pub preference: BackendPreference,
     pub quantize: bool,
-    pub read_fails: bool,
+    /// `Arc<AtomicBool>`：测试在 clone 后仍能翻转读失败开关（NFR-REL-03
+    /// 验证"失败达阈值暂停、成功恢复后清零"需要共享可变的成败行为）。
+    pub read_fails: Arc<AtomicBool>,
     pub set_charge_limit_fails: bool,
     pub set_battery_care_fails: bool,
     pub set_perf_fails: bool,
@@ -45,7 +47,7 @@ impl Default for MockBackend {
             name: "mock",
             preference: BackendPreference::Auto,
             quantize: false,
-            read_fails: false,
+            read_fails: Arc::new(AtomicBool::new(false)),
             set_charge_limit_fails: false,
             set_battery_care_fails: false,
             set_perf_fails: false,
@@ -59,7 +61,7 @@ impl MockBackend {
         Self {
             name,
             preference,
-            read_fails: true,
+            read_fails: Arc::new(AtomicBool::new(true)),
             set_charge_limit_fails: true,
             set_battery_care_fails: true,
             set_perf_fails: true,
@@ -72,7 +74,7 @@ impl MockBackend {
     pub fn partial_care(name: &'static str) -> Self {
         Self {
             name,
-            read_fails: true,
+            read_fails: Arc::new(AtomicBool::new(true)),
             set_battery_care_fails: true,
             set_perf_fails: true,
             ..Default::default()
@@ -113,14 +115,14 @@ impl EcBackend for MockBackend {
     }
 
     fn get_battery_care_enabled(&self) -> Result<bool, EcError> {
-        if self.read_fails {
+        if self.read_fails.load(Ordering::Relaxed) {
             return Err(self.fail());
         }
         Ok(self.battery_care.load(Ordering::Relaxed))
     }
 
     fn get_charge_limit(&self) -> Result<u8, EcError> {
-        if self.read_fails {
+        if self.read_fails.load(Ordering::Relaxed) {
             return Err(self.fail());
         }
         Ok(self.charge_limit.load(Ordering::Relaxed))
@@ -149,7 +151,7 @@ impl EcBackend for MockBackend {
 
     fn get_battery_state(&self) -> Result<(bool, u8), EcError> {
         self.battery_state_calls.fetch_add(1, Ordering::Relaxed);
-        if self.read_fails {
+        if self.read_fails.load(Ordering::Relaxed) {
             return Err(self.fail());
         }
         Ok((
@@ -159,7 +161,7 @@ impl EcBackend for MockBackend {
     }
 
     fn get_performance_mode(&self) -> Result<u8, EcError> {
-        if self.read_fails {
+        if self.read_fails.load(Ordering::Relaxed) {
             return Err(self.fail());
         }
         Ok(self.perf_mode.load(Ordering::Relaxed))

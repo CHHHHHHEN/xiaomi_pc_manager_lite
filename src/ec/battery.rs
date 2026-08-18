@@ -339,7 +339,7 @@ mod tests {
     #[test]
     fn test_apply_battery_state_readback_failure_keeps_written_value() {
         let backend = MockBackend {
-            read_fails: true,
+            read_fails: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             set_charge_limit_fails: false,
             set_battery_care_fails: false,
             set_perf_fails: false,
