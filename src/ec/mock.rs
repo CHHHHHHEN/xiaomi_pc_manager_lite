@@ -35,6 +35,10 @@ pub struct MockBackend {
     pub set_charge_limit_fails: bool,
     pub set_battery_care_fails: bool,
     pub set_perf_fails: bool,
+    /// 模拟 WMI 的养护位契约 no-op：`set_battery_care` 返回 Ok 但**不落地**
+    /// （读回恒为 false）。启动同步必须不被这种固件误导（L5 回归：不能把
+    /// care=false 写进配置，否则下次启动按 care=false 强制 100%）。
+    pub care_write_is_noop: bool,
 }
 
 impl Default for MockBackend {
@@ -51,6 +55,7 @@ impl Default for MockBackend {
             set_charge_limit_fails: false,
             set_battery_care_fails: false,
             set_perf_fails: false,
+            care_write_is_noop: false,
         }
     }
 }
@@ -132,7 +137,9 @@ impl EcBackend for MockBackend {
         if self.set_battery_care_fails {
             return Err(self.fail());
         }
-        self.battery_care.store(enabled, Ordering::Relaxed);
+        if !self.care_write_is_noop {
+            self.battery_care.store(enabled, Ordering::Relaxed);
+        }
         Ok(())
     }
 

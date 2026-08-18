@@ -447,7 +447,20 @@ fn run_watcher(
         match run_watcher_once(cmd_tx, bindings, capture) {
             Err(WatcherError::NoEventClasses) => {
                 stale_cycles += 1;
-                let delay = if stale_cycles <= 3 { 5u64 } else { 30u64 };
+                // 退避节奏（修订 1.32/L4）：前 3 次 5s、随后 30s、持续
+                // 无类后降为 10min 长探测——硬件上没有这些 OEM 事件类
+                // （VM / 非小米机型 / 绑定了不存在的类）时，类永远不会
+                // 出现，30s 一次的 warn 刷屏毫无价值；长探测保留"驱动
+                // 后来安装/类后来出现"的恢复通道，同时把日志频率压到
+                // 可忽略。空转（无绑定）场景由 run_watcher_loop 内部
+                // 的 1s continue 承担，不会走到这里（M1 回归）。
+                let delay = if stale_cycles <= 3 {
+                    5
+                } else if stale_cycles <= 20 {
+                    30
+                } else {
+                    600
+                };
                 log::warn!(
                     "Fn: no event classes for {} consecutive cycle(s); retrying in {}s",
                     stale_cycles,
@@ -499,13 +512,20 @@ fn process_event(
 
     // 捕获模式：每条事件转发给 GUI（用于发现键码、配置绑定）。
     if capture.load(Ordering::Relaxed) {
-        send_watcher_command(
-            cmd_tx,
-            UiCommand::FnEventSeen {
-                class: class_name.to_string(),
-                hex: normalized.clone(),
-            },
-        );
+        // 转发限流（修订 1.32/L2）：按住键触发固件自动重复时事件是
+        // 连续流，逐条转发会塞满无界 mpsc、每事件唤醒 GUI 重绘并各打
+        // 一条 info 日志（GUI 侧也只保留最后一条，其余全浪费）。同一
+        // 类在同一窗口内只转发**最新**一条，即按住时保持 UI 显示最后
+        // 键码不变、松开后下一事件照常更新。
+        if capture_event_gate() {
+            send_watcher_command(
+                cmd_tx,
+                UiCommand::FnEventSeen {
+                    class: class_name.to_string(),
+                    hex: normalized.clone(),
+                },
+            );
+        }
     }
 
     if dispatch_bindings(class_name, &normalized, bindings, cmd_tx) {
@@ -513,6 +533,32 @@ fn process_event(
     }
     // 其余事件（未绑定或 Fn 锁等，见 F-FNK-09）不产生任何动作，仅记录日志。
     log::debug!("Fn [{}]: unmatched event {}", class_name, normalized);
+}
+
+/// 捕获事件转发限流闸门（修订 1.32/L2）。
+///
+/// 返回是否允许本次转发：窗口（`CAPTURE_FORWARD_MIN_MS`）内的后续事件
+/// 一律丢弃，窗口刷新后第一条放行。线程局部存储（监听线程专用），
+/// 首次调用必然放行（捕获刚开启时首条键码要即时展示）。
+const CAPTURE_FORWARD_MIN_MS: u128 = 150;
+
+fn capture_event_gate() -> bool {
+    thread_local! {
+        static LAST_FORWARD: std::cell::Cell<Option<std::time::Instant>> =
+            const { std::cell::Cell::new(None) };
+    }
+    LAST_FORWARD.with(|last| {
+        let now = std::time::Instant::now();
+        // 首次调用（None）或已过窗口（≥CAPTURE_FORWARD_MIN_MS）放行。
+        let allow = match last.get() {
+            Some(prev) => now.duration_since(prev).as_millis() >= CAPTURE_FORWARD_MIN_MS,
+            None => true,
+        };
+        if allow {
+            last.set(Some(now));
+        }
+        allow
+    })
 }
 
 /// 与绑定表做前缀匹配并派发动作。命中第一条绑定即消费（与 Meow-Box 的
@@ -622,7 +668,7 @@ fn run_external_command(command: Option<&str>) {
         log::warn!("Fn: RunCommand binding with empty command; skipped");
         return;
     };
-    log::info!("Fn: running external command: {}", command);
+    log::info!("Fn: running external command: {}", redact_command(command));
     // 转换为拥有所有权的 String 再移入线程（闭包参数 Option<&str> 借用
     // 自调用方，跨线程 move 会触发 E0521；所有权的 String 无生命周期约束）。
     let command = command.to_owned();
@@ -658,6 +704,19 @@ fn run_external_command(command: Option<&str>) {
     if let Err(e) = spawn_result {
         log::warn!("Fn: failed to spawn command thread: {}", e);
     }
+}
+
+/// 日志脱敏（修订 1.32/L3）：命令可能携带凭据（`net use`、`ssh -i` 等），
+/// info 级日志永远写入日志文件，必须截断而非全文落盘。保留前 32 字符 +
+/// 总长度提示，足够排查"哪条命令被执行"又不泄露完整内容；调试级仍可
+/// 通过 RUST_LOG=debug 输出全文（用户主动开启时才可见）。
+pub fn redact_command(command: &str) -> String {
+    const MAX: usize = 32;
+    if command.chars().count() <= MAX {
+        return command.to_string();
+    }
+    let head: String = command.chars().take(MAX).collect();
+    format!("{}... ({} chars)", head, command.chars().count())
 }
 
 /// 事件 hex 统一归一化：剔除所有非字母数字字符（如 "01-28-01" 的分隔符）
@@ -790,6 +849,21 @@ mod tests {
         assert!(!valid_class("HID-EVENT20"));
         assert!(!valid_class("1CLASS"));
         assert!(!valid_class("HID EVENT"));
+    }
+
+    /// 捕获事件转发限流（修订 1.32/L2）：首次必然放行，窗口内重复丢弃，
+    /// 窗口过后重新放行——按住触发固件自动重复时不塞爆 mpsc/不每事件
+    /// 唤醒 GUI。窗口判定是纯时间比较，不 sleep：连续调用验证"首放、
+    /// 后续即弃"的契约，跨窗口语义由实现内的 `>= CAPTURE_FORWARD_MIN_MS`
+    /// 保证（阈值改动的单点常量）。
+    #[test]
+    fn test_capture_event_gate_rate_limits() {
+        assert!(capture_event_gate(), "first event must pass");
+        assert!(!capture_event_gate(), "immediate repeat must be dropped");
+        assert!(
+            !capture_event_gate(),
+            "events within the window keep being dropped"
+        );
     }
 
     /// 绑定前缀匹配：按下命中、释放不命中（F-FNK-06）、类不匹配不命中。

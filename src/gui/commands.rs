@@ -58,7 +58,10 @@ impl XiaomiApp {
                     let keep_previous =
                         Self::keep_press_over_release(self.last_fn_event.as_ref(), &class, &hex);
                     if !keep_previous {
-                        log::info!("Fn capture event: {} / {}", class, hex);
+                        // 捕获事件在 watcher 侧已限流（CAPTURE_FORWARD_MIN_MS，
+                        // L2 回归），正常按键频率下不刷屏；这里 debug 级避免
+                        // 与上方 UiCommand 全量日志重复。仅保留最新一条。
+                        log::debug!("Fn capture event: {} / {}", class, hex);
                         self.last_fn_event = Some((class, hex));
                     }
                 }
@@ -316,7 +319,11 @@ impl XiaomiApp {
         if binding.command.as_deref() == Some(command) {
             return;
         }
-        log::info!("Fn binding {} command -> {:?}", binding.label(), command);
+        log::info!(
+            "Fn binding {} command -> {}",
+            binding.label(),
+            ec::fnkey::redact_command(command)
+        );
         binding.command = Some(command.to_string());
         self.commit_fn_bindings();
     }

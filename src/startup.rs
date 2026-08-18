@@ -6,6 +6,7 @@
 //! - `apply_startup_config` / `sync_startup_config`：启动应用与硬件读回同步。
 
 use crate::ec::backend::EcBackend;
+use crate::ec::battery::care_enabled_from_limit;
 use crate::ec::config::{AppConfig, BackendPreference, ConfigStore};
 
 /// `init_backend` 的完整结果：后端、启动同步后的配置、初始化错误、实际生效偏好。
@@ -219,13 +220,28 @@ fn sync_startup_config(
     // 电池养护 + 充电上限：两者都写入成功才回写（原因见函数注释）。
     // 读回的养护位与硬件实际生效值统一经 battery::sync_config_after_apply
     // 收敛（养护关闭时保留用户期望上限，开启时回写实际生效值）。
+    //
+    // **养护位权威来源是限值而非读回位**（修订 1.32/L5）：限值是两种后端
+    // 判定养护状态的唯一权威（care_enabled_from_limit），而 `get_battery_care_enabled`
+    // 的读回位在部分固件上是"写限值时同步"的从属位，甚至 WMI 写养护是
+    // 契约上的 no-op（set_battery_care 返回 Ok 但不落地）——若把读回的
+    // false 直接回写，会持久化 care=false + limit=80 的矛盾组合，下次启动
+    // 按 care=false 强制写 100%，用户设置的充电上限被永久摧毁（与
+    // sync_config_after_apply 注释里的历史回归一致）。读回仅用于日志对照。
     if outcome.battery.care.is_ok() && outcome.battery.charge_limit.is_ok() {
-        if let Ok(enabled) = backend.get_battery_care_enabled() {
-            if let Ok(applied) = outcome.battery.charge_limit.as_ref() {
-                crate::ec::battery::sync_config_after_apply(config, *applied);
-                // 启动同步契约：以读回的养护位为准，而不是由 applied 推导。
-                config.battery_care_enabled = enabled;
+        if let Ok(applied) = outcome.battery.charge_limit.as_ref() {
+            let readback = backend.get_battery_care_enabled();
+            match readback {
+                Ok(enabled) if enabled != care_enabled_from_limit(*applied) => log::warn!(
+                    "Startup sync: care read-back {} disagrees with limit-derived {} (limit {}%); trusting limit",
+                    enabled,
+                    care_enabled_from_limit(*applied),
+                    applied
+                ),
+                Ok(_) => {}
+                Err(e) => log::debug!("Startup sync: care read-back failed: {}", e),
             }
+            crate::ec::battery::sync_config_after_apply(config, *applied);
         }
     } else {
         log::debug!(
@@ -267,6 +283,39 @@ mod tests {
         assert!(
             cfg.battery_care_enabled,
             "care must not be overwritten by readback"
+        );
+        assert_eq!(cfg.battery_charge_limit, 80);
+    }
+
+    /// 回归测试（修订 1.32/L5）：WMI 的养护位写入是契约 no-op（返回 Ok 但
+    /// 不落地），读回的 care=false 与已写入的限值 80% 矛盾。历史实现用
+    /// `get_battery_care_enabled` 的读回值覆盖限值推导的养护位，持久化了
+    /// care=false + limit=80 的矛盾组合——下次启动按 care=false 强制写 100%，
+    /// 用户设置的充电上限被永久摧毁。修复后**限值推导是权威**，读回仅记录
+    /// 日志对照。
+    #[test]
+    fn test_care_noop_readback_does_not_clobber_limit_derived_care() {
+        let backend = MockBackend {
+            care_write_is_noop: true,
+            ..MockBackend::default()
+        };
+        let config = AppConfig {
+            auto_apply_on_startup: true,
+            battery_care_enabled: true,
+            battery_charge_limit: 80,
+            ..Default::default()
+        };
+        let outcome = apply_startup_config(&backend, &config);
+        assert!(outcome.battery.care.is_ok());
+        assert!(outcome.battery.charge_limit.is_ok());
+        assert_eq!(outcome.battery.charge_limit.as_ref().unwrap(), &80);
+
+        let mut cfg = config.clone();
+        sync_startup_config(&backend, &mut cfg, &outcome);
+        // 限值推导的养护位（applied 80 < 100 → care）必须保留，尽管读回 false。
+        assert!(
+            cfg.battery_care_enabled,
+            "limit-derived care must survive a lying care read-back"
         );
         assert_eq!(cfg.battery_charge_limit, 80);
     }
