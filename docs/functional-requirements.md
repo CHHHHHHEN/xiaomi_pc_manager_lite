@@ -2,9 +2,9 @@
 
 ## Xiaomi PC Manager Lite
 
-| 文档版本 | 1.19 |
+| 文档版本 | 1.29 |
 |---------|-----|
-| 产品版本 | 0.2.0 |
+| 产品版本 | 1.0.0.5 |
 | 制定日期 | 2026-06-15 |
 | 制定人 | opencode |
 
@@ -42,6 +42,8 @@
 | 1.25 | 2026-08-17 | **多缺陷修复（双代理评审 + 真机回归）**：① 性能模式显示与硬件背离（H1）：电池供电下写狂暴、硬件实跑极速，但 GUI/托盘仍显示狂暴直到刷新——`set_perf_mode_internal` 的 runtime 改存**实际写入** raw code（config 仍存用户选择），GUI/托盘/状态栏与硬件一致。② 开机自启动请求与配置背离（M3+M1）：`SetAutostart` 请求时**即时持久化**期望值（不再等 worker 回传），中途退出不再出现"任务已注册而配置为关"的永久背离；复选框即时反映新值不再闪烁；enable 失败按 F-AUTO-10 回滚。③ 电池养护位钳制后未重推导（M5）：读回 care=true + limit>100 垃圾值钳到 100 后，以上限重新推导养护位，杜绝"养护:开启·上限:100%"矛盾展示。④ WMI 应答无界阻塞（T1）：worker 调用改为 seq 配对 + `recv_timeout`（6s）熔断（wedged 后快速失败），过期应答按 seq 丢弃不污染后续调用——WMI 服务卡死不再永久冻结 GUI。⑤ EC 超时排查粒度（真机偶发 `EC 操作超时 0x66`）：`ec_wait_status` 增加语义化步骤名 + 实测端口值 + 耗时日志；读写各加一次瞬态重试（`retry_transient`）；最终 OBF 超时后清空数据端口防陈旧字节（R1）；寄存器地址 ≥0x100 显式报错防静默回绕（R2）。⑥ `wmi_util` 重复清理（H1b）：windows-rs 0.62 的 VARIANT 已实现 Drop，`OwnedVariant` 不再二次 VariantClear（注释与实现一致）。⑦ 后端初始化线程 panic 兜底（M4）：`catch_unwind` 捕获 init_backend 线程 panic，降级 NullBackend + 错误提示，GUI 照常启动。⑧ Fn 添加绑定下拉失效（L3）：egui 每帧重建 UI，局部选择变量被重置回默认——预设键码/动作选择持久到 `self`；捕获"使用此键"前缀按**完整字节**截断（奇数 hex 前缀匹配不到任何事件）。⑨ 托盘隐藏后窗口位置恢复（L1）：隐藏前记录在屏位置，显示时优先恢复（虚拟屏幕判定），副屏拔出等越界时回退居中。⑩ 配置保存竞态与即时落盘测试、`persist_autostart_request`/`retry_transient`/`ec_addr_u8`/`saved_pos_on_screen` 单测 | opencode |
 | 1.26 | 2026-08-17 | Fn 动作自定义内容暂缓规划：绑定动作目前仅 4 种内置，规划扩展为"运行脚本 / 打开程序 / 最小化或切换某程序"等用户自定义命令（`FnAction` 增加携带参数变体、配置向后兼容、异步线程执行不阻塞事件循环），见 3.11 范围说明 | opencode |
 | 1.27 | 2026-08-17 | **二轮评审回归（真机验证 + 双代理复查）**：① 开机自启动**过期失败回滚**：串行 worker 中先发请求的失败结果可能晚于更新请求落盘后到达（快速连点），无条件回滚会把配置覆盖成旧值、重新制造"任务在而配置关"背离——失败回滚仅当"当前配置仍等于该失败请求的期望值"时执行。② WMI 熔断后**同实例恢复**：超时熔断（wedged）后 `try_switch_backend` 的"同种后端 no-op"优化会跳过重建，WMI-only 机器上后端永久卡死到重启——新增 `EcBackend::needs_rebuild()`（WMI 熔断返回 true），切换逻辑在熔断态强制 `create_backend` 重建全新 worker。③ 熔断错误可读性：`battery()`/`perf()` 对熔断快速失败（`Unit(Err)`）如实透传"无响应（超时熔断，请切换后端重试）"，不再退化成笼统"响应异常"。④ 真机复验：本机实测双后端初始化/切换、Fn 监听订阅 HID_EVENT20、托盘/热键注册、Ctrl+Alt+B 实时切换养护（WMI 100%→80%）全部正常 | opencode |
+| 1.28 | 2026-08-18 | **修复电池供电时计划任务被终止（F-BUG）**：开机自启动任务注册时未显式设置任务电源设置，沿用 Windows 默认 `StopIfGoingOnBatteries=TRUE`——笔记本拔掉电源适配器（切到电池）即被任务计划服务终止，正是"电池供电时自启动应用退出"的根因；同时默认 `ExecutionTimeLimit=PT72H` 会在常驻运行满 72 小时时强制终止。修复：`enable` 显式 `SetStopIfGoingOnBatteries(FALSE)` + `SetDisallowStartIfOnBatteries(FALSE)`，`ExecutionTimeLimit` 设为 `PT0S`（无限）；`task_matches` 同步校验三项设置，历史版本注册的旧任务在下次启动 sync 时自动重建（F-AUTO-09 机制）。新增 F-AUTO-11 / AC-AUTO-07 | opencode |
+| 1.29 | 2026-08-18 | **修复首次启动 WMI 总是不可用（F-BUG）**：应用随登录自启动时 WinMgmt 服务/`MICommonInterface` 提供程序可能尚未就绪，WMI 后端在启动握手（10s 上限）内单次连接失败即回退 WinRing0，表现为"第一次启动 WMI 不可用、手动切换却可用"。修复：① 连接重试——`WmiWorker::connect` 在握手预算内对连接+预探测做 4 次 ×2s 退避的有界重试（确定性 `WmiInterfaceNotFound` 同样重试，因提供程序未注册时 ExecQuery 同样返回空、无法与"本机无接口"区分；总退避 6s 显著小于 10s 预算，常量关系由测试锁定），启动常见场景直接自愈；② 延迟恢复——若预算内仍未恢复（WMI 服务启动慢的极端情况），GUI 启动后按 20s→40s→80s→160s 指数退避在**后台线程**探测 WMI（最多 4 次），探测成功且用户偏好仍为 Auto/WMI 时自动切换回 WMI（`UiCommand::WmiAvailable`，偏好未变则丢弃过期结果），用户无需手动切。新增 F-HAL-17 / F-HAL-18 / AC-HAL-09 | opencode |
 
 ---
 
@@ -299,6 +301,8 @@ graph TD
 | F-HAL-14 | 系统应将 WinRing0 DLL 在编译时通过 `rust-embed` 嵌入到二进制中，运行时提取到 `%TEMP%/XiaomiPcManagerLite/bin/` | Must |
 | F-HAL-15 | DLL 提取时，应清理目标目录中的旧版本文件以避免版本冲突 | Should |
 | F-HAL-16 | 用户通过 GUI 设置中的单选按钮可在 Auto / WMI / WinRing0 之间切换后端偏好 | Should |
+| F-HAL-17 | 启动阶段创建 WMI 后端应容忍瞬态故障：连接/预探测失败（WinMgmt 服务未就绪、提供程序尚在加载等）应在握手预算内**有界重试**（重试退避总和须明显小于握手上限），并保证总等待不超过预算后仍失败才回退 | Must |
+| F-HAL-18 | 启动时 WMI 不可用而回退后，系统应在后台按**指数退避**继续探测 WMI（首次延迟与次数有上限）；探测成功且用户偏好仍为 Auto/WMI 时自动切换回 WMI，无需用户手动操作；探测结果过期（用户已手动切换）时丢弃 | Should |
 
 #### 验收标准
 
@@ -310,6 +314,7 @@ graph TD
 - **AC-HAL-06**：WMI 读性能模式时，Data0 返回的 raw code 能正确映射到 5 种性能模式之一
 - **AC-HAL-07**：WMI 读充电上限时，Data1 返回的 raw code 能正确映射到 7 种预设百分比之一
 - **AC-HAL-08**：WMI 后端在支持实例的机器上（如 2025 RedmiBook Pro 14 的 `ACPI\PNP0C14\MIFS_0`）读/写电池养护与性能模式均成功，且连续多次调用进程不崩溃
+- **AC-HAL-09**：首次启动（含随登录自启动）时即使 WinMgmt 服务尚未就绪，WMI 后端也应能在握手预算内自动连接成功；若预算内未成功而回退，后续应在后台自动恢复为 WMI（用户无需手动切换），且探测结果不覆盖用户手动选择的后端偏好
 
 ---
 
@@ -643,6 +648,7 @@ Fn+K 的键码 `ReportHex` 格式为 `01-28-YY`，其中：
 - 任务运行级别为 **最高权限**（`TASK_RUNLEVEL_HIGHEST`）；由于本应用启动时本身会自动提权（`elevate()`），由已提权进程创建/注册的任务在登录时将以管理员权限**静默启动，不弹 UAC 提示**（注册表 Run 键方案每次登录均需弹一次 UAC，故不采用）
 - 任务名固定为 `XiaomiPcManagerLite`，避免与其他软件任务冲突
 - 任务执行命令行携带 `--autostart` 参数，使自启动场景下应用直接驻留托盘
+- 任务设置须显式**关闭"电池供电时停止任务"（`StopIfGoingOnBatteries=false`）并允许电池下启动（`DisallowStartIfOnBatteries=false`）**，且执行时长限制设为**无限（`ExecutionTimeLimit=PT0S`）**——Windows 默认会分别导致拔电即终止任务、常驻运行满 72 小时被强制终止（见 F-AUTO-11）
 
 #### 功能需求
 
@@ -658,6 +664,7 @@ Fn+K 的键码 `ReportHex` 格式为 `01-28-YY`，其中：
 | F-AUTO-08 | 系统应提供单实例保护（命名互斥体 `CreateMutex`）：自启动实例已在运行时，用户手动启动的新实例应退出，并将已有实例主窗口激活到前台 | Should |
 | F-AUTO-09 | 计划任务应引用可执行文件的绝对路径；检测到任务路径与当前可执行文件路径不一致时，应自动重建任务并记录日志 | Could |
 | F-AUTO-10 | 计划任务注册失败（非管理员运行/组策略限制等）时，应用应保持正常运行，在 GUI 中展示错误并恢复复选框为未勾选状态 | Must |
+| F-AUTO-11 | 任务设置应显式设置 `StopIfGoingOnBatteries=false`（电池供电时不终止任务）、`DisallowStartIfOnBatteries=false`（允许电池供电时启动）、`ExecutionTimeLimit=PT0S`（执行时长不限）；与预期不一致时应按 F-AUTO-09 自动重建 | Must |
 
 #### 验收标准
 
@@ -667,6 +674,7 @@ Fn+K 的键码 `ReportHex` 格式为 `01-28-YY`，其中：
 - **AC-AUTO-04**：自启动场景下应用驻留托盘、不弹出主窗口；从托盘图标可正常打开主窗口
 - **AC-AUTO-05**：自启动实例运行中手动打开应用，不产生第二个实例，已有窗口被激活显示
 - **AC-AUTO-06**：任务被用户手动删除后重启应用，应用自动重建任务（配置开启时）并在日志中记录
+- **AC-AUTO-07**：笔记本拔掉电源适配器（切到电池供电）后，自启动的应用进程**不退出**、继续驻留托盘；任务计划中该任务的"条件→电源→电池供电时停止任务"复选框为未勾选状态
 
 ---
 
