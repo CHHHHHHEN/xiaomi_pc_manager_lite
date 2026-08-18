@@ -118,6 +118,11 @@ pub struct XiaomiApp {
     /// 连续硬件读取/写入失败计数（NFR-REL-03）：达到阈值后暂停自动重试
     /// 并在 GUI 展示持久提示，避免"每帧重复失败 + 反复重试"刷屏。
     pub(crate) consecutive_hw_failures: u32,
+    /// 充电上限滑块的**拖动中工作值**（F-PWR-04 回归，修订 1.33）：拖动期间
+    /// 持久到 self，避免电源切换触发的 `refresh_from_backend` 改写 runtime
+    /// 后滑块被"拽回"（egui 每帧从 runtime 重新初始化 limit）。None =
+    /// 未在拖动，直接使用 runtime.charge_limit。
+    pub(crate) charge_limit_drag: Option<u8>,
 }
 
 impl XiaomiApp {
@@ -167,6 +172,7 @@ impl XiaomiApp {
             fn_add_command: String::new(),
             fn_capture_action: ec::fnkey::FnAction::CyclePerfMode,
             fn_capture_command: String::new(),
+            charge_limit_drag: None,
             tray_status,
             // 占位 Context：真正的实例在 run_app 的 eframe 创建闭包中注入
             //（cc.egui_ctx.clone()），供托盘/Fn worker 唤醒隐藏事件循环。

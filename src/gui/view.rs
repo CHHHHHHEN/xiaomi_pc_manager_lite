@@ -288,7 +288,12 @@ impl XiaomiApp {
                     }
                 });
             } else {
-                let mut limit = self.runtime.charge_limit as f32;
+                // F-PWR-04（修订 1.33）：拖动中沿用 `charge_limit_drag` 工作值
+                // 而非每帧从 runtime 重取——电源切换触发的 refresh_from_backend
+                // 会改写 runtime.charge_limit，若滑块每帧重新初始化 limit，拖动
+                // 途中被后台刷新"拽回"，用户手指下的值会跳变（离电瞬间尤其
+                // 明显）。未拖动时（None）退回到 runtime 值。
+                let mut limit = self.charge_limit_drag.unwrap_or(self.runtime.charge_limit) as f32;
                 ui.horizontal(|ui| {
                     ui.label("充电上限:")
                         .on_hover_text("充满到该百分比即停止，40%~100% 可调");
@@ -297,11 +302,16 @@ impl XiaomiApp {
                             .step_by(1.0)
                             .suffix("%"),
                     );
-                    // 只在拖动结束（或点击/键盘改变）时一次性写入硬件：若每个
-                    // changed() 帧都调用 set_charge_limit_internal，拖动一次滑块
-                    // 会触发几十次 EC 写入 + 读回 + 配置文件落盘（WMI 后端单次
-                    // 调用可达数十毫秒），造成界面卡顿并长时间占用 EC（NFR-UX-02）。
+                    // 拖动中把工作值持久到 self（供下一帧继续），拖动结束
+                    // （或点击/键盘改变）时一次性写入硬件：若每个 changed()
+                    // 帧都调用 set_charge_limit_internal，拖动一次滑块会触发
+                    // 几十次 EC 写入 + 读回 + 配置文件落盘（WMI 后端单次调用
+                    // 可达数十毫秒），造成界面卡顿并长时间占用 EC（NFR-UX-02）。
+                    if resp.dragged() {
+                        self.charge_limit_drag = Some(limit.round() as u8);
+                    }
                     if resp.drag_stopped() || (resp.changed() && !resp.dragged()) {
+                        self.charge_limit_drag = None;
                         self.set_charge_limit_internal(limit.round() as u8);
                     }
                 });
