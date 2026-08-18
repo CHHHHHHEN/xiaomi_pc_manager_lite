@@ -447,19 +447,22 @@ fn run_watcher(
         match run_watcher_once(cmd_tx, bindings, capture) {
             Err(WatcherError::NoEventClasses) => {
                 stale_cycles += 1;
-                // 退避节奏（修订 1.32/L4）：前 3 次 5s、随后 30s、持续
-                // 无类后降为 10min 长探测——硬件上没有这些 OEM 事件类
+                // 退避节奏（修订 1.32/L4，1.33 修正）：前 3 次 5s、随后 30s、持续
+                // 无类后降为 60s 长探测——硬件上没有这些 OEM 事件类
                 // （VM / 非小米机型 / 绑定了不存在的类）时，类永远不会
                 // 出现，30s 一次的 warn 刷屏毫无价值；长探测保留"驱动
                 // 后来安装/类后来出现"的恢复通道，同时把日志频率压到
-                // 可忽略。空转（无绑定）场景由 run_watcher_loop 内部
-                // 的 1s continue 承担，不会走到这里（M1 回归）。
+                // 可忽略。60s（而非更长的 600s）保证 GUI 增删绑定/开关
+                // 捕获后最多一分钟内监听线程就能读到新状态，不会出现
+                // 用户操作后长时间无响应的假死感（回归修正）。空转
+                // （无绑定）场景由 run_watcher_loop 内部的 1s continue
+                // 承担，不会走到这里（M1 回归）。
                 let delay = if stale_cycles <= 3 {
                     5
                 } else if stale_cycles <= 20 {
                     30
                 } else {
-                    600
+                    60
                 };
                 log::warn!(
                     "Fn: no event classes for {} consecutive cycle(s); retrying in {}s",
@@ -512,12 +515,12 @@ fn process_event(
 
     // 捕获模式：每条事件转发给 GUI（用于发现键码、配置绑定）。
     if capture.load(Ordering::Relaxed) {
-        // 转发限流（修订 1.32/L2）：按住键触发固件自动重复时事件是
-        // 连续流，逐条转发会塞满无界 mpsc、每事件唤醒 GUI 重绘并各打
-        // 一条 info 日志（GUI 侧也只保留最后一条，其余全浪费）。同一
-        // 类在同一窗口内只转发**最新**一条，即按住时保持 UI 显示最后
-        // 键码不变、松开后下一事件照常更新。
-        if capture_event_gate() {
+        // 转发限流（修订 1.32/L2，1.33 修正）：按住键触发固件自动重复时
+        // 同一键身份（class + 去末状态字节的 hex）的事件是连续流，逐条
+        // 转发会塞满无界 mpsc、每事件唤醒 GUI 重绘。窗口内同一身份只
+        // 转发最新一条；**不同按键不受影响**（各自独立去重，快速连按
+        // 多个功能键不会漏键）。
+        if capture_event_gate(class_name, &normalized) {
             send_watcher_command(
                 cmd_tx,
                 UiCommand::FnEventSeen {
@@ -535,27 +538,41 @@ fn process_event(
     log::debug!("Fn [{}]: unmatched event {}", class_name, normalized);
 }
 
-/// 捕获事件转发限流闸门（修订 1.32/L2）。
+/// 捕获事件转发限流闸门（修订 1.32/L2，1.33 改按键维度）。
 ///
-/// 返回是否允许本次转发：窗口（`CAPTURE_FORWARD_MIN_MS`）内的后续事件
-/// 一律丢弃，窗口刷新后第一条放行。线程局部存储（监听线程专用），
-/// 首次调用必然放行（捕获刚开启时首条键码要即时展示）。
+/// 返回是否允许本次转发。**按"键身份"去重而非全局窗口**（回归修正）：
+/// 同一物理按键的按下/释放/自动重复事件（相同 class + 去掉末状态字节的
+/// hex，如 `012801`/`012800` 身份同为 `0128`）在窗口内只转发第一条——
+/// 按住触发固件自动重复时不再每事件唤醒 GUI；而**不同**按键（身份不同）
+/// 即使 150ms 内连续按下也各自放行，捕获工具不会漏键。线程局部存储
+/// （监听线程专用），身份首次出现必然放行。
 const CAPTURE_FORWARD_MIN_MS: u128 = 150;
 
-fn capture_event_gate() -> bool {
+fn capture_event_gate(class: &str, normalized: &str) -> bool {
     thread_local! {
-        static LAST_FORWARD: std::cell::Cell<Option<std::time::Instant>> =
-            const { std::cell::Cell::new(None) };
+        static LAST_FORWARD: std::cell::RefCell<std::collections::HashMap<String, std::time::Instant>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
     }
+    // 键身份 = 类名 + 去掉末状态字节的 hex（与 keep_press_over_release 的
+    // "去掉末字节后相同即同键码"判定一致）。长度不足 2 时退化为完整 hex。
+    let identity = if normalized.len() >= 2 {
+        format!("{}/{}", class, &normalized[..normalized.len() - 2])
+    } else {
+        format!("{}/{}", class, normalized)
+    };
     LAST_FORWARD.with(|last| {
         let now = std::time::Instant::now();
-        // 首次调用（None）或已过窗口（≥CAPTURE_FORWARD_MIN_MS）放行。
-        let allow = match last.get() {
-            Some(prev) => now.duration_since(prev).as_millis() >= CAPTURE_FORWARD_MIN_MS,
+        // 清理过期条目（窗口外的身份不再占用内存；身份数 = 窗口内不同键数，
+        // 有界且极小）。
+        last.borrow_mut()
+            .retain(|_, t| now.duration_since(*t).as_millis() < CAPTURE_FORWARD_MIN_MS);
+        let mut map = last.borrow_mut();
+        let allow = match map.get(&identity) {
+            Some(prev) => now.duration_since(*prev).as_millis() >= CAPTURE_FORWARD_MIN_MS,
             None => true,
         };
         if allow {
-            last.set(Some(now));
+            map.insert(identity, now);
         }
         allow
     })
@@ -668,7 +685,11 @@ fn run_external_command(command: Option<&str>) {
         log::warn!("Fn: RunCommand binding with empty command; skipped");
         return;
     };
+    // info 级脱敏（RUST_LOG=info 是默认，日志文件可能被转发/提交）；完整
+    // 命令仅在用户显式开启 debug 时可见（RUST_LOG=debug），排查带引号路径
+    // 等问题时再开。
     log::info!("Fn: running external command: {}", redact_command(command));
+    log::debug!("Fn: running external command (full): {}", command);
     // 转换为拥有所有权的 String 再移入线程（闭包参数 Option<&str> 借用
     // 自调用方，跨线程 move 会触发 E0521；所有权的 String 无生命周期约束）。
     let command = command.to_owned();
@@ -851,18 +872,31 @@ mod tests {
         assert!(!valid_class("HID EVENT"));
     }
 
-    /// 捕获事件转发限流（修订 1.32/L2）：首次必然放行，窗口内重复丢弃，
-    /// 窗口过后重新放行——按住触发固件自动重复时不塞爆 mpsc/不每事件
-    /// 唤醒 GUI。窗口判定是纯时间比较，不 sleep：连续调用验证"首放、
-    /// 后续即弃"的契约，跨窗口语义由实现内的 `>= CAPTURE_FORWARD_MIN_MS`
-    /// 保证（阈值改动的单点常量）。
+    /// 捕获事件转发限流（修订 1.32/L2、1.33 按键维度）：同一键身份首次
+    /// 必然放行、窗口内重复（自动重复/按下释放对）丢弃；**不同按键**即使
+    /// 在窗口内也各自放行，捕获工具不因快速连按漏键。窗口判定是纯时间
+    /// 比较，不 sleep。
     #[test]
     fn test_capture_event_gate_rate_limits() {
-        assert!(capture_event_gate(), "first event must pass");
-        assert!(!capture_event_gate(), "immediate repeat must be dropped");
         assert!(
-            !capture_event_gate(),
-            "events within the window keep being dropped"
+            capture_event_gate("HID_EVENT20", "012801"),
+            "first event must pass"
+        );
+        // 同一键的按下/释放对（身份同为 0128）：窗口内释放被去重。
+        assert!(
+            !capture_event_gate("HID_EVENT20", "012800"),
+            "release of same key within window must be dropped"
+        );
+        // 同一键的自动重复事件：窗口内丢弃。
+        assert!(
+            !capture_event_gate("HID_EVENT20", "012801"),
+            "auto-repeat of same key within window must be dropped"
+        );
+        // **不同按键**：即使同窗口内也必须放行（回归修正：历史全局窗口
+        // 会把 150ms 内按下的第二个键也吞掉，捕获工具漏键）。
+        assert!(
+            capture_event_gate("HID_EVENT20", "010701"),
+            "a different key within the window must still pass"
         );
     }
 

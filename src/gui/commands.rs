@@ -342,18 +342,18 @@ impl XiaomiApp {
         prefix: &str,
         action: ec::fnkey::FnAction,
         command: &str,
-    ) {
+    ) -> bool {
         // 与 config.rs 消毒同一套规则（修订 1.32/M3）：前缀须至少一个完整
         // 字节、类名须为合法 WQL 标识符——单字节前缀与非法类名即使手改
         // 配置也会被丢弃，GUI 侧保持一致避免"能加进去但下次加载被删"。
         if !ec::fnkey::valid_class(class) {
             log::warn!("add_fn_binding: invalid class ignored: {:?}", class);
-            return;
+            return false;
         }
         let prefix = ec::fnkey::normalize_hex(prefix);
         if !ec::fnkey::valid_prefix(&prefix) {
             log::warn!("add_fn_binding: invalid prefix ignored: {:?}", prefix);
-            return;
+            return false;
         }
         // 只有 RunCommand 动作会携带命令文本；其余动作恒为 None。
         let command = if action == ec::fnkey::FnAction::RunCommand {
@@ -390,6 +390,7 @@ impl XiaomiApp {
             });
         }
         self.commit_fn_bindings();
+        true
     }
 
     /// 删除某条绑定（列表恒保留至少一条？不强制：允许清空后监听线程
@@ -745,11 +746,15 @@ impl XiaomiApp {
             // 让用户区分"偶发一次失败"与"后端已不可用"（NFR-REL-03）。
             if self.consecutive_hw_failures >= HW_FAILURE_PAUSE_THRESHOLD {
                 log::warn!(
-                    "Hardware read failed {} consecutive times; pausing retry",
+                    "Hardware read failed {} consecutive times",
                     self.consecutive_hw_failures
                 );
+                // 措辞修正（修订 1.33）：历史文案写"已暂停自动重试"，但刷新
+                // 只由用户/启动/电源事件触发，没有周期性的自动重试循环——
+                // "暂停"是误导。改为如实描述"连续失败 N 次"，并保留同样的
+                // 排查指引（检查驱动或切换后端）。
                 errors.push(format!(
-                    "硬件连续读取失败 {} 次，已暂停自动重试；请检查驱动或切换后端",
+                    "硬件连续读取失败 {} 次；请检查驱动或切换后端",
                     self.consecutive_hw_failures
                 ));
             }
@@ -1265,8 +1270,10 @@ mod tests {
     }
 
     /// NFR-REL-03：连续硬件读取失败达到阈值后，GUI 错误提示必须包含
-    /// "已暂停自动重试"（驱动失效/EC 掉线等持续故障不再静默无限重试）；
-    /// 任意一次成功读取清零计数并移除持久提示。
+    /// "连续读取失败 N 次"（驱动失效/EC 掉线等持续故障不再静默无限重试）；
+    /// 任意一次成功读取清零计数并移除持久提示。措辞为"连续失败 N 次"
+    /// 而非"已暂停自动重试"（修订 1.33：刷新由用户/启动/电源事件触发，
+    /// 不存在周期性自动重试循环，故"暂停"是误导）。
     #[test]
     fn test_consecutive_failures_pause_retry_and_reset_on_success() {
         let store = test_store();
@@ -1282,17 +1289,17 @@ mod tests {
         // `XiaomiApp::new()` 已执行一次初始刷新：failing 后端下计 1 次失败。
         assert_eq!(app.consecutive_hw_failures, 1);
 
-        // 再失败一次（累计 2）：错误展示但不带"已暂停"提示。
+        // 再失败一次（累计 2）：错误展示但不带"连续失败"提示。
         app.refresh_from_backend();
         assert_eq!(app.consecutive_hw_failures, 2);
         let msg = app.error_msg.as_deref().unwrap_or_default();
-        assert!(!msg.contains("已暂停自动重试"), "before threshold: {}", msg);
+        assert!(!msg.contains("连续读取失败"), "before threshold: {}", msg);
 
-        // 再失败一次（累计 3）：达到阈值，错误消息必须带持久暂停提示。
+        // 再失败一次（累计 3）：达到阈值，错误消息必须带连续失败提示。
         app.refresh_from_backend();
         assert_eq!(app.consecutive_hw_failures, 3);
         let msg = app.error_msg.as_deref().unwrap_or_default();
-        assert!(msg.contains("已暂停自动重试"), "at threshold: {}", msg);
+        assert!(msg.contains("连续读取失败"), "at threshold: {}", msg);
 
         // 一次成功读取：计数清零、持久提示移除。
         mock.read_fails

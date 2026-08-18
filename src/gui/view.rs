@@ -565,9 +565,12 @@ impl XiaomiApp {
                     }
                     if ui.button("使用此键").clicked() {
                         let command = self.fn_capture_command.clone();
-                        self.add_fn_binding(&class, prefix, action, &command);
-                        // 添加成功后清空草稿（避免下次捕获残留上次命令）。
-                        self.fn_capture_command.clear();
+                        // 仅绑定真正写入（返回 true）时清空草稿：若校验拒绝
+                        // （罕见：捕获产物异常），保留用户输入便于重试（修订
+                        // 1.33 回归修正）。
+                        if self.add_fn_binding(&class, prefix, action, &command) {
+                            self.fn_capture_command.clear();
+                        }
                     }
                 });
             } else {
