@@ -542,6 +542,9 @@ impl XiaomiApp {
                 // 动作选择必须保存在 self 上（每帧 UI 重建，局部变量会
                 // 重置回默认——历史实现用局部变量导致用户选中的动作在
                 // 下一帧丢失，"使用此键"恒绑定默认动作，H1 回归）。
+                // 动作选择必须保存在 self 上（每帧 UI 重建，局部变量会
+                // 重置回默认——历史实现用局部变量导致用户选中的动作在
+                // 下一帧丢失，"使用此键"恒绑定默认动作，H1 回归）。
                 let mut action = self.fn_capture_action;
                 ui.horizontal(|ui| {
                     ui.label("绑定为:");
@@ -553,11 +556,21 @@ impl XiaomiApp {
                             }
                         });
                     self.fn_capture_action = action;
-                    // 捕获流程仅支持预设动作（无命令草稿输入）：RunCommand
-                    // 可从"添加绑定"预设流程配置命令。
-                    let command = "";
+                    // RunCommand 动作：附带命令行输入框（草稿跨帧保持，
+                    // 与添加绑定流程的 fn_add_command 同理；否则捕获绑定
+                    // 到的 RunCommand 命令为空、需事后到列表再改一次）。
+                    if action == crate::ec::fnkey::FnAction::RunCommand {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.fn_capture_command)
+                                .hint_text("例如 start notepad 或 C:\\tools\\app.exe")
+                                .desired_width(200.0),
+                        );
+                    }
                     if ui.button("使用此键").clicked() {
-                        self.add_fn_binding(&class, prefix, action, command);
+                        let command = self.fn_capture_command.clone();
+                        self.add_fn_binding(&class, prefix, action, &command);
+                        // 添加成功后清空草稿（避免下次捕获残留上次命令）。
+                        self.fn_capture_command.clear();
                     }
                 });
             } else {

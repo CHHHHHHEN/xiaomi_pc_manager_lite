@@ -97,6 +97,9 @@ pub struct XiaomiApp {
     /// 每帧重建，局部变量会被重置回默认——若用局部变量，用户选中的动作
     /// 在下一帧即丢失，点击"使用此键"时恒绑定默认动作，见 view.rs）。
     pub(crate) fn_capture_action: ec::fnkey::FnAction,
+    /// "Fn 捕获 → 绑定为"中 RunCommand 动作的命令草稿（跨帧保持，
+    /// 捕获场景无法从预设键码带出命令，需在此直接输入，见 view.rs）。
+    pub(crate) fn_capture_command: String,
     /// 托盘 tooltip/菜单共享的运行时状态（GUI 写入，托盘线程周期读取）。
     pub(crate) tray_status: SharedTrayStatus,
     /// egui Context 的线程安全克隆：供托盘/Fn 监听/自启动 worker 线程在
@@ -163,6 +166,7 @@ impl XiaomiApp {
             fn_add_action: ec::fnkey::FnAction::CyclePerfMode,
             fn_add_command: String::new(),
             fn_capture_action: ec::fnkey::FnAction::CyclePerfMode,
+            fn_capture_command: String::new(),
             tray_status,
             // 占位 Context：真正的实例在 run_app 的 eframe 创建闭包中注入
             //（cc.egui_ctx.clone()），供托盘/Fn worker 唤醒隐藏事件循环。
