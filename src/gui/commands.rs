@@ -46,8 +46,21 @@ impl XiaomiApp {
                     // 捕获模式（Fn 功能键设置中开启）下收到的实时事件：
                     // 记录最近一条，GUI 展示并用于添加新绑定。事件频率由
                     // 用户按键节奏决定，仅保留最新一条不缓存历史。
-                    log::info!("Fn capture event: {} / {}", class, hex);
-                    self.last_fn_event = Some((class, hex));
+                    //
+                    // **按下/释放过滤**（修订 1.31，L-回归）：固件对一次物理
+                    // 按键发送按下（`012801`）与释放（`012800`）两条事件，
+                    // 释放总是**后到**。若直接把释放事件写入 `last_fn_event`，
+                    // "最近捕获"显示 `01-28-00`、"使用此键"绑定 `012800`——
+                    // 下一次物理按键发出 `012801` 不再命中此前缀，绑定失效
+                    // 或变成"在释放时触发"（与 F-FNK-06 的按下/释放语义
+                    // 冲突）。修复：释放事件（hex 以 `00` 结尾）不得覆盖
+                    // 同键码的按下事件（`...01`）。
+                    let keep_previous =
+                        Self::keep_press_over_release(self.last_fn_event.as_ref(), &class, &hex);
+                    if !keep_previous {
+                        log::info!("Fn capture event: {} / {}", class, hex);
+                        self.last_fn_event = Some((class, hex));
+                    }
                 }
                 UiCommand::SetAutostartResult(enabled, result) => match result {
                     Ok(()) => {
@@ -135,9 +148,19 @@ impl XiaomiApp {
     /// 统一处理"写限值 → 写养护 → 写性能模式（含狂暴的交流电源降级）"。
     /// 兜底只作用在辅助函数内部，**不**提前改写 config——写入失败时内存中的
     /// config 不会被污染。
+    ///
+    /// **门控条件**（修订 1.31）：`auto_reapply_on_power_change` 关闭时仍执行
+    /// 的情形是"电池供电时自动切换节能"（`auto_switch_to_quiet_on_battery`）
+    /// 开启——该功能依赖拔插电源事件才能生效，若被重设开关一起关掉，用户
+    /// 明确开启的"电池自动切节能"就静默失效（配置陷阱，F-PWR-07）。重设
+    /// 开关只约束"整份配置重写"，自动切节能是独立的、被用户显式请求的行为。
     pub(crate) fn reapply_config(&mut self) {
-        if !self.config.auto_reapply_on_power_change {
-            log::debug!("ReapplyConfig ignored: auto_reapply_on_power_change is off");
+        let reapply_ok = self.config.auto_reapply_on_power_change;
+        let quiet_ok = self.config.auto_switch_to_quiet_on_battery;
+        if !reapply_ok && !quiet_ok {
+            log::debug!(
+                "ReapplyConfig ignored: auto_reapply_on_power_change off and auto_switch_to_quiet_on_battery off"
+            );
             return;
         }
         self.apply_config_and_sync();
@@ -368,6 +391,34 @@ impl XiaomiApp {
         self.commit_fn_bindings();
     }
 
+    /// 捕获模式下，**释放事件不得覆盖同键码的按下事件**（修订 1.31 回归修复）。
+    ///
+    /// 固件对一次物理按键先后发送按下与释放两条事件（如 `012801` / `012800`，
+    /// 见 F-FNK-06 的 ReportHex 语义）。捕获窗口把两者都转发给 GUI，而释放
+    /// 总是后到——若直接覆盖 `last_fn_event`，"最近捕获"显示释放码、"使用
+    /// 此键"绑定释放前缀，下一次物理按键（按下码）不再命中，绑定静默失效。
+    ///
+    /// 判定规则：新事件是**释放**（归一化 hex 末字节 `00`）且已存事件是
+    /// 同一键码的**按下**（末字节 `01`）时，保留旧的按下事件。同键码判定：
+    /// 事件类相同、hex 去掉末字节后相同（如 `012800` 与 `012801` 前缀均为
+    /// `0128`）；`None`/类不同/非释放时直接更新。
+    fn keep_press_over_release(prev: Option<&(String, String)>, class: &str, hex: &str) -> bool {
+        // 仅当新事件是释放（长度 ≥2 且以 "00" 结尾）时考虑保留旧按下事件。
+        if !(hex.len() >= 2 && hex.ends_with("00")) {
+            return false;
+        }
+        let Some((prev_class, prev_hex)) = prev else {
+            return false;
+        };
+        prev_class == class
+        && prev_hex.len() >= 2
+        && prev_hex.ends_with("01")
+        // 同键码：去掉末字节后完全相同。
+        && hex[..hex.len() - 2] == prev_hex[..prev_hex.len() - 2]
+    }
+}
+
+impl XiaomiApp {
     /// 切换 Fn 捕获模式（与监听线程共享的开关）：开启后收到的功能键
     /// 事件实时回传 GUI（UiCommand::FnEventSeen）便于配置新绑定。
     pub(crate) fn toggle_fn_capture(&mut self) {
@@ -1385,6 +1436,64 @@ mod tests {
         );
     }
 
+    /// 回归测试（修订 1.31）：开启"电池供电时自动切换节能"但关闭"电源切换
+    /// 时自动重设"时，电源广播路径的 ReapplyConfig 仍须生效——自动切节能
+    /// 依赖电源变化触发，若被重设开关一起关掉，用户明确开启的功能就静默
+    /// 失效（F-PWR-07 语义）。历史实现两者同门，自动切节能成了死配置。
+    #[test]
+    fn test_reapply_runs_when_auto_quiet_on_despite_reapply_switch_off() {
+        let store = test_store();
+        let mock = MockBackend::default();
+        let hw_perf = mock.perf_mode.clone();
+        let mut app = XiaomiApp::new(
+            store,
+            Box::new(mock.clone()),
+            AppConfig::default(),
+            crate::ec::config::BackendPreference::Auto,
+            None,
+            false,
+        );
+        // 重设开关关闭 + 自动切节能开启：电源广播仍须重设。
+        app.config.auto_reapply_on_power_change = false;
+        app.config.auto_switch_to_quiet_on_battery = true;
+        app.config.performance_mode = 0x04; // 狂暴
+        hw_perf.store(0x09, std::sync::atomic::Ordering::Relaxed);
+
+        let ctx = egui::Context::default();
+        app.cmd_tx.send(UiCommand::ReapplyConfig).unwrap();
+        app.process_commands(&ctx);
+
+        assert!(
+            hw_perf.load(std::sync::atomic::Ordering::Relaxed) != 0x09,
+            "auto-quiet needs the power-reapply path to run despite reapply switch off"
+        );
+
+        // 两开关都关闭：电源路径才真正跳过（不写硬件）。
+        let store2 = test_store();
+        let mock2 = MockBackend::default();
+        let hw_perf2 = mock2.perf_mode.clone();
+        let mut app2 = XiaomiApp::new(
+            store2,
+            Box::new(mock2.clone()),
+            AppConfig::default(),
+            crate::ec::config::BackendPreference::Auto,
+            None,
+            false,
+        );
+        app2.config.auto_reapply_on_power_change = false;
+        app2.config.auto_switch_to_quiet_on_battery = false;
+        app2.config.performance_mode = 0x04;
+        hw_perf2.store(0x09, std::sync::atomic::Ordering::Relaxed);
+        let ctx = egui::Context::default();
+        app2.cmd_tx.send(UiCommand::ReapplyConfig).unwrap();
+        app2.process_commands(&ctx);
+        assert_eq!(
+            hw_perf2.load(std::sync::atomic::Ordering::Relaxed),
+            0x09,
+            "both switches off must keep the power path inert"
+        );
+    }
+
     /// 回归测试：`apply_config_and_sync`（用户主动重设，如勾选自动切节能）
     /// 必须**不受** `auto_reapply_on_power_change` 开关约束——主动操作无条件
     /// 应用。历史实现把两者绑在一起，开关关闭时用户勾选"电池供电自动切节能"
@@ -1858,6 +1967,72 @@ mod tests {
         app.toggle_fn_capture();
         assert!(!app.fn_capture.load(std::sync::atomic::Ordering::Relaxed));
         assert_eq!(app.last_fn_event, None, "capture off clears last event");
+    }
+
+    /// 回归测试（修订 1.31）：捕获模式下固件先发按下（`012801`）后发释放
+    /// （`012800`），释放总是后到——`last_fn_event` 必须保留按下事件，否则
+    /// "最近捕获"显示释放码、"使用此键"绑定 `012800`，下一次物理按键的
+    /// `012801` 不再命中（F-FNK-06 按下/释放语义冲突）。
+    #[test]
+    fn test_capture_keeps_press_over_release() {
+        let mut app = test_app();
+        let ctx = egui::Context::default();
+
+        // 按下事件先到。
+        app.cmd_tx
+            .send(UiCommand::FnEventSeen {
+                class: "HID_EVENT20".into(),
+                hex: "012801".into(),
+            })
+            .unwrap();
+        app.process_commands(&ctx);
+        assert_eq!(
+            app.last_fn_event,
+            Some(("HID_EVENT20".to_string(), "012801".to_string()))
+        );
+
+        // 同键码释放事件后到：不得覆盖按下事件。
+        app.cmd_tx
+            .send(UiCommand::FnEventSeen {
+                class: "HID_EVENT20".into(),
+                hex: "012800".into(),
+            })
+            .unwrap();
+        app.process_commands(&ctx);
+        assert_eq!(
+            app.last_fn_event,
+            Some(("HID_EVENT20".to_string(), "012801".to_string())),
+            "release event must not overwrite the press event"
+        );
+
+        // 不同键码（新按下）正常更新：不误伤后续独立按键。
+        app.cmd_tx
+            .send(UiCommand::FnEventSeen {
+                class: "HID_EVENT20".into(),
+                hex: "010701".into(),
+            })
+            .unwrap();
+        app.process_commands(&ctx);
+        assert_eq!(
+            app.last_fn_event,
+            Some(("HID_EVENT20".to_string(), "010701".to_string()))
+        );
+
+        // 只有释放事件（无先前按下）时允许记录（用户只按了释放/键码以 00
+        // 结尾的真实按键），不因误过滤而丢失。
+        app.last_fn_event = None;
+        app.cmd_tx
+            .send(UiCommand::FnEventSeen {
+                class: "HID_EVENT20".into(),
+                hex: "012800".into(),
+            })
+            .unwrap();
+        app.process_commands(&ctx);
+        assert_eq!(
+            app.last_fn_event,
+            Some(("HID_EVENT20".to_string(), "012800".to_string())),
+            "standalone release (no prior press) must still be captured"
+        );
     }
 
     /// 延迟恢复探测结果（UiCommand::WmiAvailable）应用：用户偏好仍是

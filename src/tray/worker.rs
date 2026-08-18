@@ -356,8 +356,18 @@ fn power_broadcast_to_command(wparam: u32) -> Option<UiCommand> {
 fn handle_tray_event(hwnd: HWND, lparam: LPARAM) -> LRESULT {
     match lparam.0 as u32 {
         WM_LBUTTONUP => {
-            // 直接操作窗口（原因见 toggle_main_window）。
-            toggle_main_window();
+            // 双击检测（修订 1.31）：Windows 对一次双击发送两条 WM_LBUTTONUP
+            //（中间的 WM_LBUTTONDBLCLK 被忽略）。若每次单击都 toggle，双击
+            // 会让窗口"打开又立刻关闭"——用户肌肉记忆里的托盘双击手势
+            // 直接失效。修复：第二次单击若落在系统双击间隔内，按**强制显示**
+            // 处理而非再次 toggle。F-TRAY-04 的单击 toggle 语义保持不变。
+            if is_double_click() {
+                log::debug!("Tray double-click; force-showing main window");
+                crate::platform::window::show_main_window();
+            } else {
+                // 直接操作窗口（原因见 toggle_main_window）。
+                toggle_main_window();
+            }
             LRESULT(0)
         }
         WM_RBUTTONUP => {
@@ -365,6 +375,40 @@ fn handle_tray_event(hwnd: HWND, lparam: LPARAM) -> LRESULT {
             LRESULT(0)
         }
         _ => LRESULT(0),
+    }
+}
+
+// 托盘最近一次单击时间（线程局部，双击判定用）。
+thread_local! {
+    static LAST_CLICK: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// 判断本次托盘单击是否为双击序列的第二击。
+///
+/// 用 GetDoubleClickTime()（系统设置的双击间隔）判定：上一次单击在间隔内
+/// 则视为双击，并刷新时间戳使第三次单击重新开始一轮。线程局部存储避免
+/// 与托盘 worker 之外的状态耦合。
+fn is_double_click() -> bool {
+    LAST_CLICK.with(|last| {
+        let now = std::time::Instant::now();
+        let is_double = last
+            .get()
+            .map(|prev| now.duration_since(prev).as_millis() <= get_double_click_ms())
+            .unwrap_or(false);
+        last.set(Some(now));
+        is_double
+    })
+}
+
+/// 系统双击间隔（毫秒）。GetDoubleClickTime() 返回 u32，取默认 500ms 兜底。
+fn get_double_click_ms() -> u128 {
+    const DEFAULT_DCLICK: u128 = 500;
+    let ms = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime() };
+    if ms == 0 {
+        DEFAULT_DCLICK
+    } else {
+        ms as u128
     }
 }
 
@@ -919,6 +963,31 @@ mod tests {
             sz_tip[tip.encode_utf16().count()],
             0,
             "must be NUL-terminated"
+        );
+    }
+
+    /// 双击判定（修订 1.31）：间隔内的第二次单击视为双击；间隔外恢复单击。
+    /// 线程局部时间戳在测试线程内自洽，不依赖真实点击。
+    #[test]
+    fn test_double_click_detection() {
+        // 第一次单击：非双击。
+        assert!(!is_double_click(), "first click must not be a double-click");
+        // 紧接着第二次：双击（GetDoubleClickTime 默认 ≥100ms，两次调用间隙
+        // 远小于该值）。
+        assert!(
+            is_double_click(),
+            "immediate second click must be a double-click"
+        );
+        // 模拟"间隔已过"：把线程局部时间戳拨旧，第三次单击恢复为单击。
+        let window = get_double_click_ms() as u64 + 100;
+        LAST_CLICK.with(|c| {
+            c.set(Some(
+                std::time::Instant::now() - std::time::Duration::from_millis(window),
+            ))
+        });
+        assert!(
+            !is_double_click(),
+            "click after the double-click window must be a single click"
         );
     }
 }
