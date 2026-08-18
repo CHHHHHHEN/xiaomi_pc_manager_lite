@@ -1,4 +1,5 @@
 use windows::core::{Interface, BSTR};
+use windows::Win32::Foundation::{VARIANT_FALSE, VARIANT_TRUE};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 use windows::Win32::System::TaskScheduler::*;
 use windows::Win32::System::Variant::VARIANT;
@@ -11,9 +12,18 @@ use windows::Win32::System::Variant::VARIANT;
 /// - 以当前用户交互令牌运行，运行级别设为**最高权限**（TASK_RUNLEVEL_HIGHEST，
 ///   见 F-AUTO-02）——否则应用启动时 `elevate_self()` 会在每次登录弹出 UAC，
 ///   违背自启动"驻留托盘不打扰用户"的设计
+/// - 任务设置显式关闭"电池供电时停止任务 / 禁止电池下启动"，且执行时长设为
+///   无限（PT0S）——Windows 默认 `StopIfGoingOnBatteries=TRUE`（切到电池即
+///   终止任务）与 `ExecutionTimeLimit=PT72H`（运行满 72h 强制结束）都会杀掉
+///   常驻托盘的应用进程，必须以显式设置覆盖（见 F-AUTO-11）
 /// - 执行命令：`<exe 绝对路径> --autostart`（启动后驻留托盘）
 const TASK_NAME: &str = "XiaomiPcManagerLite";
 const TASK_DESC: &str = "Xiaomi PC Manager Lite - 开机自启动";
+
+/// 执行时长不限：计划任务默认 `ExecutionTimeLimit=PT72H`，任务运行超过 72 小时
+/// 会被任务计划服务强制终止——托盘常驻进程必须显式设为 PT0S 禁用该上限。
+/// 锁定该字符串，供 `task_matches` 校验与 `enable` 写入共用。
+const TASK_EXEC_TIME_LIMIT_DISABLED: &str = "PT0S";
 
 /// HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) = 0x80070002：任务不存在。
 /// GetTask / DeleteTask 对"任务不存在"返回该值（本机实测），与其它错误
@@ -110,6 +120,10 @@ fn bstr_to_string(b: &BSTR) -> String {
 /// - 运行级别为最高权限（TASK_RUNLEVEL_HIGHEST）——旧版本注册的任务用
 ///   默认级别（LUA，非管理员）运行，启动时 `elevate_self()` 会在每次登录
 ///   弹出 UAC，必须重建避免打扰用户；
+/// - 电池/时长设置符合预期——历史版本注册的任务未显式设置，`StopIfGoingOnBatteries`
+///   沿用默认 TRUE（拔电即被任务计划服务终止），`ExecutionTimeLimit` 沿用默认
+///   PT72H（常驻运行满 72 小时被终止）；这两项不满足都必须重建，否则升级后
+///   托盘应用仍会被平台杀掉；
 /// - 执行路径为当前可执行文件绝对路径、参数为 `--autostart`——exe 被移动/
 ///   升级后旧任务指向失效路径，应立即重建。
 fn task_matches(task: &IRegisteredTask) -> Result<bool, String> {
@@ -177,6 +191,41 @@ fn task_matches(task: &IRegisteredTask) -> Result<bool, String> {
             "Autostart task args '{}' != '--autostart'",
             bstr_to_string(&args)
         );
+    }
+
+    // 任务设置：电池供电时不得停止任务、电池下可启动、执行时长无限。
+    // 历史版本注册的任务未显式设置这三项（`StopIfGoingOnBatteries` 默认
+    // TRUE、`ExecutionTimeLimit` 默认 PT72H），与预期不符时必须重建——
+    // 否则升级后拔电/常驻超时仍会被任务计划服务终止。
+    let settings = unsafe {
+        def.Settings()
+            .map_err(|e| format!("ITaskDefinition::Settings: {}", e))?
+    };
+    let mut stop_on_battery = VARIANT_TRUE;
+    let mut disallow_on_battery = VARIANT_TRUE;
+    let mut exec_time = BSTR::new();
+    unsafe {
+        settings
+            .StopIfGoingOnBatteries(&mut stop_on_battery)
+            .map_err(|e| format!("StopIfGoingOnBatteries: {}", e))?;
+        settings
+            .DisallowStartIfOnBatteries(&mut disallow_on_battery)
+            .map_err(|e| format!("DisallowStartIfOnBatteries: {}", e))?;
+        settings
+            .ExecutionTimeLimit(&mut exec_time)
+            .map_err(|e| format!("ExecutionTimeLimit: {}", e))?;
+    }
+    let stop_ok = stop_on_battery == VARIANT_FALSE;
+    let disallow_ok = disallow_on_battery == VARIANT_FALSE;
+    let exec_ok = bstr_to_string(&exec_time) == TASK_EXEC_TIME_LIMIT_DISABLED;
+    if !stop_ok || !disallow_ok || !exec_ok {
+        log::warn!(
+            "Autostart task battery/exec settings stale (stop_on_battery={}, disallow_on_battery={}, exec_time_limit='{}'); needs rebase",
+            stop_on_battery == VARIANT_TRUE,
+            disallow_on_battery == VARIANT_TRUE,
+            bstr_to_string(&exec_time)
+        );
+        return Ok(false);
     }
     Ok(path_matches && args_match)
 }
@@ -248,6 +297,24 @@ pub fn enable() -> Result<(), String> {
             .map_err(|e| format!("SetPath: {}", e))?;
         exec.SetArguments(&BSTR::from("--autostart"))
             .map_err(|e| format!("SetArguments: {}", e))?;
+    }
+
+    // 任务设置：电池供电时**不得**停止任务（默认 `StopIfGoingOnBatteries`
+    // =TRUE，拔电即被任务计划服务终止，正是"电池供电时计划任务终止运行"
+    // 的根因），并允许在电池供电时启动（登录即触发、无 AC 依赖）；执行
+    // 时长设为无限（默认 `ExecutionTimeLimit=PT72H`，常驻应用运行满 72 小时
+    // 会被强制终止）。
+    unsafe {
+        let settings = def.Settings().map_err(|e| format!("Settings: {}", e))?;
+        settings
+            .SetStopIfGoingOnBatteries(VARIANT_FALSE)
+            .map_err(|e| format!("SetStopIfGoingOnBatteries: {}", e))?;
+        settings
+            .SetDisallowStartIfOnBatteries(VARIANT_FALSE)
+            .map_err(|e| format!("SetDisallowStartIfOnBatteries: {}", e))?;
+        settings
+            .SetExecutionTimeLimit(&BSTR::from(TASK_EXEC_TIME_LIMIT_DISABLED))
+            .map_err(|e| format!("SetExecutionTimeLimit: {}", e))?;
     }
 
     // 注册任务：创建或覆盖；以当前用户交互令牌运行（普通权限）
@@ -341,6 +408,15 @@ mod tests {
     #[test]
     fn test_task_name_is_stable() {
         assert_eq!(TASK_NAME, "XiaomiPcManagerLite");
+    }
+
+    /// 回归测试：任务执行时长不限的 ISO-8601 时长必须是 PT0S（Task Scheduler
+    /// 约定 0 时长 = 无限）。`enable` 写入、`task_matches` 校验共用该常量，
+    /// 锁定其值防止漂移——默认的 PT72H 会在常驻运行满 3 天时被任务计划服务
+    /// 强制终止。
+    #[test]
+    fn test_exec_time_limit_disabled_is_pt0s() {
+        assert_eq!(TASK_EXEC_TIME_LIMIT_DISABLED, "PT0S");
     }
 
     /// 回归测试（无条件兜底清理）："任务不存在"的判定 HRESULT 必须是
