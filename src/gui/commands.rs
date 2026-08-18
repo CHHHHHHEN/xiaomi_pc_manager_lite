@@ -637,11 +637,17 @@ impl XiaomiApp {
     /// 直接调用默认文本编辑器对 `.txt` 关联不可靠（可能落在记事本以外的
     /// 程序），资源管理器定位稳定且用户能同时看到轮转副本（app.log.1）。
     /// GUI 主线程不阻塞：explorer 是独立进程。
+    ///
+    /// `/select,` 必须与路径分开作为独立参数传入：若拼接成一个含内嵌引号的
+    /// 参数（`/select,"C:\...\app.log"`），`std::process::Command` 会整体加
+    /// 引号并把内嵌引号转义成 `\"`，explorer.exe 无法解析该参数，退化为打开
+    /// 默认位置（桌面），日志并未被定位。
     pub(crate) fn open_log_file(&mut self) {
         let path = crate::util::log_file_path();
-        let param = format!("/select,\"{}\"", path.to_string_lossy());
+        let path_str = path.to_string_lossy();
         match std::process::Command::new("explorer.exe")
-            .arg(&param)
+            .arg("/select,")
+            .arg(path_str.as_ref())
             .spawn()
         {
             Ok(_) => log::info!("Opening log file in Explorer: {}", path.display()),
