@@ -28,6 +28,7 @@ use std::sync::Mutex;
 use super::backend::EcBackend;
 use crate::app::battery;
 use crate::app::ec::EcError;
+use crate::util::err_fmt;
 
 use windows::core::{BSTR, PCWSTR};
 use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
@@ -111,7 +112,7 @@ fn ensure_com() -> Result<(), EcError> {
             Err(err)
         }
         _ => {
-            let err = EcError::WmiConnect(format!("COM init: {}", hr));
+            let err = EcError::WmiConnect(err_fmt("COM init", hr));
             log::error!("COM init failed: {}", err);
             Err(err)
         }
@@ -276,16 +277,29 @@ impl WmiWorker {
             return Ok(t.clone());
         }
         let enumerator = crate::win::exec_query(&self.services, "SELECT * FROM MICommonInterface")
-            .map_err(|e| EcError::WmiConnect(format!("ExecQuery instances: {}", e)))?;
+            .map_err(|e| EcError::WmiConnect(err_fmt("ExecQuery instances", e)))?;
 
         // (instance_name, active, is_mifs)：收集全部实例后按 Meow-Box 的
         // 选择策略挑选：active 且含 MIFS 优先，否则取第一个。
         let mut instances: Vec<(String, bool, bool)> = Vec::new();
         loop {
-            // 统一收敛在 `win::com::next_instance`（单槽 Next 样板）；枚举耗尽
-            // 或 Next 失败（与历史一致）都结束收集。
-            let Ok(Some(obj)) = (unsafe { crate::win::next_instance(&enumerator, 500) }) else {
-                break;
+            // 统一收敛在 `win::com::next_instance`（单槽 Next 样板）。
+            //
+            // **枚举耗尽与 Next 失败必须区分**（修订 1.50）：`Ok(None)` 是
+            // 正常枚举结束；`Err` 是连接失效等瞬态错误。历史实现把两者都
+            // break，若错误发生在首个实例之前，`instances` 为空 → 返回
+            // `WmiInterfaceNotFound`（"本机不支持"）——瞬态连接错误被伪装成
+            // 确定性"机型不支持"，后续重试语义（CONNECT_ATTEMPTS）也被绕开。
+            let obj = match unsafe { crate::win::next_instance(&enumerator, 500) } {
+                Ok(Some(obj)) => obj,
+                Ok(None) => break,
+                Err(e) => {
+                    log::warn!("WMI: MICommonInterface enumeration Next failed: {}", e);
+                    return Err(EcError::WmiConnect(err_fmt(
+                        "enumerate MICommonInterface instances",
+                        e,
+                    )));
+                }
             };
             // InstanceName 缺失的实例必须**跳过**而非默认成空串：历史实现
             // `unwrap_or_default()` 会留下 `InstanceName=""` 的伪实例，若它
@@ -436,10 +450,7 @@ impl WmiWorker {
             )
             .map_err(|e| {
                 let hr = e.code().0 as u32;
-                self.maybe_latch(
-                    Some(hr),
-                    EcError::WmiConnect(format!("获取类对象失败: {}", e)),
-                )
+                self.maybe_latch(Some(hr), EcError::WmiConnect(err_fmt("获取类对象失败", e)))
             })?;
         let class = match class {
             Some(c) => c,
@@ -455,7 +466,7 @@ impl WmiWorker {
                 let hr = e.code().0 as u32;
                 self.maybe_latch(
                     Some(hr),
-                    EcError::WmiConnect(format!("获取方法签名失败: {}", e)),
+                    EcError::WmiConnect(err_fmt("获取方法签名失败", e)),
                 )
             })?;
 
@@ -517,7 +528,7 @@ impl WmiWorker {
 
         let in_params = in_sig
             .SpawnInstance(0)
-            .map_err(|e| EcError::WmiConnect(format!("创建方法参数实例失败: {}", e)))?;
+            .map_err(|e| EcError::WmiConnect(err_fmt("创建方法参数实例失败", e)))?;
         // 注意：此处**尚不**包 ManuallyDrop。在 Put 成功之前的各失败分支
         // （SafeArray 创建/访问失败、Put 失败），对象从未交给提供程序，
         // 正常 Drop（Release）是安全且应当的（修订 1.47 审计：历史实现
@@ -698,7 +709,7 @@ impl WmiWorker {
             Ok(l) => l,
             Err(e) => {
                 VariantClear(&mut out_val).ok();
-                return Err(EcError::WmiConnect(format!("WMI: {}", e)));
+                return Err(EcError::WmiConnect(err_fmt("WMI", e)));
             }
         };
         if len < MIN_OUTPUT_LEN {
@@ -921,7 +932,7 @@ impl WmiBackend {
                 CoUninitialize();
             }
         })
-        .map_err(|e| EcError::WmiConnect(format!("spawn worker thread: {}", e)))?;
+        .map_err(|e| EcError::WmiConnect(err_fmt("spawn worker thread", e)))?;
         match await_handshake(&res_rx, HANDSHAKE_TIMEOUT) {
             Ok(()) => Ok(Self {
                 tx,

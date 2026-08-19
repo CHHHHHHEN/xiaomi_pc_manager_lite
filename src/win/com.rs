@@ -6,6 +6,7 @@
 //! 且 `ec` 与 `platform` 两层的共享依赖无法在依赖图中表达。收敛到 `win::com`
 //! 后，`ec` 与 `platform` 都依赖 `win`（单向、无环）。
 
+use crate::util::err_fmt;
 use windows::core::{BSTR, GUID, PCWSTR};
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoSetProxyBlanket, CoUninitialize, CLSCTX_INPROC_SERVER,
@@ -35,7 +36,7 @@ impl ComScope {
         unsafe {
             CoInitializeEx(None, COINIT_MULTITHREADED)
                 .ok()
-                .map_err(|e| format!("CoInitializeEx: {}", e))?;
+                .map_err(|e| err_fmt("CoInitializeEx", e))?;
         }
         Ok(Self)
     }
@@ -66,7 +67,7 @@ const RPC_C_AUTHZ_NONE: u32 = 0u32;
 pub fn connect_root_wmi() -> Result<IWbemServices, String> {
     let locator: IWbemLocator = unsafe {
         CoCreateInstance(&CLSID_WMI_LOCATOR, None, CLSCTX_INPROC_SERVER)
-            .map_err(|e| format!("CoCreateInstance: {}", e))?
+            .map_err(|e| err_fmt("CoCreateInstance", e))?
     };
 
     let services = unsafe {
@@ -80,7 +81,7 @@ pub fn connect_root_wmi() -> Result<IWbemServices, String> {
                 &BSTR::new(),
                 None::<&IWbemContext>,
             )
-            .map_err(|e| format!("ConnectServer root\\wmi: {}", e))?
+            .map_err(|e| err_fmt("ConnectServer root\\wmi", e))?
     };
 
     unsafe {
@@ -113,9 +114,9 @@ pub fn connect_root_wmi() -> Result<IWbemServices, String> {
 /// 且其生命周期必须覆盖本调用；调用期间不得被其它线程并发销毁。
 pub unsafe fn safe_array_bounds(sa: *const SAFEARRAY) -> Result<(i32, i32), String> {
     let lbound =
-        unsafe { SafeArrayGetLBound(sa, 1) }.map_err(|e| format!("SafeArrayGetLBound: {}", e))?;
+        unsafe { SafeArrayGetLBound(sa, 1) }.map_err(|e| err_fmt("SafeArrayGetLBound", e))?;
     let ubound =
-        unsafe { SafeArrayGetUBound(sa, 1) }.map_err(|e| format!("SafeArrayGetUBound: {}", e))?;
+        unsafe { SafeArrayGetUBound(sa, 1) }.map_err(|e| err_fmt("SafeArrayGetUBound", e))?;
     Ok((lbound, ubound))
 }
 

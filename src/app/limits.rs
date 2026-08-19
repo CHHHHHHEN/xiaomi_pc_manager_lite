@@ -35,6 +35,22 @@ pub fn coherent_charge_limit(enabled: bool, limit: u8) -> u8 {
     }
 }
 
+/// 充电上限**读回值**的非法判定：`0` 或 `> FULL_CHARGE_LIMIT` 为垃圾值
+/// （修订 1.50 收敛）。
+///
+/// 该谓词此前在 winring0.rs（`get_charge_limit`）、mock.rs（
+/// `validate_read_raw`）与 battery.rs（`apply_battery_state` 的读回闭包）
+/// 各手写一份 `raw == 0 || raw > FULL_CHARGE_LIMIT`——真实后端在各自校验，
+/// 领域层在纵深防御校验，三处语义必须一致（曾有一次"一侧漏掉 0"被修复）。
+/// 收敛到领域层后，任一地方改阈值/改规则都会同步三处。
+///
+/// 语义：`0` 不可能合法（GUI 滑块下限 40、WMI 预设下限 40、配置消毒把 0
+/// 归一为默认），`> 100` 是损坏的寄存器值（如 0xFF=255）；两者都不得冒充
+/// 有效状态展示/持久化。
+pub fn charge_limit_readback_is_invalid(raw: u8) -> bool {
+    raw == 0 || raw > FULL_CHARGE_LIMIT
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,5 +100,17 @@ mod tests {
     fn test_fallback_equals_default() {
         assert_eq!(FALLBACK_CARE_LIMIT, DEFAULT_CHARGE_LIMIT);
         assert_eq!(DEFAULT_CHARGE_LIMIT, 80);
+    }
+
+    /// 读回非法判定（修订 1.50 收敛到领域层）：0 与 >100 是垃圾值，其余合法。
+    #[test]
+    fn test_charge_limit_readback_is_invalid() {
+        assert!(charge_limit_readback_is_invalid(0), "0 is garbage");
+        assert!(charge_limit_readback_is_invalid(101), "101 > 100");
+        assert!(charge_limit_readback_is_invalid(u8::MAX), "255 is garbage");
+        assert!(!charge_limit_readback_is_invalid(1));
+        assert!(!charge_limit_readback_is_invalid(40));
+        assert!(!charge_limit_readback_is_invalid(80));
+        assert!(!charge_limit_readback_is_invalid(FULL_CHARGE_LIMIT));
     }
 }

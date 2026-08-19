@@ -20,9 +20,14 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
 
-/// 会话级命名互斥体（`Local\` 前缀，仅当前登录会话可见）。
+/// 会话级命名互斥体名：`Local\` 前缀（仅当前登录会话可见）+
+/// `util::APP_ID`（修订 1.50 与计划任务名/AppUserModelID/配置目录同源——
+/// 历史实现把 `"XiaomiPcManagerLite"` 手写在此处，任一处漂移会导致双实例
+/// 并存或互斥体互不识别）。
 /// 同用户的提权进程与非提权进程共享同一会话，可访问同一个互斥体。
-const INSTANCE_MUTEX_NAME: &str = "Local\\XiaomiPcManagerLite";
+fn instance_mutex_name() -> String {
+    format!("Local\\{}", crate::util::APP_ID)
+}
 
 /// 互斥体句柄持有者：进程存活期间持有，Drop 时关闭句柄。
 pub struct SingleInstanceGuard(HANDLE);
@@ -55,7 +60,7 @@ pub enum SingleInstance {
 /// - `WAIT_TIMEOUT`：互斥体被另一实例持有 → 判定"已有实例"；
 /// - 其它值：API 异常，按"无法确认"处理（不阻塞启动）。
 pub fn acquire() -> SingleInstance {
-    let name = crate::util::WideString::new(INSTANCE_MUTEX_NAME);
+    let name = crate::util::WideString::new(&instance_mutex_name());
     unsafe {
         let handle = match CreateMutexW(None, true, name.as_pcwstr()) {
             Ok(h) => h,

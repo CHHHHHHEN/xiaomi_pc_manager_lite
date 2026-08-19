@@ -1,3 +1,4 @@
+use crate::util::err_fmt;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -16,7 +17,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 pub fn create_message_window() -> Result<HWND, String> {
     let hinstance = HINSTANCE(
         unsafe { GetModuleHandleW(None) }
-            .map_err(|e| format!("GetModuleHandleW: {}", e))?
+            .map_err(|e| err_fmt("GetModuleHandleW", e))?
             .0,
     );
 
@@ -40,7 +41,7 @@ pub fn create_message_window() -> Result<HWND, String> {
             None,
         )
     }
-    .map_err(|e| format!("CreateWindowExW: {}", e))?;
+    .map_err(|e| err_fmt("CreateWindowExW", e))?;
 
     Ok(hwnd)
 }

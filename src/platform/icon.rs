@@ -7,6 +7,7 @@
 //! 供 `platform/window.rs` 之外的 `gui`（主窗口图标）与 `tray`（托盘图标）
 //! 直接引用。
 
+use crate::util::err_fmt;
 use std::sync::Mutex;
 
 use windows::Win32::Foundation::{LPARAM, WPARAM};
@@ -164,11 +165,11 @@ pub fn create_hicon_from_ico(ico: &[u8], preferred_size: u32) -> Result<HICON, S
         // dwVersion（Vista+ PNG 压缩帧版本号），不是大小，传原样即正确
         // （修订 1.47 误报澄清，勿按 C 语言签名臆改）。
         CreateIconFromResourceEx(block, true, 0x0003_0000, 0, 0, LR_DEFAULTCOLOR)
-            .map_err(|e| format!("CreateIconFromResourceEx: {}", e))
+            .map_err(|e| err_fmt("CreateIconFromResourceEx", e))
     }
 }
 
-/// 设置主窗口图标（任务栏 / 标题栏 / Alt-Tab）。
+/// 设置主窗口图标（任务栏 / 标题栏 / Alt-Tab），返回是否**定位到了主窗口**。
 ///
 /// eframe 的 `with_icon` 对 512×512 PNG 的缩小渲染到任务栏效果差
 /// （糊成纯色块）。这里从**多尺寸 ICO** 按目标尺寸各取最清晰单帧构建
@@ -176,19 +177,23 @@ pub fn create_hicon_from_ico(ico: &[u8], preferred_size: u32) -> Result<HICON, S
 /// （任务栏/Alt-Tab ~32 逻辑 px）的物理尺寸按系统 DPI 缩放
 /// （`scaled_px_at_dpi`），再经 `WM_SETICON` 设置——高 DPI 下系统把
 /// 16/32 逻辑 px 图标放大到物理像素（200% 时为 32/64px），取不小于物理
-/// 尺寸的帧避免小位图放大发糊（与托盘图标的 DPI 修复同源，L1 回归）。
-/// HICON 进程生命周期内缓存（Mutex 包装以满足 Sync），由系统使用、
-/// 进程退出时释放。
-pub fn set_main_window_icon() {
+/// 尺寸的帧避免小位图放大模糊（与托盘图标的 DPI 修复同源，L1 回归）。
+///
+/// 返回值（修订 1.50）：`true` = 定位到主窗口并完成设置（调用方停止重试）；
+/// `false` = 主窗口尚未创建（如 `--autostart` 首帧），调用方应重试——
+/// 历史实现以"图标纹理已加载"为闸门只调用一次，窗口未就绪时图标整个
+/// 会话缺失（修订 1.50 修复）。
+pub fn set_main_window_icon() -> bool {
     static CACHED_SMALL: Mutex<Option<IconHandle>> = Mutex::new(None);
     static CACHED_BIG: Mutex<Option<IconHandle>> = Mutex::new(None);
     let Some(hwnd) = crate::platform::window::find_main_window() else {
-        return;
+        // 窗口尚未创建：返回 false，由调用方（GUI 每帧）重试。
+        return false;
     };
     let ico_bytes = build_multi_size_ico();
     if ico_bytes.is_empty() {
         log::warn!("set_main_window_icon: multi-size ICO build failed");
-        return;
+        return true;
     }
     // 按目标尺寸从缓存取/构建 HICON（缓存命中则跳过构建；进程生命周期内
     // 每个尺寸只构建一次）。返回 null 表示构建失败（记录日志后忽略）。
@@ -231,6 +236,7 @@ pub fn set_main_window_icon() {
             );
         }
     }
+    true
 }
 
 #[cfg(test)]

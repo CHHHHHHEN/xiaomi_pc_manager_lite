@@ -71,12 +71,12 @@ impl ConfigStore {
         let dir = std::env::var_os("XIAOMI_PC_MANAGER_CONFIG_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| match dirs::config_dir() {
-                Some(dir) => dir.join("XiaomiPcManagerLite"),
+                Some(dir) => dir.join(crate::util::APP_ID),
                 None => {
                     log::warn!(
                         "config_dir() unavailable; falling back to current directory for config"
                     );
-                    PathBuf::from(".").join("XiaomiPcManagerLite")
+                    PathBuf::from(".").join(crate::util::APP_ID)
                 }
             });
         Self { dir }

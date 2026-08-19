@@ -74,6 +74,9 @@ pub struct XiaomiApp {
     autostart_start: std::time::Instant,
     /// 标题栏应用图标纹理（首帧由 icon.png 创建）。
     pub(crate) icon_tex: Option<egui::TextureHandle>,
+    /// 主窗口系统图标（WM_SETICON）是否已成功设置：`--autostart` 首帧窗口
+    /// 可能尚未创建，设置失败时每帧重试（修订 1.50，见 update()）。
+    window_icon_set: bool,
     /// 开机自启动操作的**串行** worker 发送端（首次 set_autostart 惰性创建，
     /// 见 commands.rs 的说明）：所有请求按到达顺序执行、结果按相同顺序回传。
     /// 挂在本实例上而非进程级 static——发送端随实例 drop 而关闭，worker 线程
@@ -186,6 +189,7 @@ impl XiaomiApp {
             autostart_wait_frames: 0,
             autostart_start: std::time::Instant::now(),
             icon_tex: None,
+            window_icon_set: false,
             autostart_worker: None,
             autostart_in_flight: 0,
             fn_bindings,
@@ -543,8 +547,13 @@ impl eframe::App for XiaomiApp {
         // 已由 with_icon 设置；标题栏图标补齐自绘标题栏的显示）。
         // 任务栏/窗口图标用多尺寸 ICO 覆盖设置（with_icon 对大 PNG 的
         // 任务栏缩小渲染效果差，见 platform::icon::set_main_window_icon）。
+        // **窗口图标重试**（修订 1.50）：`set_main_window_icon` 需要在主窗口
+        // 创建后调用，`--autostart` 首帧窗口可能尚未就绪——以"已成功设置"
+        // 为闸门而非"纹理已加载"，未就绪时每帧重试直到窗口出现。
+        if !self.window_icon_set && crate::platform::icon::set_main_window_icon() {
+            self.window_icon_set = true;
+        }
         if self.icon_tex.is_none() {
-            crate::platform::icon::set_main_window_icon();
             if let Some(icon) = view::load_icon_data() {
                 let color_image = egui::ColorImage::from_rgba_unmultiplied(
                     [icon.width as usize, icon.height as usize],

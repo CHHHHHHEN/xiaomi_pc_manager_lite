@@ -9,6 +9,15 @@
 /// 统一收敛到此处后，任一处改名都会同时作用于全部展示/查找路径。
 pub const APP_NAME: &str = "Xiaomi PC Manager Lite";
 
+/// 面向机器的产品标识符（无空格），全项目唯一事实来源（修订 1.50 收敛）。
+///
+/// 历史实现把 `"XiaomiPcManagerLite"` 字面量散落五处：AppUserModelID
+/// （launch.rs）、计划任务名 `TASK_NAME`（autostart.rs）、配置目录名
+/// （config.rs 两处）、日志目录名（`log_file_path`）、单实例互斥体名
+/// （single_instance.rs）。任一处漂移都会静默破坏对应功能（AUMID 漂移 →
+/// 托盘气泡被丢弃；互斥体名漂移 → 双实例并存），统一收敛到此处。
+pub const APP_ID: &str = "XiaomiPcManagerLite";
+
 /// 面向用户展示的版本号。
 ///
 /// Cargo 的 `CARGO_PKG_VERSION` 是 semver 三段号，无法表达四段的
@@ -33,9 +42,19 @@ pub const MIN_WINDOW_SIZE: (f32, f32) = (400.0, 500.0);
 pub fn log_file_path() -> std::path::PathBuf {
     std::env::var_os("XIAOMI_LOG_FILE")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::temp_dir()
-                .join("XiaomiPcManagerLite")
-                .join("app.log")
-        })
+        .unwrap_or_else(|| std::env::temp_dir().join(APP_ID).join("app.log"))
+}
+
+/// 可执行文件所在目录（`current_exe()` 的父目录，绝对路径）。
+///
+/// 修订 1.50 收敛：此前 `ec::embed`（两处）、`ec::winring0` 各自手写
+/// `current_exe() + parent()`，父目录缺失的错误文案还不一致
+/// （"no parent directory" vs "可执行文件路径没有父目录"）。统一到此处后，
+/// 错误形状与用户可见文案保持一致。
+pub fn exe_dir() -> Result<std::path::PathBuf, String> {
+    std::env::current_exe()
+        .map_err(|e| crate::util::err_fmt("current_exe", e))?
+        .parent()
+        .map(|p| p.to_path_buf())
+        .ok_or_else(|| "可执行文件路径没有父目录".to_string())
 }

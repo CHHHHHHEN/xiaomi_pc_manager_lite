@@ -29,6 +29,7 @@ use crate::app::fnkey::{
     SharedBindings,
 };
 use crate::app::sink::{CommandSink, CommandSinkExt};
+use crate::util::err_fmt;
 
 /// `RunCommand` 防抖窗口：同一命令在此窗口内不重复启动（毫秒）。
 const RUN_COMMAND_DEBOUNCE_MS: u64 = 1000;
@@ -141,8 +142,7 @@ fn run_watcher_once(
 ) -> Result<(), WatcherError> {
     // COM 公寓初始化/退出的配对统一交给 win::com::ComScope 的 RAII 作用域
     //（Drop 时自动 CoUninitialize）。
-    crate::win::ComScope::init()
-        .map_err(|e| WatcherError::Reconnect(format!("COM init: {}", e)))?;
+    crate::win::ComScope::init().map_err(|e| WatcherError::Reconnect(err_fmt("COM init", e)))?;
     run_watcher_loop(sink, bindings, capture)
 }
 

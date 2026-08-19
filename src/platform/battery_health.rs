@@ -25,6 +25,7 @@ use windows::Win32::System::Wmi::{IWbemClassObject, IWbemServices, WBEM_E_INVALI
 
 use crate::app::command::UiCommand;
 use crate::app::sink::CommandSink;
+use crate::util::err_fmt;
 
 /// `BatteryStaticData.DesignedCapacity`：电芯出厂设计容量（mWh）。
 const CLASS_STATIC: &str = "BatteryStaticData";
@@ -173,20 +174,34 @@ pub fn spawn(sink: Arc<dyn CommandSink>) {
 /// 声称"正常返回"但从未真正发生，见 `send_or_finish`）。
 fn run(sink: &dyn CommandSink) -> Result<(), String> {
     let mut failures: u32 = 0;
+    // 本轮连接是否至少成功完成过一次轮询（修订 1.50 修复）：退避计数
+    // `failures` 只增不减，一次瞬态连击进入慢速退避后**永久**停留——之后即使
+    // 已健康运行数小时，任何一次偶然失败仍直接走 30s 慢退避。记录"本轮
+    // 发生过成功轮询"，失败时先归零再计，恢复后重新按 快速→慢速 阶梯走。
+    // 与 `poll_connected` 内 `eta_failures` 的"成功清零"语义同源。
+    let mut made_progress = false;
     loop {
         // 每一轮连接生命周期独立 catch_unwind：单个 COM/FFI panic 不能杀死
         // 整个监测线程——捕获后按"连接失败"退避重连（见 spawn 注释）。
-        let round = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| poll_loop(sink)));
+        let round = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            poll_loop(sink, &mut made_progress)
+        }));
         let result = match round {
             Ok(r) => r,
             Err(panic) => {
                 let payload = crate::util::panic_message(&*panic);
-                Err(format!("panic: {}", payload))
+                Err(err_fmt("panic", payload))
             }
         };
         match result {
             Ok(()) => return Ok(()),
             Err(e) => {
+                // 本轮连接成功轮询过（恢复后的首次失败）：归零再计，回到
+                // 快速退避档；连续失败则累积（慢速档）。
+                if made_progress {
+                    failures = 0;
+                }
+                made_progress = false;
                 failures += 1;
                 // 退避节奏（与 Fn watcher 的 NoEventClasses 类似）：连续失败
                 // 前期快速重试（WMI 服务刚启动）、随后拉开间隔防刷屏。失败
@@ -216,9 +231,9 @@ fn run(sink: &dyn CommandSink) -> Result<(), String> {
 /// 时被跳过——每轮 panic 泄漏一次公寓引用计数，且外层 catch_unwind 会继续
 /// 重连。RAII 保证 panic 展开也执行 CoUninitialize（与 autostart 的 ComScope
 /// 同源收敛于 `win::com`）。
-fn poll_loop(sink: &dyn CommandSink) -> Result<(), String> {
+fn poll_loop(sink: &dyn CommandSink, made_progress: &mut bool) -> Result<(), String> {
     let _com = crate::win::ComScope::init()?;
-    poll_connected(sink)
+    poll_connected(sink, made_progress)
 }
 
 /// 向 GUI 发送命令；通道关闭（进程退出/界面已销毁）时返回 `false` 通知外层
@@ -239,7 +254,7 @@ fn send_or_finish(sink: &dyn CommandSink, cmd: UiCommand) -> bool {
     delivered
 }
 
-fn poll_connected(sink: &dyn CommandSink) -> Result<(), String> {
+fn poll_connected(sink: &dyn CommandSink, made_progress: &mut bool) -> Result<(), String> {
     let services = crate::win::connect_root_wmi()?;
     let mut last_health_sent: Option<(u32, u32)> = None;
     let mut last_eta_sent: Option<(u32, u32, u32, u32, bool, bool)> = None;
@@ -253,6 +268,8 @@ fn poll_connected(sink: &dyn CommandSink) -> Result<(), String> {
     loop {
         match read_health(&services) {
             Ok(Some(h)) => {
+                // 本轮连接成功轮询（供外层退避计数归零，见 run 的注释）。
+                *made_progress = true;
                 no_data_warned = false;
                 let key = (h.designed_mwh, h.full_mwh);
                 if last_health_sent != Some(key) {
@@ -340,6 +357,7 @@ fn poll_connected(sink: &dyn CommandSink) -> Result<(), String> {
             Ok(None) => {
                 // 无电池数据：不当作错误反复刷屏，低频探测（有电池的机器上
                 // 恢复后下一轮即读到数据）。无电池场景首次告警一次。
+                *made_progress = true;
                 if !no_data_warned {
                     no_data_warned = true;
                     log::warn!(
@@ -627,6 +645,6 @@ mod tests {
         let s = read_battery_status(&services)?.ok_or("no battery status data")?;
         assert!(s.remaining_mwh > 0, "remaining capacity must be positive");
         tx.send(Ok((h.designed_mwh, h.full_mwh)))
-            .map_err(|e| format!("send: {}", e))
+            .map_err(|e| err_fmt("send", e))
     }
 }

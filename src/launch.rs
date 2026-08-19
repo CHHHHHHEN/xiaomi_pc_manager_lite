@@ -7,6 +7,7 @@
 use crate::app;
 use crate::app::config::ConfigStore;
 use crate::gui;
+use crate::util::err_fmt;
 
 /// 统一的 panic hook：无论构建类型都先把 panic 信息写入应用日志文件。
 /// release 构建无控制台（`windows_subsystem = "windows"`），默认 panic 输出
@@ -94,11 +95,13 @@ fn rotate_log_if_large(path: &std::path::Path) {
 /// 与托盘图标/版本信息保持一致。失败不影响功能（仅通知展示可能受限），
 /// 记录 debug 日志即可。
 fn register_app_user_model_id() {
-    let id = crate::util::WideString::new("XiaomiPcManagerLite");
+    // ID 固定为产品名（machine-facing APP_ID，无空格），与托盘图标/版本
+    // 信息保持一致；与单实例互斥体/计划任务名/配置目录同源（修订 1.50）。
+    let id = crate::util::WideString::new(crate::util::APP_ID);
     match unsafe {
         windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID(id.as_pcwstr())
     } {
-        Ok(()) => log::debug!("AppUserModelID registered: XiaomiPcManagerLite"),
+        Ok(()) => log::debug!("AppUserModelID registered: {}", crate::util::APP_ID),
         Err(e) => log::warn!("SetCurrentProcessExplicitAppUserModelID failed: {}", e),
     }
 }
@@ -256,7 +259,7 @@ pub fn run() {
             .expect("EC backend init thread panicked before catch_unwind"),
         Err(e) => {
             log::error!("failed to spawn EC backend init thread: {}", e);
-            Err(format!("EC 后端初始化线程创建失败: {}", e))
+            Err(err_fmt("EC 后端初始化线程创建失败", e))
         }
     };
     let app::startup::StartupResult {

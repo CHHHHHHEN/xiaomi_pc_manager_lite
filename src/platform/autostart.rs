@@ -1,3 +1,4 @@
+use crate::util::err_fmt;
 use windows::core::{Interface, BSTR};
 use windows::Win32::Foundation::{VARIANT_FALSE, VARIANT_TRUE};
 use windows::Win32::System::TaskScheduler::*;
@@ -16,7 +17,9 @@ use windows::Win32::System::Variant::VARIANT;
 ///   终止任务）与 `ExecutionTimeLimit=PT72H`（运行满 72h 强制结束）都会杀掉
 ///   常驻托盘的应用进程，必须以显式设置覆盖（见 F-AUTO-11）
 /// - 执行命令：`<exe 绝对路径> --autostart`（启动后驻留托盘）
-const TASK_NAME: &str = "XiaomiPcManagerLite";
+// 任务名与其它机器标识（AppUserModelID/配置目录/单实例互斥体）同源，
+// 统一收敛到 util::APP_ID（修订 1.50）。
+const TASK_NAME: &str = crate::util::APP_ID;
 const TASK_DESC: &str = "Xiaomi PC Manager Lite - 开机自启动";
 
 /// 执行时长不限：计划任务默认 `ExecutionTimeLimit=PT72H`，任务运行超过 72 小时
@@ -51,7 +54,7 @@ fn task_service() -> Result<ITaskService, String> {
             None,
             windows::Win32::System::Com::CLSCTX_INPROC_SERVER,
         )
-        .map_err(|e| format!("CoCreateInstance ITaskService: {}", e))?
+        .map_err(|e| err_fmt("CoCreateInstance ITaskService", e))?
     };
     unsafe {
         service
@@ -61,7 +64,7 @@ fn task_service() -> Result<ITaskService, String> {
                 &VARIANT::default(),
                 &VARIANT::default(),
             )
-            .map_err(|e| format!("ITaskService::Connect: {}", e))?
+            .map_err(|e| err_fmt("ITaskService::Connect", e))?
     };
     Ok(service)
 }
@@ -70,7 +73,7 @@ fn task_folder(service: &ITaskService) -> Result<ITaskFolder, String> {
     unsafe {
         service
             .GetFolder(&BSTR::from("\\"))
-            .map_err(|e| format!("ITaskService::GetFolder: {}", e))
+            .map_err(|e| err_fmt("ITaskService::GetFolder", e))
     }
 }
 
@@ -89,7 +92,7 @@ fn task_state() -> Result<Option<IRegisteredTask>, String> {
     match unsafe { folder.GetTask(&BSTR::from(TASK_NAME)) } {
         Ok(task) => Ok(Some(task)),
         Err(e) if e.code().0 == HRESULT_TASK_NOT_FOUND => Ok(None),
-        Err(e) => Err(format!("GetTask: {}", e)),
+        Err(e) => Err(err_fmt("GetTask", e)),
     }
 }
 
@@ -169,16 +172,16 @@ fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
 fn task_matches(task: &IRegisteredTask) -> Result<bool, String> {
     let def = unsafe {
         task.Definition()
-            .map_err(|e| format!("ITaskDefinition: {}", e))?
+            .map_err(|e| err_fmt("ITaskDefinition", e))?
     };
 
     // 运行级别必须是最高权限。
-    let principal = unsafe { def.Principal().map_err(|e| format!("Principal: {}", e))? };
+    let principal = unsafe { def.Principal().map_err(|e| err_fmt("Principal", e))? };
     let mut runlevel = TASK_RUNLEVEL_LUA;
     unsafe {
         principal
             .RunLevel(&mut runlevel)
-            .map_err(|e| format!("RunLevel: {}", e))?;
+            .map_err(|e| err_fmt("RunLevel", e))?;
     }
     if runlevel != TASK_RUNLEVEL_HIGHEST {
         log::warn!("Autostart task run level is not highest (LUA); needs rebase");
@@ -197,13 +200,13 @@ fn task_matches(task: &IRegisteredTask) -> Result<bool, String> {
     let mut xml = BSTR::new();
     unsafe {
         def.XmlText(&mut xml)
-            .map_err(|e| format!("ITaskDefinition::XmlText: {}", e))?;
+            .map_err(|e| err_fmt("ITaskDefinition::XmlText", e))?;
     }
     let xml_text = bstr_to_string(&xml);
     let action_command = extract_xml_tag(&xml_text, "Command");
     let action_args = extract_xml_tag(&xml_text, "Arguments");
     let exe = std::env::current_exe()
-        .map_err(|e| format!("current_exe: {}", e))?
+        .map_err(|e| err_fmt("current_exe", e))?
         .to_string_lossy()
         .to_string();
     let path_matches = match &action_command {
@@ -226,7 +229,7 @@ fn task_matches(task: &IRegisteredTask) -> Result<bool, String> {
     // 否则升级后拔电/常驻超时仍会被任务计划服务终止。
     let settings = unsafe {
         def.Settings()
-            .map_err(|e| format!("ITaskDefinition::Settings: {}", e))?
+            .map_err(|e| err_fmt("ITaskDefinition::Settings", e))?
     };
     let mut stop_on_battery = VARIANT_TRUE;
     let mut disallow_on_battery = VARIANT_TRUE;
@@ -234,13 +237,13 @@ fn task_matches(task: &IRegisteredTask) -> Result<bool, String> {
     unsafe {
         settings
             .StopIfGoingOnBatteries(&mut stop_on_battery)
-            .map_err(|e| format!("StopIfGoingOnBatteries: {}", e))?;
+            .map_err(|e| err_fmt("StopIfGoingOnBatteries", e))?;
         settings
             .DisallowStartIfOnBatteries(&mut disallow_on_battery)
-            .map_err(|e| format!("DisallowStartIfOnBatteries: {}", e))?;
+            .map_err(|e| err_fmt("DisallowStartIfOnBatteries", e))?;
         settings
             .ExecutionTimeLimit(&mut exec_time)
-            .map_err(|e| format!("ExecutionTimeLimit: {}", e))?;
+            .map_err(|e| err_fmt("ExecutionTimeLimit", e))?;
     }
     let stop_ok = stop_on_battery == VARIANT_FALSE;
     let disallow_ok = disallow_on_battery == VARIANT_FALSE;
@@ -262,7 +265,7 @@ fn task_matches(task: &IRegisteredTask) -> Result<bool, String> {
 /// 登录触发 + 当前用户交互令牌，普通权限即可注册（无需管理员）。
 pub fn enable() -> Result<(), String> {
     let _com = ComScope::init()?;
-    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {}", e))?;
+    let exe = std::env::current_exe().map_err(|e| err_fmt("current_exe", e))?;
     // 路径经 OsStr → UTF-16 直构（不经 to_string_lossy）：注册进计划任务的
     // 必须是真实 Windows 路径——lossy 会把非 UTF-8 的 UTF-16 路径替换成
     // U+FFFD，任务启动时执行错误路径而静默失败（修订 1.46 安全加固，与
@@ -273,18 +276,17 @@ pub fn enable() -> Result<(), String> {
     let service = task_service()?;
     let folder = task_folder(&service)?;
 
-    let def: ITaskDefinition =
-        unsafe { service.NewTask(0).map_err(|e| format!("NewTask: {}", e))? };
+    let def: ITaskDefinition = unsafe { service.NewTask(0).map_err(|e| err_fmt("NewTask", e))? };
 
     // 注册信息：名称 + 描述
     unsafe {
         let reg = def
             .RegistrationInfo()
-            .map_err(|e| format!("RegistrationInfo: {}", e))?;
+            .map_err(|e| err_fmt("RegistrationInfo", e))?;
         reg.SetDescription(&BSTR::from(TASK_DESC))
-            .map_err(|e| format!("SetDescription: {}", e))?;
+            .map_err(|e| err_fmt("SetDescription", e))?;
         reg.SetAuthor(&BSTR::from(crate::util::APP_NAME))
-            .map_err(|e| format!("SetAuthor: {}", e))?;
+            .map_err(|e| err_fmt("SetAuthor", e))?;
     }
 
     // 主体：运行级别设为**最高权限**（TASK_RUNLEVEL_HIGHEST）。
@@ -294,39 +296,38 @@ pub fn enable() -> Result<(), String> {
     // 应用启动时 `elevate_self()` 会每次登录弹出 UAC，违背自启动"驻留托盘
     // 不打扰用户"的设计。
     unsafe {
-        let principal = def.Principal().map_err(|e| format!("Principal: {}", e))?;
+        let principal = def.Principal().map_err(|e| err_fmt("Principal", e))?;
         principal
             .SetRunLevel(TASK_RUNLEVEL_HIGHEST)
-            .map_err(|e| format!("SetRunLevel: {}", e))?;
+            .map_err(|e| err_fmt("SetRunLevel", e))?;
     }
 
     // 触发器：登录时（TASK_TRIGGER_LOGON）
     unsafe {
-        let triggers = def.Triggers().map_err(|e| format!("Triggers: {}", e))?;
+        let triggers = def.Triggers().map_err(|e| err_fmt("Triggers", e))?;
         let trigger: ITrigger = triggers
             .Create(TASK_TRIGGER_LOGON)
-            .map_err(|e| format!("Triggers::Create: {}", e))?;
+            .map_err(|e| err_fmt("Triggers::Create", e))?;
         let logon: ILogonTrigger = trigger
             .cast()
-            .map_err(|e| format!("trigger to ILogonTrigger: {}", e))?;
+            .map_err(|e| err_fmt("trigger to ILogonTrigger", e))?;
         logon
             .SetUserId(&BSTR::new())
-            .map_err(|e| format!("SetUserId: {}", e))?;
+            .map_err(|e| err_fmt("SetUserId", e))?;
     }
 
     // 动作：执行当前 exe，携带 --autostart
     unsafe {
-        let actions = def.Actions().map_err(|e| format!("Actions: {}", e))?;
+        let actions = def.Actions().map_err(|e| err_fmt("Actions", e))?;
         let action: IAction = actions
             .Create(TASK_ACTION_EXEC)
-            .map_err(|e| format!("Actions::Create: {}", e))?;
+            .map_err(|e| err_fmt("Actions::Create", e))?;
         let exec: IExecAction = action
             .cast()
-            .map_err(|e| format!("action to IExecAction: {}", e))?;
-        exec.SetPath(&exe_bstr)
-            .map_err(|e| format!("SetPath: {}", e))?;
+            .map_err(|e| err_fmt("action to IExecAction", e))?;
+        exec.SetPath(&exe_bstr).map_err(|e| err_fmt("SetPath", e))?;
         exec.SetArguments(&BSTR::from("--autostart"))
-            .map_err(|e| format!("SetArguments: {}", e))?;
+            .map_err(|e| err_fmt("SetArguments", e))?;
     }
 
     // 任务设置：电池供电时**不得**停止任务（默认 `StopIfGoingOnBatteries`
@@ -335,16 +336,16 @@ pub fn enable() -> Result<(), String> {
     // 时长设为无限（默认 `ExecutionTimeLimit=PT72H`，常驻应用运行满 72 小时
     // 会被强制终止）。
     unsafe {
-        let settings = def.Settings().map_err(|e| format!("Settings: {}", e))?;
+        let settings = def.Settings().map_err(|e| err_fmt("Settings", e))?;
         settings
             .SetStopIfGoingOnBatteries(VARIANT_FALSE)
-            .map_err(|e| format!("SetStopIfGoingOnBatteries: {}", e))?;
+            .map_err(|e| err_fmt("SetStopIfGoingOnBatteries", e))?;
         settings
             .SetDisallowStartIfOnBatteries(VARIANT_FALSE)
-            .map_err(|e| format!("SetDisallowStartIfOnBatteries: {}", e))?;
+            .map_err(|e| err_fmt("SetDisallowStartIfOnBatteries", e))?;
         settings
             .SetExecutionTimeLimit(&BSTR::from(TASK_EXEC_TIME_LIMIT_DISABLED))
-            .map_err(|e| format!("SetExecutionTimeLimit: {}", e))?;
+            .map_err(|e| err_fmt("SetExecutionTimeLimit", e))?;
     }
 
     // 注册任务：创建或覆盖；以当前用户交互令牌运行（普通权限）
@@ -359,7 +360,7 @@ pub fn enable() -> Result<(), String> {
                 TASK_LOGON_INTERACTIVE_TOKEN,
                 &VARIANT::default(),
             )
-            .map_err(|e| format!("RegisterTaskDefinition: {}", e))?;
+            .map_err(|e| err_fmt("RegisterTaskDefinition", e))?;
     }
     log::info!(
         "Autostart task '{}' registered ({} --autostart)",
@@ -390,7 +391,7 @@ pub fn disable() -> Result<(), String> {
             );
             Ok(())
         }
-        Err(e) => Err(format!("DeleteTask: {}", e)),
+        Err(e) => Err(err_fmt("DeleteTask", e)),
     }
 }
 

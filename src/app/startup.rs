@@ -9,6 +9,7 @@ use crate::app::battery::care_enabled_from_limit;
 use crate::app::config::{AppConfig, BackendPreference, ConfigStore};
 use crate::app::ec::{EcBackend, EcBackendFactory};
 use crate::app::power::{PowerSource, PowerStatus};
+use crate::util::err_fmt;
 
 /// `init_backend` 的完整结果：后端、启动同步后的配置、初始化错误、实际生效偏好。
 pub struct StartupResult {
@@ -98,7 +99,7 @@ pub fn init_backend(
         // F-START-04: 自动应用失败的错误除了记录日志，还要在 GUI 中展示。
         let apply_err = apply_errors(&outcome);
         if !apply_err.is_empty() {
-            let apply_err = format!("启动应用设置失败: {}", apply_err);
+            let apply_err = err_fmt("启动应用设置失败", apply_err);
             init_error = Some(match init_error.take() {
                 Some(e) => format!("{}; {}", e, apply_err),
                 None => apply_err,

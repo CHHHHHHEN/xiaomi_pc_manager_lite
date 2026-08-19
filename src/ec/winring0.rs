@@ -4,6 +4,7 @@ use super::addr as ec_addr;
 use super::backend::EcBackend;
 use super::embed::{arch_file_names, atomic_write, exe_dir_dll_is_embedded, extract_winring0};
 use crate::app::ec::EcError;
+use crate::util::err_fmt;
 use libloading::Library;
 
 use windows::core::PCWSTR;
@@ -27,6 +28,13 @@ const EC_CMD_WRITE: u8 = 0x81;
 /// 历史实现把 `"WinRing0_1_2_0"` 字面量散落三处（cleanup_service 内部），
 /// 驱动改名后清理与加载会对不上——统一收敛到此处（修订 1.47 清理）。
 const WINRING0_SERVICE_NAME: &str = "WinRing0_1_2_0";
+
+/// `ERROR_SERVICE_NOT_ACTIVE`（1062）：服务当前未在运行。cleanup_service
+/// 用它与 ControlService(STOP) 的失败码区分"服务本就没在运行（正常）"与
+/// "停止失败（异常，需告警）"（修订 1.50 可观测性）。windows crate 的
+/// `Win32::System::Services` 特性未导出该常量，按 autostart.rs 的
+/// HRESULT_TASK_NOT_FOUND 同款约定本地定义。
+const ERROR_SERVICE_NOT_ACTIVE: u32 = 1062;
 
 /// 轮询 EC 命令/数据端口直到满足 `(port & mask) == expected`，或超时。
 ///
@@ -111,9 +119,20 @@ fn retry_transient<T>(
 /// cleanup_service 的语义是清理**跨进程残留**的陈旧驱动服务（上次运行崩溃/
 /// 未正常卸载遗留）。当本进程已有一个存活的后端在用它时，删除该服务会同时
 /// 拆掉正在使用的驱动：随后的 InitializeOls 一旦失败（Defender 锁文件、
-/// 服务清理时序等已知瞬态），现有后端立刻失效、所有端口读写报错，直到重启。
-/// 因此仅在无存活实例时执行清理。
+/// 服务清理时序等已知瞬态），所有端口读写立刻报错，直到重启。因此仅在无
+/// 存活实例时执行清理。
 static WINRING0_INSTANCES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// 串行化"计数检查 → cleanup_service → InitializeOls → 计数递增"整段序列
+/// （修订 1.50 加固）。
+///
+/// 两个并发创建 WinRing0 后端（`try_load`）的线程可能都读到
+/// `WINRING0_INSTANCES == 0`：后到的会执行 `cleanup_service`，把先到者刚
+/// 加载的**同名驱动服务** Stop/Delete——先到后端的驱动被拆掉，端口读写
+/// 全部报错、且按注释只能重启恢复。原子计数单独无法杜绝（检查与递增是两个
+/// 原子操作，中间存在窗口）。锁住整段"检查 → 清理 → 加载 → 递增"后，同一
+/// 进程内该序列严格互斥，第二个并发创建只会看到计数已递增、跳过清理。
+static LOAD_SERIALIZE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub struct WinRing0Backend {
     rp: ReadPort,
@@ -141,6 +160,11 @@ fn dll_name() -> &'static str {
 }
 
 fn try_load(dll_path: &std::path::Path) -> Result<(Library, ReadPort, WritePort), EcError> {
+    // 整段"计数检查 → 清理 → InitializeOls → 计数递增"互斥（修订 1.50）：
+    // 见 `LOAD_SERIALIZE` 的注释——两个并发加载若都读到计数 0，后到者会拆掉
+    // 先到者刚加载的驱动服务。锁在函数入口取得、所有返回路径随 Drop 释放。
+    let _load_guard = LOAD_SERIALIZE.lock().unwrap_or_else(|p| p.into_inner());
+
     // libloading 的 Library::new 接受 AsRef<OsStr>：直接传 Path，不经
     // to_string_lossy——Windows 路径可能含非 UTF-8 的 UTF-16 序列，lossy
     // 会把它替换成 U+FFFD 导致找不到文件（修订 1.46 安全加固，与
@@ -249,8 +273,28 @@ fn cleanup_service() {
         let id = crate::util::WideString::new(WINRING0_SERVICE_NAME);
         if let Ok(svc) = OpenServiceW(scm, id.as_pcwstr(), SERVICE_ALL_ACCESS) {
             log::info!("WinRing0: removing stale service {}", WINRING0_SERVICE_NAME);
-            let _ = ControlService(svc, SERVICE_CONTROL_STOP, std::ptr::null_mut());
-            let _ = DeleteService(svc);
+            // Stop 失败大多因为服务本就不在运行（ERROR_SERVICE_NOT_ACTIVE），
+            // 属正常清理路径；其它失败（服务忙/被占用，如另一进程正在用同一
+            // 驱动）时仍尝试删除——DeleteService 对运行中服务会失败并返回
+            // ERROR_SERVICE_MARKED_FOR_DELETE 语义，记录告警让"驱动没卸载掉"
+            // 类问题可见，而不是静默吞掉（修订 1.50 可观测性）。
+            if let Err(e) = ControlService(svc, SERVICE_CONTROL_STOP, std::ptr::null_mut()) {
+                let code = e.code().0 as u32;
+                if code != ERROR_SERVICE_NOT_ACTIVE {
+                    log::warn!(
+                        "WinRing0: ControlService(STOP) failed: {} (code={:#x}); attempting delete anyway",
+                        e,
+                        code
+                    );
+                }
+            }
+            if let Err(e) = DeleteService(svc) {
+                log::warn!(
+                    "WinRing0: DeleteService failed: {} (code={:#x}); service may still exist",
+                    e,
+                    e.code().0 as u32
+                );
+            }
             let _ = CloseServiceHandle(svc);
             // 最多等待 3 秒：服务从 SCM 数据库中消失即认为清理完成。
             let mut gone = false;
@@ -345,11 +389,8 @@ impl WinRing0Backend {
         // 加载——攻击者只需在启动目录放一个恶意的 WinRing0x64.dll 即可提权。
         // 因此全部改为**绝对路径**加载：优先 EXE 同级目录，否则提取嵌入式
         // 副本到同一目录再加载。
-        let exe_dir = std::env::current_exe()
-            .map_err(|e| EcError::DllLoad(format!("无法获取当前可执行文件路径: {}", e)))?
-            .parent()
-            .ok_or_else(|| EcError::DllLoad("可执行文件路径没有父目录".into()))?
-            .to_path_buf();
+        let exe_dir = crate::util::exe_dir()
+            .map_err(|e| EcError::DllLoad(err_fmt("无法获取当前可执行文件路径", e)))?;
 
         // 兼容性提示：历史版本支持用户把自定义 DLL 放到当前工作目录。
         // 出于安全考虑已不再加载该路径，检测到存在时给出明确日志以免
@@ -491,7 +532,7 @@ impl EcBackend for WinRing0Backend {
         // 消毒也会把 0 归一化为 80。因此非法值直接返回错误，由调用方决定
         // 处理（刷新展示错误、写后回读走"保留写入值"的兜底），绝不冒充有效
         // 的 100% 状态。
-        if raw == 0 || raw > crate::app::limits::FULL_CHARGE_LIMIT {
+        if crate::app::limits::charge_limit_readback_is_invalid(raw) {
             return Err(EcError::InvalidData(format!(
                 "充电上限寄存器值 0x{:02x} 非法",
                 raw

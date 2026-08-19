@@ -80,9 +80,10 @@ pub fn power_snapshot() -> PowerSnapshot {
         warn_unknown_once();
     }
     // MSDN BatteryLifePercent：0-100 有效，255=未知/未装。255 返回 None，
-    // 由调用方显示"未知"而非荒谬的 255%。
-    let battery_percent =
-        (s.BatteryLifePercent != UNKNOWN_SENTINEL).then_some(s.BatteryLifePercent);
+    // 由调用方显示"未知"而非荒谬的 255%；其余越界值（如损坏驱动上报 150）
+    // 同样返回 None——100 是合法上限，不允许显示"电量 150%"（修订 1.50）。
+    let battery_percent = (s.BatteryLifePercent != UNKNOWN_SENTINEL && s.BatteryLifePercent <= 100)
+        .then_some(s.BatteryLifePercent);
     PowerSnapshot {
         status,
         battery_percent,

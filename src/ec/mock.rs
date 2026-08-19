@@ -130,7 +130,9 @@ impl MockBackend {
     /// `get_charge_limit` 的注释）：`0` 与 `>FULL_CHARGE_LIMIT` 是垃圾值。
     /// 三个 getter 曾各自书写同一份 `if raw == 0 || raw > 100` 判定。
     fn validate_read_raw(raw: u8) -> Result<u8, EcError> {
-        if raw == 0 || raw > crate::app::limits::FULL_CHARGE_LIMIT {
+        // 语义与真实后端/领域层同一判据（limits::charge_limit_readback_is_invalid），
+        // 三处收敛（修订 1.50）。
+        if crate::app::limits::charge_limit_readback_is_invalid(raw) {
             return Err(EcError::InvalidData(format!(
                 "充电上限 mock 值 {} 非法",
                 raw

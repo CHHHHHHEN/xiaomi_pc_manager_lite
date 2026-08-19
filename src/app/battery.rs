@@ -113,7 +113,7 @@ pub fn apply_battery_state(
                 // 持久化进配置（care=true + limit=0）。此处显式拒绝（Err），
                 // 由调用方走"保留写入值"的兜底，绝不冒充成功（纵深防御，
                 // GarbageReadback 回归测试锁定）。
-                if actual == 0 || actual > FULL_CHARGE_LIMIT {
+                if crate::app::limits::charge_limit_readback_is_invalid(actual) {
                     log::warn!(
                         "Charge limit readback out of range: {}%; treating as failure",
                         actual

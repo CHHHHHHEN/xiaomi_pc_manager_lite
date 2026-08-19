@@ -61,10 +61,9 @@ pub(crate) fn atomic_write(path: &Path, data: &[u8]) -> Result<(), String> {
 /// 可能被低权限用户在可写 EXE 目录替换为恶意 DLL——必须重新提取嵌入副本。
 pub fn exe_dir_dll_is_embedded() -> bool {
     let (dll_name, _) = arch_file_names();
-    let Some(exe_dir) = std::env::current_exe()
-        .ok()
-        .and_then(|e| e.parent().map(|p| p.to_path_buf()))
-    else {
+    // 父目录解析失败（当前 exe 不可查）按"不一致"处理：宁可重新提取嵌入
+    // 副本，也不加载来源可疑的同名 DLL。
+    let Ok(exe_dir) = crate::util::exe_dir() else {
         return false;
     };
     let Ok(disk) = std::fs::read(exe_dir.join(dll_name)) else {
@@ -91,11 +90,7 @@ pub fn extract_winring0() -> Result<PathBuf, String> {
     let embedded_sys = WinRing0Binaries::get(sys_name)
         .ok_or_else(|| format!("{} not found in embedded binaries", sys_name))?;
 
-    let target_dir = std::env::current_exe()
-        .map_err(|e| format!("current_exe: {}", e))?
-        .parent()
-        .ok_or("no parent directory")?
-        .to_path_buf();
+    let target_dir = crate::util::exe_dir()?;
 
     // Clean up old extraction locations from previous versions.
     // 注意：**不能**整体删除 `%TEMP%\XiaomiPcManagerLite`——该目录正是

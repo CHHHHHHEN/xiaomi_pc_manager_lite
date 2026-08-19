@@ -6,6 +6,7 @@ use crate::app::config::BackendPreference;
 use crate::app::limits::FULL_CHARGE_LIMIT;
 use crate::app::performance::PerfMode;
 use crate::ec;
+use crate::util::err_fmt;
 
 use super::app::XiaomiApp;
 
@@ -15,11 +16,9 @@ const HW_FAILURE_PAUSE_THRESHOLD: u32 = 3;
 
 /// 用户可见错误文案（修订 1.47 收敛）：同名字面量散落多处、各自手写，
 /// 修改措辞时容易漏改其一导致文案漂移（测试锁定这些文案的 contains 断言）。
-/// 统一收敛为单一来源——带占位符的文案共用同一 `format!("{label}: {e}")`
-/// 形状（修订 1.49 整理）；无占位符的 `ERR_SET_CARE` 用常量。
-fn err_fmt(label: &'static str, e: impl std::fmt::Display) -> String {
-    format!("{}: {}", label, e)
-}
+/// 统一收敛为单一来源——带占位符的文案共用 `util::err_fmt`（修订 1.49
+/// 整理 + 1.50 提升到 leaf 层供全项目复用）；无占位符的 `ERR_SET_CARE`
+/// 用常量。
 const ERR_SET_CHARGE_LIMIT: &str = "设置充电上限失败";
 const ERR_SYNC_CARE: &str = "同步电池养护状态失败";
 const ERR_BACKEND_SWITCH: &str = "后端切换失败";
@@ -837,7 +836,7 @@ impl XiaomiApp {
             }
             Err(e) => {
                 log::error!("Failed to set performance mode: {}", e);
-                self.push_error(format!("设置性能模式失败: {}", e));
+                self.push_error(err_fmt("设置性能模式失败", e));
             }
         }
     }
@@ -926,7 +925,7 @@ impl XiaomiApp {
                     crate::util::catch_panic(|| {
                         ec::backend::create_backend(target).map_err(|e| e.to_string())
                     })
-                    .unwrap_or_else(|payload| Err(format!("后端创建线程异常: {}", payload)));
+                    .unwrap_or_else(|payload| Err(err_fmt("后端创建线程异常", payload)));
                 if cmd_tx
                     .send(UiCommand::BackendSwitchResult {
                         user_pref: pref,
@@ -1033,7 +1032,7 @@ impl XiaomiApp {
             }
             Err(e) => {
                 log::error!("Backend refresh: {}", e);
-                errors.push(format!("读取性能模式: {}", e));
+                errors.push(err_fmt("读取性能模式", e));
             }
         }
         match self.backend.get_battery_state() {
@@ -1042,17 +1041,28 @@ impl XiaomiApp {
                 // "充电上限: 255%" 或使滑块/养护位推导溢出。上限超过 100
                 // 视为垃圾值钳到 100。
                 let limit = limit.min(FULL_CHARGE_LIMIT);
-                self.runtime.charge_limit = limit;
-                // 领域不变式：养护 == 上限 < 100%（care_enabled_from_limit）。
-                // 读回的 care 位与 limit 冲突时（垃圾值场景下存在），以
-                // limit 为权威重新推导——否则"养护: 开启 · 上限: 100%"的
-                // 矛盾组合会展示给用户（M5 回归修复：历史实现把 care 原样
-                // 存进 runtime，钳制后的 limit=100 与 care=true 并存）。
-                self.runtime.battery_care_enabled = app::battery::care_enabled_from_limit(limit);
+                // `0` 同样是垃圾值（真实后端统一拒绝，见 winring0/mock 的
+                // 读回契约）：钳制只处理 >100，0 会以"充电上限: 0%"漏进 UI，
+                // 且与"养护=限值<100%"推导出 care=true 的矛盾组合。这里补上
+                // 最后一道防线（修订 1.50）：0 按读取失败处理。
+                if limit == 0 {
+                    let e = "充电上限寄存器值 0 非法".to_string();
+                    log::error!("Backend refresh: {}", e);
+                    errors.push(err_fmt("读取电池状态", e));
+                } else {
+                    self.runtime.charge_limit = limit;
+                    // 领域不变式：养护 == 上限 < 100%（care_enabled_from_limit）。
+                    // 读回的 care 位与 limit 冲突时（垃圾值场景下存在），以
+                    // limit 为权威重新推导——否则"养护: 开启 · 上限: 100%"的
+                    // 矛盾组合会展示给用户（M5 回归修复：历史实现把 care 原样
+                    // 存进 runtime，钳制后的 limit=100 与 care=true 并存）。
+                    self.runtime.battery_care_enabled =
+                        app::battery::care_enabled_from_limit(limit);
+                }
             }
             Err(e) => {
                 log::error!("Backend refresh: {}", e);
-                errors.push(format!("读取电池状态: {}", e));
+                errors.push(err_fmt("读取电池状态", e));
             }
         }
         // NFR-REL-03：EC 读写连续失败计数。任意读取成功即清零（硬件恢复）；
@@ -1163,7 +1173,7 @@ impl XiaomiApp {
             Ok(_) => log::info!("Opening log file in Explorer: {}", path.display()),
             Err(e) => {
                 log::error!("Failed to open log file in Explorer: {}", e);
-                self.push_error(format!("打开日志失败: {}", e));
+                self.push_error(err_fmt("打开日志失败", e));
             }
         }
     }
