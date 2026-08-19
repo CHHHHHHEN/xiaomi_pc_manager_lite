@@ -1,13 +1,14 @@
 //! WinRing0 驱动的运行时提取与文件名校验（`ec` 适配器层内部）。
 //!
-//! 本模块承载驱动 DLL/SYS 的嵌入资源提取、原子写、EXE 目录副本与嵌入副本的
-//! 内容一致性校验，并提供架构文件名对 `arch_file_names` 作为唯一事实来源。
+//! 本模块承载驱动 DLL/SYS 的嵌入资源提取、EXE 目录副本与嵌入副本的内容
+//! 一致性校验，并提供架构文件名对 `arch_file_names` 作为唯一事实来源。
 //! 历史实现放在 crate 根的 `embed.rs`，与 `ec::winring0` 双向依赖（embed 取
 //! `arch_file_names`、winring0 取 `atomic_write`/`extract`）——收敛到 `ec`
-//! 内部后依赖方向单一：`ec::winring0` → `ec::embed`。
+//! 内部后依赖方向单一：`ec::winring0` → `ec::embed`（原子写不再由本模块
+//! 代理，直接引用 `util::fs::atomic_write`，修订 1.50 清理）。
 
 use rust_embed::RustEmbed;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[derive(RustEmbed)]
 #[folder = "bin"]
@@ -37,22 +38,6 @@ pub fn embedded_dll_bytes() -> Result<std::borrow::Cow<'static, [u8]>, String> {
     WinRing0Binaries::get(dll_name)
         .map(|f| f.data)
         .ok_or_else(|| format!("{} not found in embedded binaries", dll_name))
-}
-
-/// 原子写文件：先写同目录唯一临时文件，再 rename 覆盖目标。
-///
-/// **为什么**（修订 1.46 安全加固）：本进程以管理员运行，`std::fs::write`
-/// 直接写目标路径会**跟随目标处的符号链接/重解析点**（CreateFile 语义），
-/// 低权限用户可在可写的 EXE 目录（便携部署常见）预置 `WinRing0x64.dll/.sys`
-/// 符号链接指向任意文件，提权进程随即截断/覆写该文件（TOCTOU 提权写入）。
-/// 先写唯一临时文件再 `std::fs::rename`（Windows 上映射为
-/// `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`）则**替换整个目录项**而非跟随
-/// 重解析点——目标若为链接，被整体替换为正常文件，不会写穿到链接目标。
-///
-/// 实现统一收敛到 `util::fs::atomic_write`（修订 1.49 整理：与
-/// `app::config` 的配置保存共用同一份实现，含 fsync 落盘）。
-pub(crate) fn atomic_write(path: &Path, data: &[u8]) -> Result<(), String> {
-    crate::util::atomic_write(path, data)
 }
 
 /// 校验 EXE 目录中的 DLL 是否与嵌入副本**内容一致**（字节级）。
@@ -112,7 +97,8 @@ pub fn extract_winring0() -> Result<PathBuf, String> {
         }
     }
 
-    // 原子写（临时文件 + rename）：不跟随目标重解析点，见 atomic_write 注释。
+    // 原子写（临时文件 + rename）：不跟随目标重解析点，实现见
+    // `util::fs::atomic_write`（本模块不再包装，见 atomic_write_with_retry）。
     // remove_file 前置清理改为原子替换承载：直接 rename 覆盖既有文件（含陈旧
     // 句柄残留时的重试——历史"remove+write"存在竞态窗口，替换为单次原子操作）。
     //
@@ -130,10 +116,14 @@ pub fn extract_winring0() -> Result<PathBuf, String> {
 }
 
 /// 原子写 + 短暂重试（覆盖旧版本残留句柄的竞态，DLL/SYS 共用）。
+///
+/// 原子写实现收敛在 `util::fs::atomic_write`（临时文件 + fsync + rename，
+/// 不跟随目标重解析点，见该模块的 TOCTOU 说明）；此处只加"残留句柄短暂
+/// 占用 → 重试 3 次"的容错。
 fn atomic_write_with_retry(path: &std::path::Path, data: &[u8]) -> Result<(), String> {
     let mut last_err = None;
     for attempt in 0..3 {
-        match atomic_write(path, data) {
+        match crate::util::atomic_write(path, data) {
             Ok(()) => return Ok(()),
             Err(e) => {
                 last_err = Some(e);

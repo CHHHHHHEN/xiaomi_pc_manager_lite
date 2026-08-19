@@ -112,7 +112,7 @@ impl FnKeyBinding {
 
     /// GUI 展示标签，如 `HID_EVENT20 / 01-28-01`。
     pub fn label(&self) -> String {
-        format!("{} / {}", self.class, Self::display_prefix(&self.prefix))
+        binding_label(&self.class, &self.prefix)
     }
 
     /// 归一化 hex → 带分隔符可读形式（`012801` → `01-28-01`），便于与
@@ -127,6 +127,15 @@ impl FnKeyBinding {
             .collect::<Vec<_>>()
             .join("-")
     }
+}
+
+/// `class / dashed-prefix` 展示标签（如 `HID_EVENT20 / 01-28-01`）。
+///
+/// `FnKeyBinding::label`、捕获行（view.rs 的"最近捕获"）、绑定列表行各自
+/// 手写过同一形状的 `format!`（其中绑定列表曾为取 label 而临时构造整条
+/// `FnKeyBinding`）——统一收敛到此处（修订 1.50 整理）。
+pub fn binding_label(class: &str, prefix: &str) -> String {
+    format!("{} / {}", class, FnKeyBinding::display_prefix(prefix))
 }
 
 /// 默认的功能键绑定（Fn+K → 循环切换性能）。
@@ -153,11 +162,12 @@ pub struct KnownFnKey {
 }
 
 pub const KNOWN_FN_KEYS: &[KnownFnKey] = &[
-    // Fn+K：用按下状态字节完整前缀（012801），避免释放事件（012800）
-    // 也命中造成一次按键派发两次动作。
+    // Fn+K：与 FN_K_WMI_CLASS / FN_K_PRESS_PREFIX 常量同源（修订 1.50 收敛，
+    // 见 test_known_fn_k_matches_constants 锁定）——历史实现把 "HID_EVENT20" /
+    // "012801" 在此硬编码为字面量，常量改动不会同步到预设下拉。
     KnownFnKey {
-        class: "HID_EVENT20",
-        prefix: "012801",
+        class: FN_K_WMI_CLASS,
+        prefix: FN_K_PRESS_PREFIX,
         name: "Fn+K 性能模式",
     },
     KnownFnKey {
@@ -473,6 +483,17 @@ action = "CyclePerfMode""#;
             assert!(!k.prefix.is_empty());
             assert!(set.insert((k.class, k.prefix)));
         }
+    }
+
+    /// Fn+K 目录条目必须与 `FN_K_WMI_CLASS`/`FN_K_PRESS_PREFIX` 常量一致
+    ///（修订 1.50 收敛）：常量是默认绑定的事实来源，目录是 GUI 预设——两者
+    /// 漂移会让"默认绑定 Fn+K"与"预设下拉 Fn+K"行为不一致。
+    #[test]
+    fn test_known_fn_k_matches_constants() {
+        let first = KNOWN_FN_KEYS[0];
+        assert_eq!(first.class, FN_K_WMI_CLASS);
+        assert_eq!(first.prefix, FN_K_PRESS_PREFIX);
+        assert_eq!(first.name, "Fn+K 性能模式");
     }
 
     /// 无事件类的退避节奏：前 3 次 5s、第 4~20 次 30s、之后 60s。

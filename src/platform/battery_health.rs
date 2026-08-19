@@ -398,7 +398,9 @@ fn query_first_instance(
     services: &IWbemServices,
     class: &str,
 ) -> Result<Option<IWbemClassObject>, String> {
-    let query = format!("SELECT * FROM {}", class);
+    // WQL 语句统一经 win::com::select_all_wql 构造（修订 1.50 收敛，与
+    // fn_watcher 的事件订阅同一形状）。
+    let query = crate::win::select_all_wql(class);
     let enumerator = match crate::win::exec_query(services, &query) {
         Ok(e) => e,
         // 类不存在（本机没有其他 WMI 类，如台式机/VM 无电池类）= 正常无数据；
@@ -466,10 +468,13 @@ fn read_battery_status(services: &IWbemServices) -> Result<Option<BatteryStatusI
     };
     // 内部闭包返回 Option（任意属性缺失 → None）：BatteryStatus 是标准类，
     // 属性齐全时读取；个别属性缺失视作本机无完整数据（返回 Ok(None)）。
+    // 充放电速率用 `uint_rate_prop`（修订 1.50）：固件以有符号 Int32 承载，
+    // "该方向未充放电"可能上报负值——钳为 0 而不是把整条记录判为不可读
+    //（否则一条字段的负号会连带丢失另一方向的 ETA，见 win/variant.rs）。
     let read = || -> Option<BatteryStatusInfo> {
         let remaining = crate::win::uint_prop(&obj, PROP_REMAINING)?;
-        let charge_rate = crate::win::uint_prop(&obj, PROP_CHARGE_RATE)?;
-        let discharge_rate = crate::win::uint_prop(&obj, PROP_DISCHARGE_RATE)?;
+        let charge_rate = crate::win::uint_rate_prop(&obj, PROP_CHARGE_RATE)?;
+        let discharge_rate = crate::win::uint_rate_prop(&obj, PROP_DISCHARGE_RATE)?;
         let charging = crate::win::get_bool_prop(&obj, PROP_CHARGING)?;
         let discharging = crate::win::get_bool_prop(&obj, PROP_DISCHARGING)?;
         Some(BatteryStatusInfo {

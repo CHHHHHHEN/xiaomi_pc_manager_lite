@@ -607,14 +607,11 @@ impl XiaomiApp {
                 let hex = hex.clone();
                 ui.horizontal(|ui| {
                     ui.label("最近捕获:");
-                    ui.monospace(format!(
-                        "{} / {}",
-                        class,
-                        app::fnkey::FnKeyBinding::display_prefix(&hex)
-                    ));
+                    ui.monospace(app::fnkey::binding_label(&class, &hex));
                 });
                 // 用捕获到的键直接添加绑定（无需从预设挑选）：取 `capture_prefix`
-                // 截断后的前缀（保留键码信息又不过度匹配，截断规则见该函数）。
+                // 截断后的前缀（保留键码信息又不过度匹配，截断/释放归一化规则
+                // 见该函数）。
                 let prefix = capture_prefix(&hex);
                 // 动作选择必须保存在 self 上（每帧 UI 重建，局部变量会
                 // 重置回默认——历史实现用局部变量导致用户选中的动作在
@@ -635,7 +632,7 @@ impl XiaomiApp {
                         // 仅绑定真正写入（返回 true）时清空草稿：若校验拒绝
                         // （罕见：捕获产物异常），保留用户输入便于重试（修订
                         // 1.33 回归修正）。
-                        if self.add_fn_binding(&class, prefix, action, &command) {
+                        if self.add_fn_binding(&class, &prefix, action, &command) {
                             self.fn_capture_command.clear();
                         }
                     }
@@ -667,17 +664,9 @@ impl XiaomiApp {
                 )
             };
             let (class, prefix, action, command) = &binding_snapshot;
-            let label = format!(
-                "{}. {}",
-                i + 1,
-                app::fnkey::FnKeyBinding {
-                    class: class.clone(),
-                    prefix: prefix.clone(),
-                    action: *action,
-                    command: None,
-                }
-                .label()
-            );
+            // 标签统一经 app::fnkey::binding_label（修订 1.50 收敛：历史为取
+            // label 临时构造整条 FnKeyBinding，与捕获行的 format 各写一份）。
+            let label = format!("{}. {}", i + 1, app::fnkey::binding_label(class, prefix));
             ui.horizontal(|ui| {
                 ui.label(label);
                 let mut selected_action = *action;
@@ -819,15 +808,26 @@ fn fn_action_combo(
 /// （如 `01280`）匹配不到任何真实事件，且展示时会缺半个字节（L3 回归）。
 /// 极端输入（长度 < 2，如单 hex 字符 `"A"`）会匹配所有以 A 开头的事件，
 /// 与空前缀同属危险配置——回退到**偶数长度**（0）而非保留奇数串。
-fn capture_prefix(hex: &str) -> &str {
+///
+/// **释放事件归一化为按下**（修订 1.50 修复）：捕获开启时若用户已按住目标
+/// 键，收到的首条事件可能是释放（状态字节 `00`）——直接绑定该前缀只会命中
+/// 未来的释放事件，下一次物理按键（按下 `01`）永不命中，绑定看起来"静默
+/// 失效"（F-FNK-06 语义冲突）。前缀末字节若是 `00`（释放）则改写为 `01`
+/// （按下），让绑定命中下一次物理按键的按下事件。
+fn capture_prefix(hex: &str) -> String {
     let mut prefix_len = hex.len().min(6);
     if !prefix_len.is_multiple_of(2) {
         prefix_len -= 1;
     }
-    if prefix_len >= 2 {
+    let p = if prefix_len >= 2 {
         &hex[..prefix_len]
     } else {
         &hex[..hex.len() - hex.len() % 2]
+    };
+    if p.len() >= 6 && p.ends_with("00") {
+        format!("{}01", &p[..p.len() - 2])
+    } else {
+        p.to_string()
     }
 }
 
@@ -966,5 +966,23 @@ mod tests {
         // <80 红。
         assert_eq!(battery_health_color(79.9), red);
         assert_eq!(battery_health_color(0.0), red);
+    }
+
+    /// 捕获前缀（修订 1.50）：按下事件原样截断为 6 hex；释放事件（末状态
+    /// 字节 `00`）归一化为按下（`01`）——否则绑定只命中未来的释放事件、
+    /// 下一次物理按键永不触发（F-FNK-06）；奇数长度/超长输入回退与截断
+    /// 语义不变。
+    #[test]
+    fn test_capture_prefix_normalizes_release_to_press() {
+        // 按下事件：前 6 位保留。
+        assert_eq!(capture_prefix("01280100"), "012801");
+        // 释放事件（捕获开启时按键已被按住的首条事件）：状态字节 00 → 01。
+        assert_eq!(capture_prefix("012800"), "012801");
+        // 含后续长度字节的报告同样只取前 6。
+        assert_eq!(capture_prefix("0128010002"), "012801");
+        // 非释放前缀不受影响（末字节 01/其它）。
+        assert_eq!(capture_prefix("012501"), "012501");
+        // 奇数长度回退到偶数。
+        assert_eq!(capture_prefix("01280"), "0128");
     }
 }

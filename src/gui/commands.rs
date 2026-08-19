@@ -238,9 +238,60 @@ impl XiaomiApp {
     ///（与"增量落盘"设计不冲突）。
     fn handle_quit(&mut self, ctx: &egui::Context) {
         log::info!("Quit: setting quitting flag");
+        // 先等待在飞的自启动操作收尾（可能回滚配置），再兜底保存最终状态
+        //（drain 内的回滚路径也会各自 save_state，此处统一兜底）。
+        self.drain_pending_autostart();
         self.save_state();
         self.quitting = true;
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    /// 退出前有界等待在飞的自启动操作（修订 1.50 修复）。
+    ///
+    /// 自启动注册/删除走**串行后台 worker**（可能尚未执行完）：用户取消勾选
+    /// "开机自启动"后立刻经托盘"退出"，若 `DeleteTask` 尚未完成进程就结束，
+    /// 计划任务残留而配置已落盘为关——下次启动 `autostart::sync` 对"配置关 +
+    /// 任务在"采取保守不删除，任务被永久残留、App 照常自启，与配置矛盾
+    /// （F-AUTO-03 契约背离）。此处有界阻塞等待 `autostart_in_flight` 归零，
+    /// 期间只处理 `SetAutostartResult` 回执（退出中其余命令丢弃）；
+    /// 超时/通道关闭则放弃（正常操作毫秒级完成，3s 仅覆盖极端挂起）。
+    fn drain_pending_autostart(&mut self) {
+        const AUTOSTART_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+        if self.autostart_in_flight == 0 {
+            return;
+        }
+        log::info!(
+            "Quit: waiting for {} pending autostart operation(s)",
+            self.autostart_in_flight
+        );
+        let deadline = std::time::Instant::now() + AUTOSTART_DRAIN_TIMEOUT;
+        while self.autostart_in_flight > 0 {
+            let wait = deadline.saturating_duration_since(std::time::Instant::now());
+            if wait.is_zero() {
+                log::warn!(
+                    "Quit: {} autostart result(s) still pending after {}s; exiting anyway",
+                    self.autostart_in_flight,
+                    AUTOSTART_DRAIN_TIMEOUT.as_secs()
+                );
+                return;
+            }
+            match self.cmd_rx.recv_timeout(wait) {
+                Ok(UiCommand::SetAutostartResult(enabled, result)) => {
+                    self.handle_autostart_result(enabled, result);
+                }
+                // 退出中其它后台命令（电池健康/捕获事件等）对最终状态无影响，
+                // 直接丢弃，只等自启动回执。
+                Ok(_other) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    log::warn!(
+                        "Quit: autostart command channel closed with {} result(s) pending",
+                        self.autostart_in_flight
+                    );
+                    return;
+                }
+            }
+        }
     }
     /// 电源切换时重设配置（UiCommand::ReapplyConfig）。
     ///
@@ -648,7 +699,7 @@ impl XiaomiApp {
     /// 此键"绑定释放前缀，下一次物理按键（按下码）不再命中，绑定静默失效。
     ///
     /// 判定规则：新事件是**释放**且已存事件是同一键码的**按下**时，保留旧的
-    /// 按下事件。按下/释放判定与 Fn 监听派发共用 ec::fnkey 的
+    /// 按下事件。按下/释放判定与 Fn 监听派发共用 `app::fnkey` 的
     /// `is_press_report` / `is_release_report`（同一条"状态字节位于第 3 字节"
     /// 的硬件规则，历史两处各自实现有漂移风险）。同键码判定：事件类相同、
     /// 去掉状态字节后的 hex 相同（`012800` 与 `012801` 经

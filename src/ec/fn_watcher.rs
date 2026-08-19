@@ -98,7 +98,8 @@ fn subscribe(services: &IWbemServices, classes: &[String]) -> Vec<(String, SafeE
     classes
         .iter()
         .filter_map(|class_name| {
-            let query = format!("SELECT * FROM {}", class_name);
+            // WQL 语句统一经 win::com::select_all_wql 构造（修订 1.50 收敛）。
+            let query = crate::win::select_all_wql(class_name);
             match unsafe {
                 services.ExecNotificationQuery(
                     &BSTR::from("WQL"),

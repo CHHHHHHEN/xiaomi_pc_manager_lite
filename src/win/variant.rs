@@ -127,6 +127,38 @@ pub unsafe fn bool_from_variant(val: &VARIANT) -> Option<bool> {
     Some(val.Anonymous.Anonymous.Anonymous.boolVal != VARIANT_BOOL(0))
 }
 
+/// 读取**充放电速率**属性为 u32，`VT_I4` 负值钳为 0（修订 1.50）。
+///
+/// 与 [`uint_from_variant`] 的差异：`BatteryStatus.ChargeRate/DischargeRate`
+/// 由固件以**有符号**（Int32，本机实测 VT_I4）承载，"该方向未充放电"可能
+/// 上报负值。对速率而言负值 = 无速率（0）——钳为 0 后 `eta_*_minutes`
+/// 自然返回 None（不展示估算），而不是把整条 `BatteryStatus` 判为"属性
+/// 不可读"导致充放电两条 ETA 一起丢失（一条字段的符号语义不能毁掉另一条
+/// 方向的估算）。其余整型变体（VT_UI4/VT_UINT）原样读取；非整型返回 None。
+///
+/// # Safety
+/// 与 [`uint_from_variant`] 相同：`val` 必须指向已初始化的 `VARIANT`，读取
+/// 期间不得被并发修改。
+pub unsafe fn unsigned_rate_from_variant(val: &VARIANT) -> Option<u32> {
+    let vt = val.Anonymous.Anonymous.vt.0;
+    if vt == VT_I4.0 {
+        let l = val.Anonymous.Anonymous.Anonymous.lVal;
+        return Some(if l < 0 { 0 } else { l as u32 });
+    }
+    if vt != windows::Win32::System::Variant::VT_UI4.0
+        && vt != windows::Win32::System::Variant::VT_UINT.0
+    {
+        return None;
+    }
+    Some(val.Anonymous.Anonymous.Anonymous.ulVal)
+}
+
+/// 从 WMI 对象读取充放电速率属性（见 `unsigned_rate_from_variant`）。
+pub fn uint_rate_prop(obj: &IWbemClassObject, name: &str) -> Option<u32> {
+    let val = get_property(obj, name)?;
+    unsafe { unsigned_rate_from_variant(&val) }
+}
+
 /// 读取整数属性（电池容量等 uint32 字段）为 u32。
 ///
 /// WMI 提供程序对 uint32 属性的变体类型并不统一：
@@ -176,6 +208,32 @@ mod tests {
             assert_eq!(uint_from_variant(&VARIANT::from(-1i32)), None);
             // VT_EMPTY / 未初始化：类型不符。
             assert_eq!(uint_from_variant(&VARIANT::default()), None);
+        }
+    }
+
+    /// 充放电速率读取（修订 1.50）：VT_I4 **负值钳为 0**（"该方向未充放电"
+    /// 的固件符号语义），正数/UI4/UINT 原样读取——一条字段的负号不得让整条
+    /// BatteryStatus 变成"不可读"、连带丢弃另一方向的 ETA。
+    #[test]
+    fn test_unsigned_rate_from_variant_clamps_negative() {
+        unsafe {
+            // VT_I4 负数（"该方向未充放电"）：钳为 0（eta 判定为无速率）。
+            assert_eq!(
+                unsigned_rate_from_variant(&VARIANT::from(-5000i32)),
+                Some(0)
+            );
+            // VT_I4 正数：原样。
+            assert_eq!(
+                unsigned_rate_from_variant(&VARIANT::from(12000i32)),
+                Some(12000)
+            );
+            // VT_UI4 / VT_UINT：原样。
+            assert_eq!(
+                unsigned_rate_from_variant(&VARIANT::from(20000u32)),
+                Some(20000)
+            );
+            // 非整型（未初始化）：不可读。
+            assert_eq!(unsigned_rate_from_variant(&VARIANT::default()), None);
         }
     }
 }

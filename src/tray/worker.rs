@@ -470,10 +470,10 @@ fn build_tray_nid(hwnd: HWND, hicon: HICON) -> NOTIFYICONDATAW {
 /// 写入 szTip 并保证 NUL 结尾。提示文本达到或超过 128 个 UTF-16 单元时截断
 /// 到 127 单元 + NUL：不保证 NUL 结尾的 Tooltip 会让 Shell_NotifyIconW 越过
 /// szTip 读入 dwState/szInfo 等后续字段，工具提示会显示垃圾字符。
+/// 实现收敛到 `util::write_utf16_capped`（与 notify.rs 的 szInfo/szInfoTitle
+/// 同一套"截断 + NUL"语义，修订 1.50 整理）。
 fn set_tip(sz_tip: &mut [u16; 128], tip: &str) {
-    let mut wide: Vec<u16> = tip.encode_utf16().take(127).collect();
-    wide.push(0);
-    sz_tip[..wide.len()].copy_from_slice(&wide);
+    crate::util::write_utf16_capped(sz_tip, 127, tip);
 }
 
 /// 生成托盘 tooltip 文案（含实时状态）。
@@ -542,8 +542,11 @@ fn refresh_tray_tooltip() {
         log::debug!("Tray: NIM_MODIFY tooltip failed (icon not ready?)");
     }
 
-    // 性能模式/电池养护变化时弹通知。只在主窗口隐藏时弹：窗口可见时用户
-    // 能直接看到 GUI 变化，再弹通知反而是打扰（NFR-UX 一致性）。
+    // 性能模式/电池养护变化时弹通知。只在用户看不到主窗口时弹：窗口在屏
+    // 可见时用户能直接看到 GUI 变化，再弹通知反而是打扰（NFR-UX 一致性）。
+    // 用 `window_visible_to_user` 而非 `main_window_visible`（修订 1.50 修复）：
+    // 最小化到任务栏的窗口对托盘 toggle 仍算"可见"，但用户看不到 GUI——
+    // 若按后者门控，最小化期间所有状态气泡（F-TRAY-13/14）会被静默吞掉。
     // 通知基线与"充电已达上限"武装状态统一保存在 TrayThreadState。
     let (should_notify_perf, should_notify_care, should_notify_charge) = TRAY_STATE.with(|s| {
         let mut guard = s.borrow_mut();
@@ -570,7 +573,7 @@ fn refresh_tray_tooltip() {
         st.charge_limit_reached = at_limit.map(|armed| (charge_limit, armed));
         (should_notify_perf, should_notify_care, should_notify_charge)
     });
-    if crate::platform::window::main_window_visible() {
+    if crate::platform::window::window_visible_to_user() {
         return;
     }
     if should_notify_perf {

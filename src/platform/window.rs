@@ -104,15 +104,30 @@ pub(crate) fn find_main_window() -> Option<HWND> {
 
 /// 主窗口当前是否可见（任务栏图标随可见性出现/消失）。
 ///
-/// 隐藏态用"窗口移出屏幕外"实现（见 `HIDDEN_POS`）：`WS_VISIBLE` 位仍在，
-/// `IsWindowVisible` 恒返回 true，不能直接用它判定——改为比较窗口位置，
+/// 隐藏时用"窗口移出屏幕外"实现（见 `HIDDEN_POS`）：`WS_VISIBLE` 位仍在，
+/// `IsWindowVisible` 恒返回 true，不能直接用它判断——改为比较窗口位置，
 /// 位于隐藏坐标即视为隐藏。**最小化窗口同样报告 `(-32000,-32000)` 位置**
-/// （修订 1.46 审计）：最小化到任务栏的窗口是"可见"状态（通知门控应放行
-/// 托盘气泡），用 `IsIconic` 区分最小化与离屏隐藏——最小化窗口视为可见，
-/// 离屏隐藏（且非最小化）才视为隐藏。
+/// （修订 1.46 审计）：最小化到任务栏的窗口对托盘 toggle 而言是"可见"
+/// （点击托盘应继续隐藏到托盘），用 `IsIconic` 区分最小化与离屏隐藏——
+/// 最小化窗口视为可见，离屏隐藏（且非最小化）才视为隐藏。
 pub fn main_window_visible() -> bool {
     find_main_window()
         .map(|hwnd| unsafe { IsWindowVisible(hwnd).as_bool() && !window_at_hidden_pos(hwnd) })
+        .unwrap_or(false)
+}
+
+/// 用户是否**能看到主窗口内容**（F-TRAY-13/14 的"窗口可见不弹"门控）。
+///
+/// 与 `main_window_visible` 的差异：**最小化窗口**虽然 `IsWindowVisible`
+/// 为真、托盘 toggle 视为可见，但用户看不到 GUI 变化——把状态变化弹成
+/// 托盘气泡仍是合理反馈（否则最小化到任务栏时性能/养护/充电上限通知被
+/// 静默吞掉，修订 1.50 修复）。仅当窗口在屏、非最小化、非离屏隐藏时才
+/// 认为用户可直接看到 GUI。
+pub fn window_visible_to_user() -> bool {
+    find_main_window()
+        .map(|hwnd| unsafe {
+            IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool() && !window_offscreen(hwnd)
+        })
         .unwrap_or(false)
 }
 
@@ -124,18 +139,26 @@ fn rect_at_hidden_pos(rect: &RECT) -> bool {
     rect.left == HIDDEN_POS.0 && rect.top == HIDDEN_POS.1
 }
 
-/// 窗口是否位于隐藏原点（-32000,-32000）且未被最小化。
-fn window_at_hidden_pos(hwnd: HWND) -> bool {
+/// 窗口是否位于隐藏原点（-32000,-32000）。与 `IsIconic` 无关：最小化窗口
+/// 的 `GetWindowRect` 同样报告该坐标，是否算"托盘隐藏"由调用方决定
+/// （`window_at_hidden_pos` 排除最小化、`window_visible_to_user` 把它当
+/// 不可见）。
+fn window_offscreen(hwnd: HWND) -> bool {
     let mut rect = unsafe { std::mem::zeroed() };
     if unsafe { GetWindowRect(hwnd, &mut rect) }.is_err() {
         return false;
     }
+    rect_at_hidden_pos(&rect)
+}
+
+/// 窗口是否位于隐藏原点（-32000,-32000）且未被最小化。
+fn window_at_hidden_pos(hwnd: HWND) -> bool {
     // 最小化窗口也会把 GetWindowRect 报告为 (-32000,-32000)：只有"非最小化
     // 且位于隐藏坐标"才是本应用的隐藏态（见 main_window_visible 注释）。
     if unsafe { IsIconic(hwnd).as_bool() } {
         return false;
     }
-    rect_at_hidden_pos(&rect)
+    window_offscreen(hwnd)
 }
 
 /// 判断给定的窗口左上角（x, y）是否位于**虚拟屏幕**（所有监视器的并集，

@@ -99,20 +99,16 @@ pub fn apply_battery_state(
             // ——不能静默当成读回成功：调用方会把读回值写回持久化配置，
             // 静默吞掉会使 config 与硬件实际值长期背离且无法排查。
             //
-            // 读回契约（修订 1.46 审计）：后端 get_charge_limit 对非法值
-            // （0 / >100）返回 Err（见 winring0.rs / wmi.rs 的读回校验）。
-            // 合法范围由后端保证；万一某后端越界返回 Ok(0)/Ok(>100)，
-            // 在此显式拒绝（Err），由调用方走"保留写入值"的兜底，绝不冒充
-            // 成功（纵深防御，GarbageReadback 回归测试锁定）。
+            // 读回契约（修订 1.46/1.47 审计，纵深防御）：后端 get_charge_limit
+            // 对非法值（0 / >100）返回 Err（见 winring0.rs / wmi.rs 的读回校验，
+            // 以及 limits::charge_limit_readback_is_invalid 的单一谓词）。万一某
+            // 后端越界返回 Ok(0)/Ok(>100)，在此显式拒绝（Err），由调用方走
+            // "保留写入值"的兜底，绝不冒充成功（GarbageReadback 回归测试锁定）。
+            // 0 同样是垃圾值：GUI 滑块下限 40、WMI 预设下限 40、配置消毒把 0
+            // 归一为默认——只判 >100 会让损坏的 0 被当作"合法 0%"持久化进配置
+            // （care=true + limit=0 的矛盾组合）。
             let readback = || -> Result<u8, EcError> {
                 let actual = backend.get_charge_limit()?;
-                // 读回契约（修订 1.46/1.47 审计）：后端 get_charge_limit 对非法值
-                // （0 / >100）返回 Err（见 winring0.rs / wmi.rs 的读回校验）。
-                // 0 同样是垃圾值（GUI 滑块下限 40、WMI 预设下限 40、配置消毒
-                // 把 0 归一为默认）——只判 >100 会让损坏的 0 被当作"合法 0%"
-                // 持久化进配置（care=true + limit=0）。此处显式拒绝（Err），
-                // 由调用方走"保留写入值"的兜底，绝不冒充成功（纵深防御，
-                // GarbageReadback 回归测试锁定）。
                 if crate::app::limits::charge_limit_readback_is_invalid(actual) {
                     log::warn!(
                         "Charge limit readback out of range: {}%; treating as failure",

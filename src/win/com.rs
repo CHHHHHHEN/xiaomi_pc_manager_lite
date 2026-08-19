@@ -156,6 +156,16 @@ pub fn exec_query(
     }
 }
 
+/// 全表查询的 WQL 语句（`SELECT * FROM <class>`）构造点（修订 1.50 收敛）。
+///
+/// fn_watcher.rs（`ExecNotificationQuery` 事件订阅）与 battery_health.rs
+/// （`ExecQuery` 快照查询）此前各自手写同一句 `format!("SELECT * FROM {}",
+/// class)`——WQL 形状一旦要统一演化（如追加过滤子句）需同步多处。类名由
+/// 调用方校验（`app::fnkey::valid_class` 保证合法 WQL 标识符，无注入面）。
+pub fn select_all_wql(class: &str) -> String {
+    format!("SELECT * FROM {}", class)
+}
+
 /// 从枚举器取**下一个**实例（单槽 `Next`，一次一条）。
 ///
 /// - `Ok(Some(obj))` = 取到一条实例；

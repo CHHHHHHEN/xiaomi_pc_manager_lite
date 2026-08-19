@@ -48,7 +48,8 @@ src/
 ├── launch.rs       # 组合根：日志/panic 兜底/单实例/提权/后端初始化/GUI 启动
 ├── util/           # 跨层工具（各层唯一事实来源）
 │   ├── app.rs      #   应用元数据（APP_NAME/APP_VERSION/窗口尺寸/日志路径）
-│   ├── text.rs     #   UTF-16 缓冲（WideString）
+│   ├── fs.rs       #   原子文件写（临时文件 + fsync + rename，配置与驱动共用）
+│   ├── text.rs     #   UTF-16 缓冲（WideString）与定长宽字符串写入
 │   ├── thread.rs   #   线程兜底（spawn_guarded/catch_panic/panic_message）
 │   └── sync.rs     #   锁毒化恢复 + 只告警一次（lock_or_recover/log_once）
 ├── win/            # Windows 互操作基础设施（供 ec/platform 复用，仅依赖 util）

@@ -2,7 +2,7 @@ use std::sync::Mutex;
 
 use super::addr as ec_addr;
 use super::backend::EcBackend;
-use super::embed::{arch_file_names, atomic_write, exe_dir_dll_is_embedded, extract_winring0};
+use super::embed::{arch_file_names, exe_dir_dll_is_embedded, extract_winring0};
 use crate::app::ec::EcError;
 use crate::util::err_fmt;
 use libloading::Library;
@@ -353,8 +353,8 @@ fn ensure_sys_in_exe_dir(dll_path: &std::path::Path) {
             // 原子写（临时文件 + rename）而非 std::fs::copy：本进程是提权
             // 进程，copy 会跟随目标处的符号链接/重解析点——低权限用户在
             // 可写的 EXE 目录预置指向任意文件的链接时，提权进程会覆写该
-            // 文件（TOCTOU，与 embed::atomic_write 同一安全问题）。直接
-            // 复用 embed 的原子写（读源字节 → 写临时 → rename 替换）。
+            // 文件（TOCTOU，与 util::fs::atomic_write 同一安全问题）。直接
+            // 复用 util 的原子写（读源字节 → 写临时 → rename 替换）。
             let data = match std::fs::read(&sys_src) {
                 Ok(d) => d,
                 Err(e) => {
@@ -362,7 +362,7 @@ fn ensure_sys_in_exe_dir(dll_path: &std::path::Path) {
                     return;
                 }
             };
-            match atomic_write(&sys_dst, &data) {
+            match crate::util::atomic_write(&sys_dst, &data) {
                 Ok(()) => log::info!("WinRing0: copied .sys to {:?}", sys_dst),
                 Err(e) => log::warn!("WinRing0: copy .sys to EXE dir: {}", e),
             }

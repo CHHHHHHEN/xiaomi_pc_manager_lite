@@ -13,5 +13,9 @@
 pub mod com;
 pub mod variant;
 
-pub use com::{connect_root_wmi, exec_query, next_instance, safe_array_len, ComScope};
-pub use variant::{bstr_from_variant, get_bool_prop, get_property, get_string_prop, uint_prop};
+pub use com::{
+    connect_root_wmi, exec_query, next_instance, safe_array_len, select_all_wql, ComScope,
+};
+pub use variant::{
+    bstr_from_variant, get_bool_prop, get_property, get_string_prop, uint_prop, uint_rate_prop,
+};

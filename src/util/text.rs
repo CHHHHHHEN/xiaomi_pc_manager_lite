@@ -62,3 +62,68 @@ impl WideString {
         &self.0
     }
 }
+
+/// 把 `src` 写入固定大小 UTF-16 目标缓冲（`dst`）并保证 **NUL 结尾**。
+///
+/// NUL 是 Windows 字符串 API（`Shell_NotifyIconW` 的 szTip/szInfo 等）读取
+/// 缓冲的**唯一终止信号**：不保证 NUL 结尾会让 API 越过缓冲读入相邻字段，
+/// 显示垃圾字符。语义：写入 `src` 的 UTF-16 编码，最多 `max_units` 单元
+/// （再受 `dst.len()-1` 物理上限约束），末尾恒补一个 0；NUL 之后的单元
+/// 保持调用方原值（字符串读取在 NUL 处停止，无需整体清零）。
+///
+/// 托盘 notify.rs（szInfo/szInfoTitle）与 worker.rs（szTip）此前各自手写
+/// "encode_utf16 + take + 追加 NUL"的样板，截断/清零策略各不相同——统一
+/// 收敛到此处（修订 1.50 整理）。`max_units` 与数组容量解耦：如
+/// `NOTIFYICONDATAW.szInfo` 实际为 256 单元，但 NIF_INFO 正文约定只用到
+/// 63 单元，调用方显式传 `max_units`，缓冲物理容量由 `dst.len()` 兜底。
+pub fn write_utf16_capped(dst: &mut [u16], max_units: usize, src: &str) {
+    let max = max_units.min(dst.len().saturating_sub(1));
+    let units: Vec<u16> = src.encode_utf16().take(max).collect();
+    dst[..units.len()].copy_from_slice(&units);
+    // 截断后的下一个单元置 NUL：NUL 之前是内容、之后由调用方决定。
+    dst[units.len()] = 0;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// UTF-16 截断 + NUL 结尾（修订 1.50 收敛）：短文本原样写入并在内容后
+    /// NUL 结尾、NUL 之后保持调用方原值；超长文本截断到上限单元数且 NUL
+    /// 结尾；max_units 超过物理容量时受数组容量兜底。
+    #[test]
+    fn test_write_utf16_capped() {
+        // 短文本：内容 + NUL，NUL 之后保持原值。
+        let mut dst = [0xAAAAu16; 8];
+        write_utf16_capped(&mut dst, 8, "ab");
+        let mut expect = vec![b'a' as u16, b'b' as u16, 0];
+        expect.extend([0xAAAAu16; 5]);
+        assert_eq!(dst, expect.as_slice());
+        // 超长文本：截断到 max_units（7 单元），NUL 位于第 7 个槽。
+        write_utf16_capped(&mut dst, 7, "abcdefgh");
+        assert_eq!(
+            &dst[..7],
+            vec![
+                b'a' as u16,
+                b'b' as u16,
+                b'c' as u16,
+                b'd' as u16,
+                b'e' as u16,
+                b'f' as u16,
+                b'g' as u16
+            ]
+            .as_slice()
+        );
+        assert_eq!(dst[7], 0, "NUL must terminate the truncated text");
+        // max_units 大于物理容量：内容最多 dst.len()-1（127 语义的防御）。
+        let mut small = [0u16; 4];
+        write_utf16_capped(&mut small, 100, "toolong");
+        assert_eq!(&small[..3], &[b't' as u16, b'o' as u16, b'o' as u16]);
+        assert_eq!(small[3], 0);
+        // 空串：仅 NUL。
+        let mut empty = [0xBBu16; 3];
+        write_utf16_capped(&mut empty, 2, "");
+        assert_eq!(empty[0], 0);
+        assert_eq!(empty[1], 0xBB, "NUL 之后保持原值");
+    }
+}

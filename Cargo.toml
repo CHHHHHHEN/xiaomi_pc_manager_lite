@@ -41,7 +41,7 @@ windows = { version = "0.62", features = [
     "Win32_System_TaskScheduler",
 ]}
 
-# 发布构建优化（NFR-PERF-04 目标 ≤ 5 MB）：
+# 发布构建优化（NFR-PERF-04，Could 级目标 ≤ 6 MB，修订 1.32/1.46）：
 # - lto = "fat"：跨 crate 链接期优化（full 版比 thin 更激进，可补偿
 #   panic 从 abort 改 unwind 带来的体积回增——见下）；
 # - codegen-units = 1：单 codegen 单元最大化内联收益（与 LTO 配合）；

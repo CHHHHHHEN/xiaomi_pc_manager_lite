@@ -9,9 +9,10 @@ use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_INFO, NIIF_INFO, NIM_MODIFY, NOTIFYICONDATAW,
 };
 
-/// 气泡标题与正文的容量上限（NIF_INFO 的 szInfoTitle/szInfo 均为
-/// 64 UTF-16 单元；标题可全用 64，正文尾部须保留 NUL 故取 63）。
-const SZ_INFO_TITLE_CAP: usize = 64;
+/// 气泡标题与正文的**内容**单元上限（`NIF_INFO` 的 szInfoTitle 容量 64、
+/// szInfo 容量 256；NUL 结尾占用 1 单元，故内容上限比容量小 1）。调用
+/// `util::write_utf16_capped` 时物理容量仍由数组自身兜底。
+const SZ_INFO_TITLE_CAP: usize = 63;
 const SZ_INFO_CAP: usize = 63;
 
 /// 弹托盘气泡通知（NIF_INFO）：通用通知（性能模式/电池养护共用）。
@@ -23,15 +24,16 @@ pub fn show_tray_notification(nid: NOTIFYICONDATAW, body: &str) {
     let mut nid = nid;
     nid.uFlags = NIF_INFO;
     nid.dwInfoFlags = NIIF_INFO;
-    // 先整体清零再拷贝正文：NUL 结尾是 Shell_NotifyIconW 读取字符串的
-    // 唯一终止信号（其余单元须为 0）。
-    let title = crate::util::WideString::new(crate::util::APP_NAME);
-    let title_len = title.units().len().min(SZ_INFO_TITLE_CAP - 1);
-    nid.szInfoTitle.fill(0);
-    nid.szInfoTitle[..title_len].copy_from_slice(&title.units()[..title_len]);
-    let info_wide: Vec<u16> = body.encode_utf16().take(SZ_INFO_CAP).collect();
-    nid.szInfo.fill(0);
-    nid.szInfo[..info_wide.len()].copy_from_slice(&info_wide);
+    // 标题/正文统一经 util::write_utf16_capped 保证 NUL 结尾（NUL 是
+    // Shell_NotifyIconW 读取字符串的唯一终止信号；NUL 之后保持调用方原值，
+    // 读取在 NUL 处停止）。历史实现各自手写 encode_utf16.take + 整体清零
+    // 的样板（修订 1.50 收敛）。
+    crate::util::write_utf16_capped(
+        &mut nid.szInfoTitle,
+        SZ_INFO_TITLE_CAP,
+        crate::util::APP_NAME,
+    );
+    crate::util::write_utf16_capped(&mut nid.szInfo, SZ_INFO_CAP, body);
     // NIM_MODIFY 携带 NIF_INFO 触发气泡。
     if !unsafe { Shell_NotifyIconW(NIM_MODIFY, &nid).as_bool() } {
         log::debug!("Tray: NIM_MODIFY notification failed");

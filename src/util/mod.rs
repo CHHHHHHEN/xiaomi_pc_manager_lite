@@ -25,7 +25,7 @@ pub use app::{
 };
 pub(crate) use fs::atomic_write;
 pub(crate) use sync::{lock_or_recover, lock_read_or_recover, lock_write_or_recover, log_once};
-pub use text::WideString;
+pub use text::{write_utf16_capped, WideString};
 pub(crate) use thread::catch_panic;
 pub use thread::{panic_message, spawn_guarded};
 
