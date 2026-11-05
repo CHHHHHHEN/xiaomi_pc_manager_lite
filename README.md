@@ -2,6 +2,8 @@
 
 # Xiaomi PC Manager Lite
 
+**注意**：本软件是基于 Redmibook Pro 14 2025 开发的，对于非 Redmibook xx xx 202x 系列请谨慎使用！
+
 **20261030更新**: 对于**redmibook pro 14 2025**机型，已经可以精确控制风扇转速，请参照[仓库](https://github.com/CHHHHHHEN/redmibook_pro_14_2025_fan_control)。
 
 轻量级小米 PC 管理工具 — 电池养护 / 性能模式切换
